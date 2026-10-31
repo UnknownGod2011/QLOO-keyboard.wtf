@@ -7,7 +7,7 @@ QLOO Jarvis is the Jarvis mode of [keyboard.wtf](https://github.com/UnknownGod20
 
 Ask "which of these two shirts suits me?", "find a film I'd actually enjoy" or "Inception or Mamma Mia tonight?" and Jarvis compares the options against your remembered preferences, asks Qloo how those options relate to things you already like, picks one, and says why. Tell it "not that one" and the next decision changes.
 
-**Try QLOO:** Download at [keyboardwtf.com/qloo-demo](https://keyboardwtf.com/qloo-demo) or from [GitHub Releases](https://github.com/UnknownGod2011/QLOO-keyboard.wtf/releases/latest). Setup takes 5 minutes with your own Gemini + Qloo API keys.
+**Try it now:** [Download QLOO for Windows](https://keyboardwtf.com/qloo-demo) or watch the [demo video](https://www.youtube.com/watch?v=QAYuLlb70LE). Setup takes 5 minutes with your own Gemini + Qloo API keys.
 
 ## The problem
 
@@ -64,6 +64,10 @@ Details: [docs/QLOO_ARCHITECTURE.md](docs/QLOO_ARCHITECTURE.md) and the Qloo ref
 - **Qloo down, quota used up, or 401** → the same decision falls back to taste memory and ordinary reasoning, flagged as not Qloo-grounded.
 
 ## Setup (Windows 10/11 x64)
+
+**Quick start:** Visit [keyboardwtf.com/qloo-demo](https://keyboardwtf.com/qloo-demo) for download and setup instructions, or follow the developer setup below.
+
+### Developer setup
 
 Requirements: .NET 8 SDK, a Gemini API key, a Qloo hackathon API key (optional but needed for Qloo grounding), a microphone and speakers. Chrome + the QLOO Helper only for browser automation.
 
