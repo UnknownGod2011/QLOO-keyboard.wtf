@@ -257,6 +257,10 @@ public sealed partial class WebSettingsService : IDisposable
             {
                 await HandlePersonalApiSettings(req, resp, path);
             }
+            else if (path.StartsWith("/api/qloo/", StringComparison.Ordinal) && method == "POST")
+            {
+                await HandleQlooSettings(req, resp, path);
+            }
             else if (path.StartsWith("/api/paid/", StringComparison.Ordinal)
                 && method == "POST")
             {
@@ -555,7 +559,7 @@ public sealed partial class WebSettingsService : IDisposable
         (path == "/api/connectors" || path?.StartsWith("/api/connectors/", StringComparison.Ordinal) == true)
         || method == "POST" && path is
             "/api/settings" or "/api/settings/quick-action" or "/api/settings/large-saved-setup/dismiss"
-            or "/api/hotkeys/reset" or "/api/personal-ai/action"
+            or "/api/hotkeys/reset" or "/api/personal-ai/action" or "/api/qloo/action"
             or "/api/paid/sign-in" or "/api/paid/retry-sign-in" or "/api/paid/refresh"
             or "/api/paid/revoke-device" or "/api/paid/cancel-subscription"
             or "/api/paid/manage" or "/api/paid/billing"
@@ -910,7 +914,7 @@ public sealed partial class WebSettingsService : IDisposable
                 CommandMode = "",
                 QuickSend = "",
                 Cancel = GetHotkey(hotkeysEl, "cancel", _settings?.Current.Hotkeys.Cancel ?? "Ctrl+Alt+X"),
-                OpenSettings = GetHotkey(hotkeysEl, "openSettings", _settings?.Current.Hotkeys.OpenSettings ?? "Ctrl+Alt+,"),
+                OpenSettings = GetHotkey(hotkeysEl, "openSettings", _settings?.Current.Hotkeys.OpenSettings ?? HotkeySettings.Defaults().OpenSettings),
             };
 
             if (HotkeyService.HasDuplicates(hotkeys, out var duplicate))

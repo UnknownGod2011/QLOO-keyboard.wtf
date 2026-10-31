@@ -21,6 +21,10 @@ public sealed class KeyboardWtfApp : IDisposable
     private readonly IntentMemoryService _intentMemory = new();
     private readonly JarvisActionHistoryService _jarvisHistory = new();
     private readonly LearnedMappingService _learnedMappings = new();
+    private readonly Taste.TasteProfileStore _tasteProfile = new();
+    private readonly Qloo.QlooCredentialStore _qlooCredentials = new();
+    private Qloo.QlooClient _qloo;
+    private Taste.TasteJarvisTools _taste;
     private readonly BrowserNativeHostInstaller _browserNativeHostInstaller = new();
     private readonly HashSet<string> _reportedHotkeyFailures = new(StringComparer.OrdinalIgnoreCase);
 
@@ -71,6 +75,9 @@ public sealed class KeyboardWtfApp : IDisposable
         _intentMemory.Load();
         _jarvisHistory.Load();
         _learnedMappings.Load();
+        _tasteProfile.Load();
+        _qloo = new Qloo.QlooClient(_qlooCredentials, dailyBudget: _settings.Current.QlooDailyBudget);
+        _taste = new Taste.TasteJarvisTools(_tasteProfile, _qloo, () => _settings.Current.QlooEnabled);
         _paidAccount = new PaidAccountService(updateWorkAdmission: UpdateWorkAdmission);
         PersonalApiSettingsController personalApiSettings = null;
 #if QLOO_JARVIS
@@ -117,6 +124,8 @@ public sealed class KeyboardWtfApp : IDisposable
             _paidAccount,
             _learnedMappings,
             UpdateWorkAdmission);
+        _liveConversation.AttachTasteTools(_taste);
+        _taste.Activity += status => KeyboardWtfState.SetUi(VoiceUiPhase.Executing, KeyboardWtfState.AssistantName, status);
         _browserHelper = new BrowserHelperBridge();
         _browserHelper.Start();
         _browserPlanner = new BrowserAutomationPlanner(_paidAccount);
@@ -189,6 +198,7 @@ public sealed class KeyboardWtfApp : IDisposable
             _browserAutomation,
             _paidAccount,
             personalApiSettings);
+        WebSettingsService.Instance.TasteTools = _taste;
         WebSettingsService.Instance.Start();
         if (_paidAccount.Enabled)
             _ = TrackFiniteUpdateWorkAsync(InitializePaidAccountAsync);
@@ -741,6 +751,7 @@ public sealed class KeyboardWtfApp : IDisposable
         _browserAutomation?.Dispose();
         _aiBackend?.Dispose();
         _personalKeyValidator?.Dispose();
+        _qloo?.Dispose();
         _paidAccount?.Dispose();
         _jarvisAutomation?.Dispose();
         _overlay?.Dispose();

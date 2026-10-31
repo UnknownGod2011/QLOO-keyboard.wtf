@@ -1,82 +1,131 @@
-# QLOO Jarvis
+# QLOO Jarvis: a desktop assistant that learns your taste
 
-An isolated Windows desktop project derived from the keyboard.wtf Jarvis implementation. This checkout exposes one product mode: **Jarvis**. It uses Gemini Personal API credentials for inference and can use an independently configured connector relay for provider authorization and native Gmail, Calendar, and other connector operations.
+QLOO Jarvis is the Jarvis mode of [keyboard.wtf](https://github.com/UnknownGod2011/keyboard.wtf): a Windows tray assistant you summon with a shortcut and talk to. It answers questions, reads the screen, and operates Windows apps and Chrome. This hackathon version adds two things:
 
-## Requirements
+- an **adaptive taste memory** that learns what you like from what you say and choose, and
+- **Qloo's cultural intelligence** (the Taste AI Insights API), which grounds personal decisions in real cultural affinity data.
 
-- Windows 10/11 x64.
-- .NET 8 SDK to build; .NET 8 Desktop Runtime to run a framework-dependent build.
-- A Gemini API key with access to the Gemini Live and required generation endpoints.
-- A microphone and audio output for voice conversations.
-- Chrome plus the QLOO unpacked Helper only for Chrome page interaction and browser automation.
+Ask "which of these two shirts suits me?", "find a film I'd actually enjoy" or "Inception or Mamma Mia tonight?" and Jarvis compares the options against your remembered preferences, asks Qloo how those options relate to things you already like, picks one, and says why. Tell it "not that one" and the next decision changes.
 
-## Build and run
+**Hosted demo (no install, no keys needed):** https://qloo-jarvis-taste.vercel.app. It runs the same decision engine in the browser with a demo persona, side by side with Qloo OFF and ON.
 
-From this folder:
+## The problem
+
+General assistants are good at reasoning and bad at taste. Asked to choose, they fall back on popularity ("Inception is a great pick… or Mamma Mia if you prefer musicals") or refuse to choose. They also forget what you told them yesterday. QLOO Jarvis keeps a private, evidence-weighted profile of your taste and uses Qloo to connect it to the options in front of you.
+
+## How it works
+
+```
+You (voice/text, optional screen) ──► Gemini Live (Jarvis): intent, vision, planning, final answer
+                                           │  calls tools
+                     ┌─────────────────────┼──────────────────────────┐
+              inspect_screen         taste_decide                taste_observe / taste_feedback / taste_profile
+           (Gemini vision; image      │                                │
+            never leaves Gemini)      ▼                                ▼
+                              TasteDecisionEngine ◄──────────── TasteProfileStore (%LOCALAPPDATA%\QLOO\taste-profile.json)
+                                      │ named entities + style words only
+                                      ▼
+                              QlooClient ──► https://hackathon.api.qloo.com  (/search, /v2/tags, /v2/insights)
+                              cache · de-dup · per-decision cap · daily budget · retry/timeout
+```
+
+- **Gemini stays the brain.** Gemini Live understands the request, looks at the screen (existing `inspect_screen` tool), extracts the options and their attributes, makes the final choice and explains it.
+- **Qloo is a specialised tool, not a chatbot.** For taste decisions Gemini calls `taste_decide`. The engine resolves the things you like (films, brands, artists, places) and style words (e.g. "minimalist") to Qloo IDs with `/search` and `/v2/tags`, then scores *your own options* with `/v2/insights` using `filter.results.entities` and `feature.explainability`. With no options it asks Qloo for recommendations and excludes what you dislike.
+- **Qloo is only called when it helps.** Maths, coding, logistics and factual questions never reach Qloo. Unbranded items ("a navy shirt") are judged from taste memory and Gemini's vision; Qloo does not judge colour or fit.
+- **Honest output.** Each brief says whether it was Qloo-grounded, which preferences drove it, the Qloo affinities, and what is missing. Confidence is high/medium/low, never a fake percentage.
+
+Details: [docs/QLOO_ARCHITECTURE.md](docs/QLOO_ARCHITECTURE.md) and the Qloo reference library in [docs/qloo/](docs/qloo/README.md).
+
+## How Jarvis learns your taste
+
+`TasteProfileStore` (`src/Services/Taste/`) keeps evidence, not a favourites list:
+
+| Kind | Example | Weight per observation |
+|---|---|---|
+| Explicit | "I love minimalist clothes" | 1.0 |
+| Inferred from a choice | you picked the navy shirt | 0.6 |
+| Negative | you rejected the neon tee | 0.6 against |
+| Inferred mention | "…like Arrival, but…" | 0.35 |
+| Contextual | "for weddings I go formal" | stored separately, used only for that occasion |
+| Temporary | "comedy tonight" | expires (default 14 days), never changes long-term taste |
+
+- Confidence = 1 − e^(−1.2·|net evidence|), with recency decay (half-life 365 days for explicit, 120 for inferred). Repeated choices raise it; one explicit statement starts "strong".
+- A contradicting explicit statement halves the older opposite evidence instead of overwriting it, and the preference is marked "recently changed". A correction from Settings is authoritative.
+- The same observation within 24 hours is counted once.
+- Health, religion, politics, sexuality, ethnicity, finances and identifiers are refused, never stored.
+- You can inspect, flip ("actually I dislike it"), forget or clear everything in **Settings → Qloo cultural intelligence**, or by voice ("what do you know about my taste?", "forget that I like sushi").
+
+## Qloo ON / OFF
+
+- **On by default.** Settings → **Qloo cultural intelligence** has a single toggle. It applies from the next Jarvis conversation.
+- **OFF = the original Jarvis.** The Gemini tool list and system instruction are exactly the pre-Qloo ones (a unit test checks the serialized tool list is unchanged).
+- **ON without a key** still uses taste memory and says the result is not Qloo-grounded, with a setup hint.
+- **Qloo down, quota used up, or 401** → the same decision falls back to taste memory and ordinary reasoning, flagged as not Qloo-grounded.
+
+## Setup (Windows 10/11 x64)
+
+Requirements: .NET 8 SDK, a Gemini API key, a Qloo hackathon API key (optional but needed for Qloo grounding), a microphone and speakers. Chrome + the QLOO Helper only for browser automation.
 
 ```powershell
 dotnet restore .\src\KeyboardWtf.csproj
 dotnet run --project .\src\KeyboardWtf.csproj -c Release
 ```
 
-The app is the tray process `QLOO.exe`. Start/end Jarvis with **Ctrl+Alt+Q** and cancel the active Jarvis action with **Ctrl+Alt+X**. If either shortcut is already owned, QLOO uses the existing conflict fallback and reports the active shortcut.
+The tray process is `QLOO.exe`. On first run Settings opens in your browser.
 
-For a self-contained x64 publish:
+1. **Gemini key:** Settings → *Personal Gemini API* → *Add Gemini API key* (native Windows dialog, stored with DPAPI).
+2. **Qloo key**, any one of:
+   - Settings → *Qloo cultural intelligence* → *Add or replace Qloo API key* (native dialog, stored with DPAPI in `%LOCALAPPDATA%\QLOO\qloo-api-v1.dat`);
+   - `QLOO.exe --import-qloo-key "C:\path\to\key.txt"` (stores the first key-shaped token from a local file, prints nothing);
+   - the `QLOO_API_KEY` environment variable (developer fallback; see [.env.example](.env.example)).
+
+   Keys are never sent to the settings page, prompts or logs. The Qloo key is sent only in the `X-Api-Key` header to `https://hackathon.api.qloo.com`.
+
+### Keyboard shortcuts
+
+| Action | Default | Fallback if taken |
+|---|---|---|
+| Start / end Jarvis | `Ctrl+Alt+Q` | `Ctrl+Alt+J` |
+| Cancel current action | `Ctrl+Alt+X` | `Ctrl+Alt+Escape` |
+| Open QLOO Settings | `Ctrl+Alt+P` | `Ctrl+Alt+Shift+P` |
+
+`Ctrl+Alt+P` avoids Windows-reserved combinations and keyboard.wtf's own defaults (K, D, Q, X and comma). Shortcuts live in `%LOCALAPPDATA%\QLOO\settings.json` (`Hotkeys`) and can be changed through the settings API (`POST /api/settings` with `hotkeys`), which rejects duplicates and rolls back if Windows refuses a combination.
+
+### Qloo quota protection
+
+Per decision at most 8 Qloo calls; a persisted daily budget (default 150, `QlooDailyBudget` in settings.json); a private on-disk cache (`/search` and `/v2/tags` 30 days, `/v2/insights` 7 days; allowed by Qloo's hackathon terms); identical in-flight requests share one call; 8 s timeout; one retry only for 429/5xx/timeouts; a 401 stops calls until the key changes. Settings shows today's requests and cache hits.
+
+## Tests
 
 ```powershell
-dotnet publish .\src\KeyboardWtf.csproj -c Release -r win-x64 --self-contained true
+dotnet test .\tests\KeyboardWtf.Tests\KeyboardWtf.Tests.csproj -c Debug --filter "FullyQualifiedName~QlooTasteTests"
+node --test "demo/web/test/*.test.mjs"
 ```
 
-## Configure Gemini
+The Qloo tests use synthetic fixtures only; Qloo's hackathon terms forbid storing real response data in a public repository. Results of the internal tests and the live OFF/ON comparison are in [docs/qloo/EVALUATION.md](docs/qloo/EVALUATION.md).
 
-Open QLOO Settings from the tray. Under **Personal Gemini API**, choose **Add Gemini API key**. The key is entered in a native Windows dialog, validated, and stored in the QLOO profile with Windows DPAPI. The browser settings page never receives or stores the key. QLOO forces the PersonalOnly policy; reset and settings actions cannot switch inference to a managed backend.
+## Repository layout
 
-The default profile is `%LOCALAPPDATA%\QLOO`. `QLOO_APPDATA_DIR` may select a subdirectory inside that QLOO profile for isolated development. It cannot point into keyboard.wtf's profile or another arbitrary directory.
+- `src/Services/Qloo/`: `QlooClient` (HTTP, validation, cache, budgets) and `QlooCredentialStore` (DPAPI key).
+- `src/Services/Taste/`: `TasteProfileStore` (memory), `TasteDecisionEngine` (generic decisions), `TasteJarvisTools` (Gemini tool declarations, prompt section, execution).
+- `src/Services/GeminiLiveConversationService.cs`: Gemini Live session; taste tools are attached only when the toggle is on.
+- `src/Services/WebSettingsService.Qloo.cs`, `src/Resources/web/settings.html`: settings routes and UI.
+- `demo/web/`: hosted web demo (Vercel, zero dependencies) with its own README.
+- `docs/qloo/`: researched Qloo API reference library. `docs/QLOO_ARCHITECTURE.md`: architecture and checklist.
+- Everything else is the existing Jarvis: desktop/browser automation (`JarvisAutomationService`, `BrowserAutomationV2/`), connectors (`Connectors/`, optional relay in `staging/backend/`), Personal Gemini backend (`Ai/Backends/`), Chrome Helper (`extensions/`).
 
-No credentials are tracked by Git. The source export did include ignored, credential-named local artifacts (`QLOO-API KEY.txt`, `API KEYS.docx`, and `qloo-source.tar`); their contents were not printed, and they must be removed locally before sharing or publishing this folder. The Qloo API has not yet been integrated into runtime code; a Qloo key can be configured when that feature is implemented, without reusing the Gemini credential.
+## Optional connectors and Chrome Helper
 
-## Optional connectors
+Native Gmail/Calendar connectors need a separately deployed relay: set both `QLOO_CONNECTOR_BACKEND_URL` and `QLOO_CONNECTOR_WEB_URL` (HTTPS) before starting QLOO. Without them, Jarvis, desktop tools and local browser actions still work. For Chrome page actions use **Prepare QLOO Chrome Helper** in Settings and load the folder as an unpacked extension (`chrome://extensions`, Developer mode).
 
-Native connectors remain in the Jarvis execution flow. They require the separately deployed connector relay and the user's own provider authorization. Set both environment variables before starting QLOO:
+## Known limitations
 
-```text
-QLOO_CONNECTOR_BACKEND_URL=https://your-qloo-connector-api/
-QLOO_CONNECTOR_WEB_URL=https://your-qloo-connector-site/
-```
+- Qloo grounds named cultural entities (films, shows, artists, books, podcasts, games, brands, places, destinations) and style tags. It does not evaluate colour, fit, materials or price; those come from Gemini's vision and your taste memory.
+- Qloo results depend on hackathon data coverage; unresolved names are reported, not guessed.
+- Taste settings take effect from the next Jarvis conversation, because Gemini Live receives tools at session setup.
+- The hosted demo keeps the taste profile in your browser; its rate limits and cache are per serverless instance.
+- Microphone, speaker and real-time screen behaviour must be checked on the target PC; the automated tests cover logic, not audio hardware.
 
-The two values must be supplied together and use HTTPS (or loopback for local development). The relay supplies connector catalog, OAuth connection, account-scoped access, and native Gmail/Calendar/provider operations. Gemini inference remains on the local Personal API key even when the relay is configured; connector sign-in does not activate credits or managed AI. Without a relay, Jarvis, desktop tools, and local browser actions remain available, while provider connectors report that authorization is unavailable.
+## License
 
-Optional relay source is in `staging/backend/KeyboardWtf.Staging.Api/`; it is a separate service and is not started or published by the desktop project. Review its deployment configuration before hosting it. Connector provider scopes and account access are controlled by that service and each provider. The connector-site staging builder requires QLOO-owned Firebase web configuration (`QLOO_FIREBASE_API_KEY`, `QLOO_FIREBASE_AUTH_DOMAIN`, `QLOO_FIREBASE_PROJECT_ID`, `QLOO_FIREBASE_STORAGE_BUCKET`, `QLOO_FIREBASE_MESSAGING_SENDER_ID`, `QLOO_FIREBASE_APP_ID`). The Firebase web API key is public client configuration, not a provider secret; restrict it to the owned project and required APIs. Vercel deployment also requires `QLOO_VERCEL_PROJECT_ID` and `QLOO_VERCEL_SCOPE`. The builder does not deploy unless explicitly passed `--deploy`.
-
-## Chrome Helper
-
-Use **Prepare QLOO Chrome Helper** in Settings, then open `chrome://extensions`, enable Developer mode, and load the prepared folder as an unpacked extension. QLOO has a distinct native-host name, pipe, extension key, and extension ID. It does not register over the keyboard.wtf Helper during startup.
-
-## Architecture map
-
-- `src/Program.cs` — single-instance tray entry point and Jarvis-only menu.
-- `src/Services/KeyboardWtfApp.cs` — application composition, two hotkeys, connector relay binding, and service lifecycle.
-- `src/Services/GeminiLiveConversationService.cs` — Gemini Live speech, conversation/tool routing, cancellation, selected-text translation ownership, and session context.
-- `src/Services/JarvisAutomationService.cs` and `src/Services/BrowserAutomationV2/` — validated desktop actions, Chrome Helper coordination, browser planning, and safety checks.
-- `src/Services/Connectors/` — connector intent, task lifecycle, retained provider references, and authenticated native operations.
-- `src/Services/Ai/Backends/` — Personal API credential vault, DPAPI protection, policy router, Gemini transports, and native key-entry settings controller.
-- `src/Services/PaidStaging/` — connector relay HTTP/OAuth session transport only in QLOO; its managed inference fallback is unreachable because QLOO pins the PersonalOnly backend.
-- `src/Services/SettingsService.cs` and `src/Resources/web/settings.html` — QLOO-local preferences and settings UI. Only Jarvis and Cancel hotkeys are persisted/registered.
-- `extensions/keyboard-wtf-browser-helper-v2/` — QLOO-branded unpacked Chrome Helper source.
-- `staging/backend/KeyboardWtf.Staging.Api/` — optional connector relay service source.
-- `tests/KeyboardWtf.Tests/` — existing focused regression tests for shared Jarvis, connectors, Personal API policy, and related behaviors.
-
-## Runtime flow
-
-1. Ctrl+Alt+Q starts Jarvis and opens the microphone.
-2. Gemini Live receives voice input over the Personal API transport; tool requests are validated and routed to the existing desktop, browser, or connector executor.
-3. Connector calls use the authenticated relay only when it is configured and signed in. Verified provider resource identifiers and references remain account-scoped within the connector/session layer.
-4. Tool receipts return to the same live conversation; speech and the existing dynamic activity UI finish through their normal lifecycle.
-5. Ctrl+Alt+X cancels the active operation and ends its session-owned work.
-
-## Known boundaries
-
-- Physical microphone/speaker behavior and visible Chrome rendering must be verified on the target PC; source builds alone do not prove those outcomes.
-- Connector operations require a compatible relay deployment, valid provider OAuth grants, and provider-side availability.
-- The Chrome Helper must be loaded by the user in Chrome. Browser actions remain restricted by the existing active-window and tab safety checks.
-- This project has not been code-signed or published as a public installer. OAuth review, signing, deployment, and release packaging are separate release tasks.
+MIT, see [LICENSE](LICENSE). Third-party components are listed in [NOTICES.md](NOTICES.md). Qloo and Gemini are third-party services used under their own terms; no Qloo response data is included in this repository.

@@ -142,6 +142,9 @@ export function finalOnPrompt({ question, extraction, brief }) {
 export function createGemini({ env = {}, mock = false, fetchImpl, timeoutMs = 20000 } = {}) {
   const apiKey = String(env.GEMINI_API_KEY || '');
   const model = /^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(String(env.GEMINI_MODEL || '')) ? env.GEMINI_MODEL : DEFAULT_GEMINI_MODEL;
+  // Extraction is a simpler structured task; it uses the lighter model so the final
+  // decision keeps the main model's per-minute quota.
+  const extractModel = /^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(String(env.GEMINI_EXTRACT_MODEL || '')) ? env.GEMINI_EXTRACT_MODEL : 'gemini-3.5-flash-lite';
   const doFetch = fetchImpl || globalThis.fetch;
 
   // One bounded retry for transient failures (5xx/429/timeout/truncated JSON).
@@ -151,14 +154,14 @@ export function createGemini({ env = {}, mock = false, fetchImpl, timeoutMs = 20
     } catch (e) {
       const transient = e instanceof GeminiError && (/^http_(5\d\d|429)$/.test(e.code) || ['timeout', 'network', 'empty', 'bad_json'].includes(e.code));
       if (!transient) throw e;
-      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) => setTimeout(r, e.code === 'http_429' ? 4000 : 400));
       return generateJsonOnce(args);
     }
   }
 
-  async function generateJsonOnce({ system, text, images = [] }) {
+  async function generateJsonOnce({ system, text, images = [], useModel = model }) {
     if (!apiKey) throw new GeminiError('not_configured', 'Gemini is not configured');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(useModel)}:generateContent`;
     const body = {
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: 'user', parts: [{ text }, ...images.map((i) => ({ inlineData: { mimeType: i.mimeType, data: i.data } }))] }],
@@ -190,7 +193,7 @@ export function createGemini({ env = {}, mock = false, fetchImpl, timeoutMs = 20
     async extract({ question, optionsText, images = [], location }) {
       const raw = mock
         ? mockGemini('extract', { question, optionsText, images, location })
-        : await generateJson({ system: EXTRACT_SYSTEM, text: extractPrompt({ question, optionsText, location, imageCount: images.length }), images });
+        : await generateJson({ system: EXTRACT_SYSTEM, text: extractPrompt({ question, optionsText, location, imageCount: images.length }), images, useModel: extractModel });
       return normalizeExtraction(raw);
     },
     async decideOff({ question, extraction }) {

@@ -10,6 +10,7 @@ public sealed class HotkeyService : IDisposable
     private const int WmHotkey = 0x0312;
     public const string JarvisFallback = "Ctrl+Alt+J";
     public const string CancelFallback = "Ctrl+Alt+Escape";
+    public const string OpenSettingsFallback = "Ctrl+Alt+Shift+P";
 
     private readonly ConcurrentDictionary<int, (string Name, string Hotkey, Action Handler)> _handlers = new();
     private readonly object _hotkeyGate = new();
@@ -70,6 +71,8 @@ public sealed class HotkeyService : IDisposable
         {
             Register("Jarvis", hotkeys.Jarvis, commands.ToggleJarvisMode, JarvisFallback),
             Register("Cancel", hotkeys.Cancel, commands.CancelCurrent, CancelFallback),
+            Register("OpenSettings", string.IsNullOrWhiteSpace(hotkeys.OpenSettings)
+                ? HotkeySettings.Defaults().OpenSettings : hotkeys.OpenSettings, commands.OpenSettings, OpenSettingsFallback),
         };
         return results.All(result => result);
     }
@@ -99,6 +102,7 @@ public sealed class HotkeyService : IDisposable
             {
                 ("Jarvis", settings.Jarvis, commands.ToggleJarvisMode),
                 ("Cancel", settings.Cancel, commands.CancelCurrent),
+                ("OpenSettings", settings.OpenSettings, commands.OpenSettings),
             };
 
             var previous = (previousSettings ?? HotkeySettings.Defaults()).ToDictionary();

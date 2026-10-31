@@ -38,7 +38,23 @@
       <div><label for="preferredBrowser">Preferred browser (optional)</label><input id="preferredBrowser" placeholder="Chrome, Edge, Firefox…"></div>
     </div>
     <label><input id="browserAutomationEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">Enable browser automation</label>
-    <p class="note">Start or end Jarvis: <code>Ctrl+Alt+Q</code>. Cancel a current action: <code>Ctrl+Alt+X</code>.</p>
+    <p class="note">Start or end Jarvis: <code>Ctrl+Alt+Q</code>. Cancel a current action: <code>Ctrl+Alt+X</code>. Open these settings: <code>Ctrl+Alt+P</code>.</p>
+  </section>
+  <section class="card" id="qloo">
+    <h2>Qloo cultural intelligence</h2>
+    <p class="note">When on, Jarvis keeps an adaptive taste memory on this PC and uses Qloo's cultural taste graph for personal decisions (films, music, fashion, dining, travel…). When off, Jarvis behaves exactly like the original. Changes apply from the next Jarvis conversation.</p>
+    <label><input id="qlooEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">Use Qloo cultural intelligence and taste memory</label>
+    <p id="qlooKeyStatus" class="note" role="status">Checking Qloo…</p>
+    <div class="row" style="margin-top:8px">
+      <button id="qlooAddKey" type="button">Add or replace Qloo API key</button>
+      <button id="qlooRemoveKey" type="button">Remove Qloo key</button>
+    </div>
+    <p id="qlooUsage" class="note"></p>
+    <h2 style="margin-top:18px">What Jarvis has learned about your taste</h2>
+    <p class="note">Learned from what you say and choose. Explicit statements count most; repeated choices raise confidence; occasion-specific and temporary preferences never overwrite your general taste. Sensitive traits are never stored.</p>
+    <div id="tasteList" class="note" role="status">Loading…</div>
+    <div class="row" style="margin-top:10px"><button id="tasteClear" type="button">Clear taste memory</button><button id="qlooClearCache" type="button">Clear private Qloo cache</button></div>
+    <p id="qlooStatus" class="note" role="status"></p>
   </section>
   <section class="card" id="browser-automation">
     <h2>Browser Automation data disclosure</h2>
@@ -210,7 +226,54 @@
       node.textContent = `Helper folder prepared: ${result.extensionFolder || 'see opened folder'}`;
     } catch (error) { node.textContent = error.message || 'QLOO Helper setup failed.'; }
   });
+  function renderQloo(state) {
+    if (!state) return;
+    $('qlooEnabled').checked = !!state.enabled;
+    $('qlooKeyStatus').textContent = state.configured
+      ? `Qloo key ${state.mask} (${state.keySource === 'environment' ? 'from QLOO_API_KEY' : 'Windows-encrypted on this PC'})${state.lockedOut ? ' was rejected by Qloo (401). Replace it.' : ' is ready.'}`
+      : 'No Qloo key yet. Taste memory still works; Qloo-grounded results need a key.';
+    $('qlooRemoveKey').hidden = !state.configured || state.keySource !== 'profile';
+    const u = state.usage;
+    $('qlooUsage').textContent = u ? `Today: ${u.requests}/${u.dailyBudget} Qloo requests, ${u.cacheHits} answered from the private cache (${state.cachedResponses} cached responses)${u.lastError ? `, last error: ${u.lastError}` : ''}.` : '';
+    const root = $('tasteList'); root.replaceChildren();
+    const prefs = Array.isArray(state.preferences) ? state.preferences : [];
+    if (prefs.length === 0) { const empty = document.createElement('span'); empty.textContent = 'Nothing learned yet. Tell Jarvis what you like, or choose between options.'; root.append(empty); }
+    for (const p of prefs) {
+      const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '8px';
+      const text = document.createElement('span');
+      const verb = p.polarity < 0 ? 'Dislikes' : 'Likes';
+      text.textContent = `${verb} ${p.value}${p.context ? ' for ' + p.context : ''} · ${p.domain}/${p.attribute} · ${p.strength} (${p.kind}, ${p.evidence} observation${p.evidence === 1 ? '' : 's'})${p.recentlyChanged ? ' · recently changed' : ''}`;
+      if (p.lastQuote) text.title = p.lastQuote;
+      const actions = document.createElement('div');
+      const flip = document.createElement('button'); flip.type = 'button'; flip.textContent = p.polarity < 0 ? 'Actually I like it' : 'Actually I dislike it';
+      flip.addEventListener('click', () => qlooAction('correct', { id: p.id, polarity: p.polarity < 0 ? 'like' : 'dislike' }));
+      const forget = document.createElement('button'); forget.type = 'button'; forget.textContent = 'Forget';
+      forget.addEventListener('click', () => qlooAction('forget', { id: p.id }));
+      actions.append(flip, forget); row.append(text, actions); root.append(row);
+    }
+  }
+  async function qlooAction(action, extra = {}) {
+    try {
+      const response = await fetch('/api/qloo/action', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ action, ...extra }) });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || 'Qloo settings action failed.');
+      $('qlooStatus').textContent = result.message || '';
+      renderQloo(result.state);
+    } catch (error) { $('qlooStatus').textContent = error.message || 'Qloo settings action failed.'; }
+  }
+  async function loadQloo() {
+    const response = await fetch('/api/qloo/state', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', cache:'no-store' });
+    const result = await response.json();
+    if (!response.ok || result.ok !== true) throw new Error(result.error || 'Could not load Qloo state.');
+    renderQloo(result.state);
+  }
+  $('qlooEnabled').addEventListener('change', () => qlooAction('enabled', { enabled: $('qlooEnabled').checked }));
+  $('qlooAddKey').addEventListener('click', () => { $('qlooStatus').textContent = 'Opening secure Windows key entry…'; qlooAction('add-key'); });
+  $('qlooRemoveKey').addEventListener('click', () => { if (window.confirm('Remove the Qloo key from this PC?')) qlooAction('remove-key'); });
+  $('tasteClear').addEventListener('click', () => { if (window.confirm('Clear everything Jarvis has learned about your taste?')) qlooAction('clear-profile'); });
+  $('qlooClearCache').addEventListener('click', () => qlooAction('clear-cache'));
   load().catch(error => setStatus(error.message || 'Could not load settings.', true));
+  loadQloo().catch(error => { $('qlooKeyStatus').textContent = error.message || 'Could not load Qloo state.'; });
 })();
 </script>
 </body>

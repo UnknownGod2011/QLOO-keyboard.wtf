@@ -37,6 +37,14 @@ internal static class Program
             return;
         }
 
+        // One-shot: QLOO.exe --import-qloo-key "<file>" stores the first key-shaped token from a
+        // local text file in the DPAPI-protected profile and exits. The key is never echoed.
+        if (args.Length >= 2 && string.Equals(args[0], "--import-qloo-key", StringComparison.OrdinalIgnoreCase))
+        {
+            Environment.ExitCode = new Services.Qloo.QlooCredentialStore().ImportFromFile(args[1]) ? 0 : 1;
+            return;
+        }
+
         WindowsAppLifecycleService.WaitForRestartParent(args);
 
         if (!TryAcquireInstanceLock())

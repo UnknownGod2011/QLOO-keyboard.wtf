@@ -54,12 +54,15 @@ public sealed class HotkeySettings
     [JsonIgnore] public string Dictation { get; set; } = "";
     [JsonIgnore] public string CommandMode { get; set; } = "";
     [JsonIgnore] public string QuickSend { get; set; } = "";
-    [JsonIgnore] public string OpenSettings { get; set; } = "";
+    // Second global shortcut: opens QLOO Settings. Ctrl+Alt+P avoids Windows-reserved combos,
+    // keyboard.wtf's own defaults (K, D, Q, X, comma) and the Jarvis/Cancel bindings.
+    public string OpenSettings { get; set; } = "Ctrl+Alt+P";
 
     public Dictionary<string, string> ToDictionary() => new(StringComparer.OrdinalIgnoreCase)
     {
         ["Jarvis"] = Jarvis,
         ["Cancel"] = Cancel,
+        ["OpenSettings"] = OpenSettings,
     };
 
     public static HotkeySettings Defaults() => new();
@@ -109,6 +112,10 @@ public sealed class AppSettings
     public string BrowserAutomationModel { get; set; } = "gemini-3.1-flash-lite-preview";
     public bool BrowserAutomationMemoryEnabled { get; set; }
     public string UpdateChannel { get; set; } = "stable";
+    // Qloo cultural intelligence + adaptive taste memory. On by default; Qloo calls also need a key.
+    // Off restores the original Jarvis tool list and system instruction exactly.
+    public bool QlooEnabled { get; set; } = true;
+    public int QlooDailyBudget { get; set; } = 150;
 }
 
 public sealed class SettingsService
@@ -279,6 +286,9 @@ public sealed class SettingsService
             Current.Hotkeys.Jarvis = HotkeySettings.Defaults().Jarvis;
         if (string.IsNullOrWhiteSpace(Current.Hotkeys.Cancel))
             Current.Hotkeys.Cancel = HotkeySettings.Defaults().Cancel;
+        if (string.IsNullOrWhiteSpace(Current.Hotkeys.OpenSettings)
+            || IsInaccessibleFunctionKey(Current.Hotkeys.OpenSettings))
+            Current.Hotkeys.OpenSettings = HotkeySettings.Defaults().OpenSettings;
 
         // A side-by-side production candidate briefly used F13-F17 to avoid
         // colliding with an already-running legacy build. Most customer
@@ -466,6 +476,17 @@ public sealed class SettingsService
             Current.ShowQuickActionButton = value;
         }
     }
+    public void SaveQlooEnabled(bool value)
+    {
+        lock (_saveLock)
+        {
+            var snapshot = Current.CopyForSave();
+            snapshot.QlooEnabled = value;
+            SaveSnapshot(snapshot);
+            Current.QlooEnabled = value;
+        }
+    }
+
     public void DismissLargeSavedSetupWarning()
     {
         var previous = Current.LargeSavedSetupWarningDismissed;

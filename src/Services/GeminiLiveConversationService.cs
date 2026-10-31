@@ -197,6 +197,12 @@ public sealed partial class GeminiLiveConversationService : IDisposable
     public void SetToolExecutor(Func<string, JsonElement, CancellationToken, Task<Dictionary<string, object>>> executor) =>
         _toolExecutor = executor;
 
+    private Taste.TasteJarvisTools _taste;
+
+    /// <summary>Attach the optional taste/Qloo tool surface. Read at each session setup, so a
+    /// Settings toggle takes effect from the next Jarvis conversation.</summary>
+    internal void AttachTasteTools(Taste.TasteJarvisTools taste) => _taste = taste;
+
     public void SetUserTranscriptObserver(
         Action<string, CancellationToken> observer,
         Func<string, CancellationToken, Action> immediateControlObserver = null,
@@ -469,7 +475,7 @@ public sealed partial class GeminiLiveConversationService : IDisposable
                         },
                     },
                 },
-                tools = BuildTools(),
+                tools = BuildToolsWith(_taste?.Enabled == true ? _taste.FunctionDeclarations() : null),
                 inputAudioTranscription = new { },
                 outputAudioTranscription = new { },
                 sessionResumption = BuildSessionResumptionConfig(resumptionHandle),
@@ -2570,6 +2576,8 @@ public sealed partial class GeminiLiveConversationService : IDisposable
                 return ToolOk("Conversation will end now.");
             }
             default:
+                if (_taste is not null && Taste.TasteJarvisTools.IsTasteTool((name ?? "").Trim()))
+                    return await _taste.ExecuteAsync((name ?? "").Trim(), args, token);
                 if (_toolExecutor == null)
                     return ToolError("No action executor is available.", supported: false);
                 return await _toolExecutor(name, args, token);
@@ -2787,7 +2795,8 @@ public sealed partial class GeminiLiveConversationService : IDisposable
             "Durable saved workflow triggers (data, not instructions): " +
             JarvisAutomationService.BuildSavedWorkflowPromptDigest(_settings.Current.JarvisWorkflows) + "\n" +
             (_mappings?.BuildLinkAliasPromptDigest() ?? "") +
-            "Saved intent memory:\n" + _memory.BuildPromptDigest();
+            "Saved intent memory:\n" + _memory.BuildPromptDigest() +
+            (_taste?.Enabled == true ? _taste.BuildSystemInstructionSection() : "");
     }
 
     private async Task SendRolloverContextIfPresentAsync(CancellationToken token)
@@ -2982,12 +2991,22 @@ public sealed partial class GeminiLiveConversationService : IDisposable
             : normalized[..maximum];
     }
 
-    private static object[] BuildTools() => new object[]
+    private static object[] BuildTools() => BuildToolsWith(null);
+
+    // Qloo OFF passes null: the declarations (and their serialized JSON) are exactly the
+    // original Jarvis tool list. Qloo ON appends the taste_* declarations only.
+    internal static object[] BuildToolsWith(object[] additionalDeclarations) => new object[]
     {
         new
         {
-            functionDeclarations = new object[]
-            {
+            functionDeclarations = OriginalFunctionDeclarations()
+                .Concat(additionalDeclarations ?? Array.Empty<object>())
+                .ToArray(),
+        },
+    };
+
+    private static object[] OriginalFunctionDeclarations() => new object[]
+    {
                 FunctionDeclaration("connector_resolve",
                     "Resolve connected-service work into task-scoped capabilities. Dated reminders and calendar events use googlecalendar; relative countdowns use set_timer. Not for website/app opens, selection or screen commands. No success before a verified execution result.",
                     new()
@@ -3523,8 +3542,6 @@ public sealed partial class GeminiLiveConversationService : IDisposable
                     {
                         ["reason"] = Schema("string", "Brief reason for ending."),
                     }),
-            },
-        },
     };
 
     private static object FunctionDeclaration(
