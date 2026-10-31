@@ -61,6 +61,32 @@ internal static class ClipboardHelper
         return processId == Environment.ProcessId;
     }
 
+    // OLE/shell formats whose data is a live COM object or a reference back into the source app
+    // (embedded objects, links, virtual files, metafiles). Their objects belong to the capture
+    // thread's apartment; restoring them after that thread ends made ole32 crash the whole app
+    // (access violation 0xc0000005), reproduced with Word content on the clipboard.
+    internal static readonly IReadOnlySet<string> NonRestorableFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Ole Private Data", "Object Descriptor", "Link Source", "Link Source Descriptor", "Embed Source",
+        "Embedded Object", "ObjectLink", "OwnerLink", "Native", "DataObject", "FileContents",
+        "FileGroupDescriptor", "FileGroupDescriptorW", "EnhancedMetafile", "MetaFilePict",
+    };
+
+    private const long MaxRestorableBytes = 32L * 1024 * 1024;
+
+    /// <summary>Detached copy of clipboard data that is safe to put back on the clipboard from
+    /// another thread, or null when the value cannot be restored safely.</summary>
+    internal static object ToRestorableValue(object value) => value switch
+    {
+        null => null,
+        string text => text,
+        string[] list => (string[])list.Clone(),
+        byte[] bytes => bytes.LongLength <= MaxRestorableBytes ? (byte[])bytes.Clone() : null,
+        MemoryStream stream => stream.Length <= MaxRestorableBytes ? new MemoryStream(stream.ToArray()) : null,
+        System.Drawing.Bitmap bitmap => new System.Drawing.Bitmap(bitmap),
+        _ => null, // COM objects, native-storage streams, metafiles, serialized managed objects
+    };
+
     public static Snapshot Capture()
     {
         Snapshot snapshot = null;
@@ -79,13 +105,30 @@ internal static class ClipboardHelper
                     var copy = new DataObject();
                     foreach (var format in source.GetFormats())
                     {
+                        if (NonRestorableFormats.Contains(format))
+                            continue;
+                        object value = null;
                         try
                         {
-                            var value = source.GetData(format);
-                            if (value != null)
-                                copy.SetData(format, value);
+                            value = source.GetData(format);
+                            var restorable = ToRestorableValue(value);
+                            if (restorable != null)
+                                copy.SetData(format, restorable);
                         }
                         catch { }
+                        finally
+                        {
+                            // Release apartment-bound objects on this (still alive) STA thread and
+                            // dispose originals that were copied; never let them outlive the capture.
+                            try
+                            {
+                                if (value != null && Marshal.IsComObject(value))
+                                    Marshal.FinalReleaseComObject(value);
+                                else if (value is IDisposable disposable)
+                                    disposable.Dispose();
+                            }
+                            catch { }
+                        }
                     }
                     snapshot = new Snapshot { Data = copy, WasEmpty = false };
                 }
