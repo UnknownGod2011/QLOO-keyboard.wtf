@@ -87,7 +87,7 @@ Qloo is a **local Jarvis tool path**, not a relay connector: it needs no OAuth a
 - `AppSettings.QlooEnabled` (default `true`) and `QlooDailyBudget` (default 150) in `settings.json`; `SettingsService.SaveQlooEnabled` commits atomically before publishing the value.
 - `WebSettingsService.Qloo.cs`: `POST /api/qloo/state` and `POST /api/qloo/action` (`enabled`, `add-key`, `remove-key`, `forget`, `correct`, `clear-profile`, `clear-cache`), protected by the existing action-token guard and update-work admission.
 - The Qloo key: `QlooCredentialStore` (DPAPI, `qloo-api-v1.dat`), native `QlooKeyEntryDialog`, `QLOO.exe --import-qloo-key <file>`, or `QLOO_API_KEY`. The page receives only `configured`, `keySource` and a 4-character mask.
-- Toggle semantics: read at Gemini Live session setup. OFF → `BuildToolsWith(null)` and no prompt section, which serialize exactly as before (unit-tested). ON → original declarations first, taste declarations appended.
+- Toggle semantics: read at Gemini Live session setup. OFF → `BuildToolsWith(null)` and no prompt section, which serialize exactly as before (unit-tested). ON → original declarations first, taste declarations appended. Switching the toggle ends a running conversation (`KeyboardWtfApp.EndJarvisConversationIfActiveAsync`) so the next one uses the new mode. The switch lives in Settings → Connectors → Qloo.
 - Hotkeys: Jarvis defaults to `Ctrl+Alt+Shift+Q` (fallback `Ctrl+Alt+Shift+J`) because `Ctrl+Alt+Q`, `Ctrl+Alt+J` and `Ctrl+Alt+Space` belong to keyboard.wtf; a one-time migration (`HotkeysRevision`) moves older QLOO settings off `Ctrl+Alt+Q`. `HotkeySettings.OpenSettings = "Ctrl+Alt+P"` is now persisted and registered (fallback `Ctrl+Alt+Shift+P`), handled by `CommandRegistry.OpenSettings` → the same `KeyboardWtfApp.OpenSettings` used by the tray. Cancel keeps `Ctrl+Alt+X` with a new non-conflicting fallback `Ctrl+Alt+Shift+X`.
 
 ## 10. Fallback architecture
@@ -113,7 +113,8 @@ Private on-disk cache keyed by canonical sorted query (search/tags 30 days, insi
 - `src/Services/SettingsService.cs` — `QlooEnabled`, `QlooDailyBudget`, `SaveQlooEnabled`, persisted `OpenSettings` hotkey + migration.
 - `src/Services/HotkeyService.cs` — register/replace the Open Settings hotkey.
 - `src/Services/WebSettingsService.cs` — `/api/qloo/*` routes and update-work classification; hotkey default.
-- `src/Resources/web/settings.html` — Qloo card, taste-profile editor, shortcut note.
+- `src/Resources/web/settings.html` — Qloo entry inside the Connectors card (On switch, key, usage, collapsible taste-profile editor), shortcut note.
+- `src/Services/Ai/Backends/PersonalKeyImporter.cs` (new) + `src/Program.cs` — `--import-gemini-keys` bulk import into the Personal API key pool, probing each key with a real `generateContent` call.
 - `src/Program.cs` — `--import-qloo-key`.
 - `README.md`, `.env.example`, this document.
 

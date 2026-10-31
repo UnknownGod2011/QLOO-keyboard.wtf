@@ -44,6 +44,13 @@ internal static class Program
             Environment.ExitCode = new Services.Qloo.QlooCredentialStore().ImportFromFile(args[1]) ? 0 : 1;
             return;
         }
+        // QLOO.exe --import-gemini-keys "<file>": adds one key per line to the Personal API key pool
+        // (DPAPI vault), probing each with a real generateContent call. Keys are never echoed.
+        if (args.Length >= 2 && string.Equals(args[0], "--import-gemini-keys", StringComparison.OrdinalIgnoreCase))
+        {
+            Environment.ExitCode = Services.Ai.Backends.PersonalKeyImporter.Run(args[1]);
+            return;
+        }
 
         WindowsAppLifecycleService.WaitForRestartParent(args);
 

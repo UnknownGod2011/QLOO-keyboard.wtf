@@ -376,6 +376,29 @@ public sealed class QlooTasteTests : IDisposable
             Assert.Contains($"\"name\":\"{name}\"", enhanced);
     }
 
+    // ---------------- Gemini key pool import ----------------
+
+    [Fact]
+    public async Task Gemini_key_import_keeps_generating_keys_active_and_others_inactive()
+    {
+        var vault = new KeyboardWtf.Services.Ai.Backends.PersonalApiVault(Path.Combine(_dir, "personal-api-v1.dat"),
+            defaultPolicy: KeyboardWtf.Services.Ai.Backends.AiBackendPolicy.PersonalOnly);
+        var keys = Enumerable.Range(1, 12).Select(i => $"AQ.synthetic-key-{i:00}-0123456789abcdef").ToList();
+        keys.Insert(3, keys[0]); // duplicate line
+        var summary = await KeyboardWtf.Services.Ai.Backends.PersonalKeyImporter.ImportAsync(vault, keys,
+            (key, _) => Task.FromResult(key.Contains("-02-") || key.Contains("-05-")
+                ? KeyboardWtf.Services.Ai.Backends.PersonalKeyValidation.CapabilityUnavailable
+                : KeyboardWtf.Services.Ai.Backends.PersonalKeyValidation.AuthenticationValidated));
+
+        var view = vault.GetView();
+        Assert.Equal(10, view.Keys.Count);                 // pool maximum
+        Assert.Equal(10, summary.Added);
+        Assert.Equal(8, summary.Active);
+        Assert.Equal(2, summary.Inactive);
+        Assert.Equal(8, view.Keys.Count(k => k.Enabled && k.AuthenticationValidated));
+        Assert.All(view.Keys, k => Assert.DoesNotContain("synthetic", k.Mask));
+    }
+
     // ---------------- helpers ----------------
 
     private QlooClient Client(FakeQloo handler, int dailyBudget = 150) =>

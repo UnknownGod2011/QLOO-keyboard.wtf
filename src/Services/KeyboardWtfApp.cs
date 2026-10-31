@@ -372,6 +372,16 @@ public sealed class KeyboardWtfApp : IDisposable
         }
     }
 
+    /// <summary>Ends a running Jarvis conversation so a Qloo ON/OFF switch applies to the next one
+    /// (Gemini Live receives its tool list once, at session setup). Returns true if one was running.</summary>
+    internal async Task<bool> EndJarvisConversationIfActiveAsync()
+    {
+        if (_liveConversation is null || !(_liveConversation.IsActive || _liveConversation.IsStarting))
+            return false;
+        await _liveConversation.StopAsync();
+        return true;
+    }
+
     public async Task SendJarvisTextTurnAsync(string text, CancellationToken token = default)
     {
         if (string.IsNullOrWhiteSpace(text))

@@ -53,11 +53,12 @@ Details: [docs/QLOO_ARCHITECTURE.md](docs/QLOO_ARCHITECTURE.md) and the Qloo ref
 - A contradicting explicit statement halves the older opposite evidence instead of overwriting it, and the preference is marked "recently changed". A correction from Settings is authoritative.
 - The same observation within 24 hours is counted once.
 - Health, religion, politics, sexuality, ethnicity, finances and identifiers are refused, never stored.
-- You can inspect, flip ("actually I dislike it"), forget or clear everything in **Settings → Qloo cultural intelligence**, or by voice ("what do you know about my taste?", "forget that I like sushi").
+- You can inspect, flip ("actually I dislike it"), forget or clear everything in **Settings → Connectors → Qloo → What Jarvis has learned about your taste**, or by voice ("what do you know about my taste?", "forget that I like sushi").
 
 ## Qloo ON / OFF
 
-- **On by default.** Settings → **Qloo cultural intelligence** has a single toggle. It applies from the next Jarvis conversation.
+- **On by default.** Settings → **Connectors** → **Qloo** has a single On switch. Switching ends a running Jarvis conversation, so the next one starts in the new mode (Gemini Live receives its tools when a conversation starts).
+- **Try the difference:** switch Qloo off, start Jarvis and ask "Inception or Mamma Mia tonight?". Then switch it on, tell Jarvis a few things you like ("I love Interstellar and Arrival, I can't stand horror"), and ask again.
 - **OFF = the original Jarvis.** The Gemini tool list and system instruction are exactly the pre-Qloo ones (a unit test checks the serialized tool list is unchanged).
 - **ON without a key** still uses taste memory and says the result is not Qloo-grounded, with a setup hint.
 - **Qloo down, quota used up, or 401** → the same decision falls back to taste memory and ordinary reasoning, flagged as not Qloo-grounded.
@@ -73,9 +74,9 @@ dotnet run --project .\src\KeyboardWtf.csproj -c Release
 
 The tray process is `QLOO.exe`. On first run Settings opens in your browser.
 
-1. **Gemini key:** Settings → *Personal Gemini API* → *Add Gemini API key* (native Windows dialog, stored with DPAPI).
+1. **Gemini key pool (up to 10 keys):** Settings → *Personal Gemini API* → *Add Gemini API key* (native Windows dialog, stored with DPAPI), or import several at once with `QLOO.exe --import-gemini-keys "C:\path\to\keys.txt"` (one key per line). Current `AQ.` auth keys and legacy `AIza` keys both work; QLOO sends them in the `x-goog-api-key` header, as the Gemini API docs describe, for both REST and Live. The importer tests each key with a real `generateContent` call: keys that can generate join the active rotation; keys Google rejects (for example "free tier is not available for this project") are stored inactive and can be validated later from Settings.
 2. **Qloo key**, any one of:
-   - Settings → *Qloo cultural intelligence* → *Add or replace Qloo API key* (native dialog, stored with DPAPI in `%LOCALAPPDATA%\QLOO\qloo-api-v1.dat`);
+   - Settings → *Connectors* → *Qloo* → *Add or replace Qloo API key* (native dialog, stored with DPAPI in `%LOCALAPPDATA%\QLOO\qloo-api-v1.dat`);
    - `QLOO.exe --import-qloo-key "C:\path\to\key.txt"` (stores the first key-shaped token from a local file, prints nothing);
    - the `QLOO_API_KEY` environment variable (developer fallback; see [.env.example](.env.example)).
 

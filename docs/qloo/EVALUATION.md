@@ -25,7 +25,12 @@ What the Qloo tests cover: hackathon base URL and `X-Api-Key` header (key never 
 | Shortcuts with keyboard.wtf running | Jarvis `Ctrl+Alt+Shift+Q`, Settings `Ctrl+Alt+P` registered; Cancel fell back to `Ctrl+Alt+Shift+X` because keyboard.wtf owns `Ctrl+Alt+X` |
 | Simulated key presses | `Ctrl+Alt+P` opened Settings; `Ctrl+Alt+Shift+Q` started Jarvis, which stopped with "No enabled, authenticated Personal API key" because the Gemini key has not been added to this new QLOO profile yet |
 
-Not verified automatically: a spoken Gemini Live conversation (needs the Gemini key in Settings and a person at the microphone) and an on-screen `inspect_screen` comparison.
+### End-to-end desktop run with the key pool (after importing 10 Gemini keys and the Qloo key)
+
+- Key pool: 10 keys stored, 6 active. The other 4 were rejected by Google for both REST and Live with "The Gemini API free tier is not available for this project" (a project billing setting; no request format changes that) and are stored inactive. The `AQ.` keys work with the documented `x-goog-api-key` header for REST and for the Live WebSocket.
+- Typed turns through the normal Jarvis Live route (`/api/jarvis/text-turn`): the Live session connected in about 1.5 s; "remember my taste: I love sci-fi films like Interstellar and Arrival, and I can't stand horror" produced one `taste_observe` call that stored four strong preferences; "Inception or Mamma Mia tonight?" produced one `taste_decide` call with 6 Qloo requests (4 `/search`, 1 `/v2/tags`, 1 `/v2/insights`) and a Qloo-grounded brief; "goodbye" ended the session. The test preferences were cleared afterwards.
+
+Not verified automatically: a spoken (microphone) conversation and an on-screen `inspect_screen` comparison.
 
 ## 3. Live comparative evaluation (Qloo OFF vs ON)
 

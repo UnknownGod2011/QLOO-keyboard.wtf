@@ -55,9 +55,11 @@ public sealed partial class WebSettingsService
                 {
                     var enabled = root.TryGetProperty("enabled", out var e) && e.ValueKind == JsonValueKind.True;
                     _settings.SaveQlooEnabled(enabled);
-                    message = enabled
-                        ? "Qloo cultural intelligence is on. It applies from the next Jarvis conversation."
-                        : "Qloo cultural intelligence is off. Jarvis behaves exactly like the original from the next conversation.";
+                    var ended = _app is not null && await _app.EndJarvisConversationIfActiveAsync();
+                    message = (enabled
+                        ? "Qloo is on: Jarvis uses your taste memory and Qloo for personal choices."
+                        : "Qloo is off: Jarvis behaves exactly like the original.")
+                        + (ended ? " The running conversation was ended; start Jarvis again to use the new mode." : "");
                     break;
                 }
                 case "add-key":

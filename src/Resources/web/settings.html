@@ -40,22 +40,6 @@
     <label><input id="browserAutomationEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">Enable browser automation</label>
     <p class="note">Start or end Jarvis: <code>Ctrl+Alt+Shift+Q</code>. Cancel a current action: <code>Ctrl+Alt+X</code>. Open these settings: <code>Ctrl+Alt+P</code>.</p>
   </section>
-  <section class="card" id="qloo">
-    <h2>Qloo cultural intelligence</h2>
-    <p class="note">When on, Jarvis keeps an adaptive taste memory on this PC and uses Qloo's cultural taste graph for personal decisions (films, music, fashion, dining, travel…). When off, Jarvis behaves exactly like the original. Changes apply from the next Jarvis conversation.</p>
-    <label><input id="qlooEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">Use Qloo cultural intelligence and taste memory</label>
-    <p id="qlooKeyStatus" class="note" role="status">Checking Qloo…</p>
-    <div class="row" style="margin-top:8px">
-      <button id="qlooAddKey" type="button">Add or replace Qloo API key</button>
-      <button id="qlooRemoveKey" type="button">Remove Qloo key</button>
-    </div>
-    <p id="qlooUsage" class="note"></p>
-    <h2 style="margin-top:18px">What Jarvis has learned about your taste</h2>
-    <p class="note">Learned from what you say and choose. Explicit statements count most; repeated choices raise confidence; occasion-specific and temporary preferences never overwrite your general taste. Sensitive traits are never stored.</p>
-    <div id="tasteList" class="note" role="status">Loading…</div>
-    <div class="row" style="margin-top:10px"><button id="tasteClear" type="button">Clear taste memory</button><button id="qlooClearCache" type="button">Clear private Qloo cache</button></div>
-    <p id="qlooStatus" class="note" role="status"></p>
-  </section>
   <section class="card" id="browser-automation">
     <h2>Browser Automation data disclosure</h2>
     <p class="note">When you start a browser task, the Chrome Helper sends the controlled tab's URL/title, bounded visible page text, selected text, form/control state, and action receipts to the local QLOO app through Chrome Native Messaging. This can include personal information or communications present in the task you selected. When page understanding needs AI, QLOO sends the user request and a bounded task snapshot - plus a current-tab screenshot only for visual recovery - to the configured Gemini browser model.</p>
@@ -69,6 +53,26 @@
   </section>
   <section class="card" id="connectors">
     <h2>Connectors</h2>
+    <div id="qloo" style="border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0 18px">
+      <div class="row" style="align-items:center">
+        <div><strong>Qloo</strong> · cultural intelligence and taste memory</div>
+        <label style="font-weight:normal"><input id="qlooEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">On</label>
+      </div>
+      <p class="note">Off: the original Jarvis. On: Jarvis remembers your taste and uses Qloo's taste graph when you ask it to choose or recommend (films, music, fashion, dining, travel…). A running Jarvis conversation ends when you switch, so the next one starts in the new mode.</p>
+      <p id="qlooKeyStatus" class="note" role="status">Checking Qloo…</p>
+      <div class="row" style="margin-top:8px">
+        <button id="qlooAddKey" type="button">Add or replace Qloo API key</button>
+        <button id="qlooRemoveKey" type="button">Remove Qloo key</button>
+      </div>
+      <p id="qlooUsage" class="note"></p>
+      <details style="margin-top:8px">
+        <summary>What Jarvis has learned about your taste</summary>
+        <p class="note">Learned from what you say and choose. Explicit statements count most, repeated choices raise confidence, and occasion-specific or temporary preferences never overwrite your general taste. Sensitive traits are never stored.</p>
+        <div id="tasteList" class="note" role="status">Loading…</div>
+        <div class="row" style="margin-top:10px"><button id="tasteClear" type="button">Clear taste memory</button><button id="qlooClearCache" type="button">Clear private Qloo cache</button></div>
+      </details>
+      <p id="qlooStatus" class="note" role="status"></p>
+    </div>
     <p class="note">Gmail, Calendar and other native connectors use an independently configured QLOO connector relay. Connector sign-in is separate from Gemini inference and does not enable a managed or usage-billed AI backend.</p>
     <p class="note">Set both <code>QLOO_CONNECTOR_BACKEND_URL</code> and <code>QLOO_CONNECTOR_WEB_URL</code> before connecting a provider. Without both, Jarvis remains available for local and browser tasks but connector authorization is unavailable.</p>
     <div class="row" style="margin-top:14px">
