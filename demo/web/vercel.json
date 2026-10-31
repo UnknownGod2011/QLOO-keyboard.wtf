@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/decide.js": { "maxDuration": 30 },
+    "api/decide.js": { "maxDuration": 60 },
     "api/health.js": { "maxDuration": 10 }
   },
   "headers": [

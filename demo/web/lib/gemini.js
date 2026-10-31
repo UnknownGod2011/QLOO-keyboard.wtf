@@ -144,13 +144,26 @@ export function createGemini({ env = {}, mock = false, fetchImpl, timeoutMs = 20
   const model = /^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(String(env.GEMINI_MODEL || '')) ? env.GEMINI_MODEL : DEFAULT_GEMINI_MODEL;
   const doFetch = fetchImpl || globalThis.fetch;
 
-  async function generateJson({ system, text, images = [] }) {
+  // One bounded retry for transient failures (5xx/429/timeout/truncated JSON).
+  async function generateJson(args) {
+    try {
+      return await generateJsonOnce(args);
+    } catch (e) {
+      const transient = e instanceof GeminiError && (/^http_(5\d\d|429)$/.test(e.code) || ['timeout', 'network', 'empty', 'bad_json'].includes(e.code));
+      if (!transient) throw e;
+      await new Promise((r) => setTimeout(r, 400));
+      return generateJsonOnce(args);
+    }
+  }
+
+  async function generateJsonOnce({ system, text, images = [] }) {
     if (!apiKey) throw new GeminiError('not_configured', 'Gemini is not configured');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     const body = {
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: 'user', parts: [{ text }, ...images.map((i) => ({ inlineData: { mimeType: i.mimeType, data: i.data } }))] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 2048 },
+      // Thinking models spend part of the output budget on reasoning; keep room for the JSON answer.
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 8192 },
     };
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
