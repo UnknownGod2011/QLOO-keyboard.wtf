@@ -54,6 +54,6 @@ Findings, stated plainly:
 
 Approximate live Qloo usage for all verification and evaluation on 2026-10-31: about 60 requests, many later answered from cache.
 
-## 4. Hosted demo check
+## 4. Demo page check
 
-`https://qloo-jarvis-taste.vercel.app`: `/api/health` reports Qloo and Gemini configured (booleans only). The OFF/ON check for the movie scenario returned the same results as above; a repeat ON request was served entirely from the instance cache (0 Qloo calls, 6 cache hits).
+The Windows download page at `https://keyboardwtf.com/qloo-demo` provides setup instructions and links to the GitHub release. The full Windows application includes the live Gemini + Qloo integration with voice, screen reading, and browser automation.

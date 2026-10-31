@@ -153,7 +153,7 @@ Private on-disk cache keyed by canonical sorted query (search/tags 30 days, insi
 - [x] Settings toggle, key management, usage, taste-profile editor
 - [x] Second global shortcut (Open Settings, `Ctrl+Alt+P`)
 - [x] Unit tests; demo tests; live OFF/ON evaluation
-- [x] Hosted demo deployed (https://qloo-jarvis-taste.vercel.app)
+- [x] Demo page deployed at https://keyboardwtf.com/qloo-demo
 - [ ] Manual voice/screen session on the target PC with both keys configured (needs the user's microphone and Gemini key in Settings)
 
 ## Lineage and isolation

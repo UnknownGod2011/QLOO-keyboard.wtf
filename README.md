@@ -7,7 +7,7 @@ QLOO Jarvis is the Jarvis mode of [keyboard.wtf](https://github.com/UnknownGod20
 
 Ask "which of these two shirts suits me?", "find a film I'd actually enjoy" or "Inception or Mamma Mia tonight?" and Jarvis compares the options against your remembered preferences, asks Qloo how those options relate to things you already like, picks one, and says why. Tell it "not that one" and the next decision changes.
 
-**Hosted demo (no install, no keys needed):** https://qloo-jarvis-taste.vercel.app. It runs the same decision engine in the browser with a demo persona, side by side with Qloo OFF and ON.
+**Try QLOO:** Download at [keyboardwtf.com/qloo-demo](https://keyboardwtf.com/qloo-demo) or from [GitHub Releases](https://github.com/UnknownGod2011/QLOO-keyboard.wtf/releases/latest). Setup takes 5 minutes with your own Gemini + Qloo API keys.
 
 ## The problem
 
