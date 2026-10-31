@@ -119,6 +119,13 @@ internal sealed class AiBackendGateway : IDisposable
                 {
                     result = await _text.GenerateAsync(key, model, request, cancellation);
                 }
+                catch (PersonalAiException ex) when (ex.ModelScoped && PersonalModelCooldowns.FallbackFor(model) is { } fallback)
+                {
+                    AppLog.Info($"Personal AI model quota exhausted: operation={operation.LogicalOperationId:N} request={requestId:N} "
+                        + $"capability={capability} model={model} fallback={fallback} failure={ex.Failure} httpStatus={ex.HttpStatusCode?.ToString() ?? "none"}");
+                    cancellation.ThrowIfCancellationRequested();
+                    result = await _text.GenerateAsync(key, fallback, request, cancellation);
+                }
                 catch (PersonalAiException ex)
                 {
                     AppLog.Info($"Personal AI request failed: operation={operation.LogicalOperationId:N} request={requestId:N} "

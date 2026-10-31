@@ -30,6 +30,78 @@ internal sealed class PersonalAiException(PersonalAiFailure failure) : Exception
     // Numeric protocol metadata only; never retain provider error bodies,
     // request text, credentials, or response headers in diagnostics.
     internal int? HttpStatusCode { get; set; }
+    // Google reported a per-model quota (for example the free tier's daily request limit for one
+    // model). Other models on the same key, including Live, are unaffected, so the pool is not cooled.
+    internal bool ModelScoped { get; init; }
+
+    public override string Message => ModelScoped
+        ? "The free-tier limit for this Gemini model is used up on the active key for now. Jarvis voice and other features keep working."
+        : base.Message;
+}
+
+/// <summary>Per-key, per-model quota memory (in process). Prevents repeated 429 calls to a model whose
+/// daily or per-minute free-tier quota is exhausted on that key, without freezing the whole pool.</summary>
+internal static class PersonalModelCooldowns
+{
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Guid Slot, string Model), DateTimeOffset> Until = new();
+
+    internal static void Mark(Guid slot, string model, TimeSpan duration) =>
+        Until[(slot, model)] = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(Math.Clamp(duration.TotalSeconds, 1, 86_400));
+
+    internal static bool IsCooling(Guid slot, string model)
+    {
+        if (!Until.TryGetValue((slot, model), out var until)) return false;
+        if (until > DateTimeOffset.UtcNow) return true;
+        Until.TryRemove((slot, model), out _);
+        return false;
+    }
+
+    /// <summary>Lighter model on the same key to use when a model's own quota is exhausted.</summary>
+    internal static string FallbackFor(string model) =>
+        model == PersonalGeminiModels.Reasoning ? PersonalGeminiModels.Text : null;
+
+    /// <summary>Reads Google's 429 body (google.rpc.QuotaFailure / RetryInfo) without retaining it.
+    /// Model-scoped only when every reported violation is a per-model quota.</summary>
+    internal static (bool ModelScoped, TimeSpan? RetryDelay) ParseQuotaScope(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return (false, null);
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            if (!document.RootElement.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object
+                || !error.TryGetProperty("details", out var details) || details.ValueKind != JsonValueKind.Array)
+                return (false, null);
+            int violations = 0, perModel = 0;
+            TimeSpan? retry = null;
+            foreach (var detail in details.EnumerateArray())
+            {
+                var type = detail.ValueKind == JsonValueKind.Object && detail.TryGetProperty("@type", out var t)
+                    && t.ValueKind == JsonValueKind.String ? t.GetString() ?? "" : "";
+                if (type.EndsWith("google.rpc.QuotaFailure", StringComparison.Ordinal)
+                    && detail.TryGetProperty("violations", out var list) && list.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var violation in list.EnumerateArray())
+                    {
+                        violations++;
+                        var quotaId = violation.TryGetProperty("quotaId", out var q) && q.ValueKind == JsonValueKind.String
+                            ? q.GetString() ?? "" : "";
+                        var hasModel = violation.TryGetProperty("quotaDimensions", out var dims) && dims.ValueKind == JsonValueKind.Object
+                            && dims.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String
+                            && !string.IsNullOrWhiteSpace(m.GetString());
+                        if (hasModel || quotaId.Contains("PerModel", StringComparison.Ordinal)) perModel++;
+                    }
+                }
+                else if (type.EndsWith("google.rpc.RetryInfo", StringComparison.Ordinal)
+                    && detail.TryGetProperty("retryDelay", out var delay) && delay.ValueKind == JsonValueKind.String
+                    && delay.GetString() is { Length: > 1 } text && text.EndsWith('s')
+                    && double.TryParse(text[..^1], System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var seconds) && seconds > 0)
+                    retry = TimeSpan.FromSeconds(Math.Min(seconds, 86_400));
+            }
+            return (violations > 0 && perModel == violations, retry);
+        }
+        catch (JsonException) { return (false, null); }
+    }
 }
 
 /// <summary>One owned direct-provider attempt; never calls managed accounting or rotates keys on ambiguous completion.</summary>
@@ -68,6 +140,9 @@ internal sealed class PersonalGeminiHttpTransport : IDisposable
         try
         {
             _vault.EnsureDispatchAllowed(credential);
+            // This key's quota for this model is known to be exhausted: fail fast, no request.
+            if (PersonalModelCooldowns.IsCooling(credential.SlotId, model))
+                throw new PersonalAiException(PersonalAiFailure.Quota) { ModelScoped = true, HttpStatusCode = 429 };
             using var request = new HttpRequestMessage(HttpMethod.Post,
                 "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent");
             request.Headers.Add("x-goog-api-key", _vault.ReadSecretForTransport(credential));
@@ -84,6 +159,18 @@ internal sealed class PersonalGeminiHttpTransport : IDisposable
             deadline.Token.ThrowIfCancellationRequested();
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
+                string quotaBody = null;
+                try { quotaBody = Encoding.UTF8.GetString(await ReadBoundedAsync(response.Content, deadline.Token)); }
+                catch (Exception ex) when (ex is IOException or HttpRequestException or InvalidOperationException or PersonalAiException) { }
+                var (modelScoped, retryDelay) = PersonalModelCooldowns.ParseQuotaScope(quotaBody);
+                quotaBody = null; // Error bodies are parsed for scope only, never retained or logged.
+                if (modelScoped)
+                {
+                    // Google's per-model quota (e.g. 20 free-tier requests/day): only this key+model rests.
+                    PersonalModelCooldowns.Mark(credential.SlotId, model, retryDelay ?? TimeSpan.FromMinutes(1));
+                    _diagnostics($"Personal model quota reached: model={model} cooldownSeconds={(long)(retryDelay ?? TimeSpan.FromMinutes(1)).TotalSeconds} poolCooled=False");
+                    throw new PersonalAiException(PersonalAiFailure.Quota) { ModelScoped = true };
+                }
                 var delay = response.Headers.RetryAfter?.Delta
                     ?? (response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow) ?? TimeSpan.FromMinutes(1);
                 _vault.CoolDownUnknownScopePool(TimeSpan.FromSeconds(Math.Clamp(delay.TotalSeconds, 1, 86_400)));

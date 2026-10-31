@@ -373,3 +373,56 @@ public sealed class PersonalGeminiHttpTransportTests : IDisposable
     }
     public void Dispose() { if (Directory.Exists(_directory)) Directory.Delete(_directory, true); }
 }
+
+    [Fact]
+    public async Task Model_scoped_quota_429_does_not_cool_pool_and_prevents_repeated_requests_to_that_model()
+    {
+        var calls = 0;
+        var quota429 = Reply(429, """
+            {"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+            {"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+            "description":"Generate content requests per day limit exceeded on Free Tier.","quotaDimensions":{"location":"global","model":"gemini-3.6-flash"},"quotaValue":"20"}]},
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"63440s"}]}}
+            """);
+        using var transport = new PersonalGeminiHttpTransport(_vault, new Handler((_, _) =>
+            { calls++; return Task.FromResult(quota429); }));
+        using var operation = _router.BeginOperation();
+        var first = await Assert.ThrowsAsync<PersonalAiException>(() =>
+            _router.ExecuteAsync(operation, AiCapability.Images, _ => throw new Exception("Managed forbidden"),
+                (key, model, token) => transport.GenerateAsync(key, model, new("test", null, 16), token)));
+        Assert.Equal(PersonalAiFailure.Quota, first.Failure);
+        Assert.True(first.ModelScoped);
+        Assert.Equal(429, first.HttpStatusCode);
+        Assert.Equal(1, calls);
+        var second = await Assert.ThrowsAsync<PersonalAiException>(() =>
+            _router.ExecuteAsync(operation, AiCapability.Images, _ => throw new Exception("Managed forbidden"),
+                (key, model, token) => transport.GenerateAsync(key, model, new("test", null, 16), token)));
+        Assert.Equal(PersonalAiFailure.Quota, second.Failure);
+        Assert.True(second.ModelScoped);
+        Assert.Equal(1, calls); // No repeated HTTP request; fast-failed due to cooldown memory.
+        Assert.Null(_vault.GetView().CooldownUntil); // Pool not cooled.
+        using var nextOperation = _router.BeginOperation(); // Pool still works for other capabilities/models.
+        Assert.NotNull(nextOperation);
+    }
+
+    [Theory]
+    [InlineData("""{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"PerModel"}]}]}}""", true)]
+    [InlineData("""{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaDimensions":{"model":"gemini-3.5-flash"}}]}]}}""", true)]
+    [InlineData("""{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":"GenerateRequestsPerDayPerProject"}]}]}}""", false)]
+    [InlineData("""{"error":{"code":429,"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3600s"}]}}""", false)]
+    [InlineData("""{"error":{"code":429}}""", false)]
+    public void Quota_scope_parser_detects_per_model_violations(string body, bool expectModelScoped)
+    {
+        var (modelScoped, _) = PersonalModelCooldowns.ParseQuotaScope(body);
+        Assert.Equal(expectModelScoped, modelScoped);
+    }
+
+    [Fact]
+    public void Quota_scope_parser_extracts_retry_delay()
+    {
+        var (_, delay) = PersonalModelCooldowns.ParseQuotaScope(
+            """{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7200.5s"}]}}""");
+        Assert.NotNull(delay);
+        Assert.Equal(7200, (int)delay.Value.TotalSeconds);
+    }
