@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QLOO Jarvis — taste-aware decisions (web demo)</title>
+  <meta name="description" content="Web demo of the QLOO Jarvis Windows assistant: Qloo Taste AI + adaptive taste memory + Gemini, with a Qloo OFF/ON comparison.">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#q">Skip to the question</a>
+  <header class="top">
+    <div class="brand">
+      <div class="orb" aria-hidden="true"></div>
+      <div>
+        <h1>QLOO Jarvis <span class="dash">—</span> taste-aware decisions</h1>
+        <p class="sub">Web demo of the Windows assistant · Qloo Taste AI + adaptive taste memory + Gemini</p>
+      </div>
+    </div>
+    <div class="status" aria-live="polite">
+      <span class="pill" id="st-gemini">Gemini …</span>
+      <span class="pill" id="st-qloo">Qloo …</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="col-main" aria-label="Ask Jarvis">
+      <form id="ask" class="card ask" autocomplete="off" novalidate>
+        <label for="q" class="label">Ask Jarvis</label>
+        <textarea id="q" rows="2" maxlength="1000" placeholder="Which of these two shirts fits my style better?"></textarea>
+        <div class="chips" aria-label="Example questions">
+          <button type="button" class="chip" data-example="shirts">Which of these two shirts fits my style better?</button>
+          <button type="button" class="chip" data-example="tonight">Find a movie I would genuinely enjoy tonight</button>
+          <button type="button" class="chip" data-example="inception">Which is a better pick for me: Inception or Mamma Mia!?</button>
+          <button type="button" class="chip" data-example="math">What is 17% of 2,340? <span class="chip-note">(Qloo not called)</span></button>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="opts" class="label small">Options <span class="muted">optional · one per line or “A: … / B: …”</span></label>
+            <textarea id="opts" rows="2" maxlength="2000" placeholder="A: navy minimalist linen shirt, Uniqlo / B: neon graphic tee with large logo"></textarea>
+          </div>
+          <div class="field">
+            <label for="loc" class="label small">City <span class="muted">optional · for restaurants and hotels</span></label>
+            <input id="loc" type="text" maxlength="80" placeholder="e.g. Austin">
+            <div class="upload">
+              <input id="img" type="file" accept="image/jpeg,image/png,image/webp" multiple class="visually-hidden">
+              <label for="img" class="btn ghost small" id="img-label">Add images <span class="muted">(max 3)</span></label>
+              <div id="thumbs" class="thumbs"></div>
+            </div>
+          </div>
+        </div>
+        <div class="controls">
+          <fieldset class="seg" id="mode-seg">
+            <legend class="visually-hidden">Qloo mode</legend>
+            <input type="radio" name="mode" id="mode-off" value="off">
+            <label for="mode-off">Qloo OFF</label>
+            <input type="radio" name="mode" id="mode-on" value="on" checked>
+            <label for="mode-on">Qloo ON</label>
+          </fieldset>
+          <button type="submit" class="btn primary" id="go">Decide</button>
+          <button type="button" class="btn" id="compare">Compare OFF vs ON</button>
+          <label class="toggle" title="Demonstrates graceful fallback: no Qloo calls are made">
+            <input type="checkbox" id="outage"> Simulate Qloo outage
+          </label>
+        </div>
+        <p class="hint" id="mode-hint"></p>
+      </form>
+
+      <div id="error" class="error" role="alert" hidden></div>
+      <section id="results" class="results" aria-live="polite" aria-busy="false"></section>
+    </section>
+
+    <aside class="col-side card" aria-labelledby="mem-title">
+      <div class="side-head">
+        <div>
+          <h2 id="mem-title">Taste memory</h2>
+          <p class="muted small" id="persona-line">Demo persona: Alex</p>
+        </div>
+        <button type="button" class="btn ghost small" id="reset">Reset demo persona</button>
+      </div>
+
+      <form id="add" class="add" autocomplete="off" novalidate>
+        <fieldset class="seg small" id="pol-seg">
+          <legend class="visually-hidden">Like or dislike</legend>
+          <input type="radio" name="pol" id="pol-like" value="1" checked>
+          <label for="pol-like">Like</label>
+          <input type="radio" name="pol" id="pol-dislike" value="-1">
+          <label for="pol-dislike">Dislike</label>
+        </fieldset>
+        <div class="row">
+          <label class="visually-hidden" for="add-domain">Domain</label>
+          <select id="add-domain"></select>
+          <label class="visually-hidden" for="add-attr">Kind of thing</label>
+          <select id="add-attr">
+            <option value="entity">title / name</option>
+            <option value="brand">brand</option>
+            <option value="artist">artist</option>
+            <option value="style">style</option>
+            <option value="genre">genre</option>
+            <option value="color">colour</option>
+            <option value="feature">feature</option>
+            <option value="cuisine">cuisine</option>
+            <option value="general">other</option>
+          </select>
+        </div>
+        <label class="visually-hidden" for="add-value">What</label>
+        <input id="add-value" type="text" maxlength="80" placeholder="e.g. Dune, linen, jazz">
+        <div class="row">
+          <label class="visually-hidden" for="add-context">Only for this occasion (optional)</label>
+          <input id="add-context" type="text" maxlength="40" placeholder="Only for… (optional, e.g. wedding)">
+          <label class="toggle small"><input type="checkbox" id="add-temp"> Just for now (14 d)</label>
+        </div>
+        <button class="btn small" type="submit">Remember</button>
+        <p id="add-msg" class="msg" role="status" aria-live="polite"></p>
+      </form>
+
+      <div id="prefs" class="prefs"></div>
+      <p class="privacy small">Your taste memory lives only in this browser (localStorage). It is sent with each request for that one decision and is not stored on the server. Only short entity names and style words go to Qloo. Sensitive topics (health, religion, politics, sexuality, ethnicity, finances, contact details, immigration, criminal record) are refused.</p>
+    </aside>
+  </main>
+
+  <footer class="foot">
+    <p>Same decision engine as the Windows app: Gemini reads the question → taste memory + Qloo Taste AI build an evidence brief → Gemini makes the final, cited decision. Qloo judges cultural affinity, not colour or fit.</p>
+  </footer>
+</body>
+</html>
