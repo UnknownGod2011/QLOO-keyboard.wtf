@@ -1,9 +1,9 @@
 # Integration design: Qloo in QLOO Jarvis
 
-**Status:** this is the design implemented in `src/Services/Taste/` (decision engine, preference store,
-tools) and `src/Services/Qloo/` (HTTP client, cache, quota, key storage). Those folders were not yet
-present in the working tree when this document was written on 2026-10-31. Where code and this document
-disagree, update one of them.
+**Status:** implemented in `src/Services/Taste/` (`TasteProfileStore`, `TasteDecisionEngine`,
+`TasteJarvisTools`) and `src/Services/Qloo/` (`QlooClient`, `QlooCredentialStore`); settings routes in
+`src/Services/WebSettingsService.Qloo.cs`. Test results: [EVALUATION.md](EVALUATION.md). Where code and
+this document disagree, update one of them.
 
 ## Roles
 

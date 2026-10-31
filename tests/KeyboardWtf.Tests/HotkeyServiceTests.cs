@@ -31,8 +31,13 @@ public sealed class HotkeyServiceTests
     [Fact]
     public void ConflictFallbacksDoNotUseReservedCursivisShortcut()
     {
-        Assert.Equal("Ctrl+Alt+J", HotkeyService.JarvisFallback);
-        Assert.Equal("Ctrl+Alt+Escape", HotkeyService.CancelFallback);
+        // QLOO runs beside keyboard.wtf, which owns Ctrl+Alt+J and Ctrl+Alt+Escape as its own
+        // fallbacks, so QLOO's fallbacks add Shift. None may use the reserved Space shortcut.
+        Assert.Equal("Ctrl+Alt+Shift+J", HotkeyService.JarvisFallback);
+        Assert.Equal("Ctrl+Alt+Shift+X", HotkeyService.CancelFallback);
+        Assert.Equal("Ctrl+Alt+Shift+P", HotkeyService.OpenSettingsFallback);
+        Assert.DoesNotContain("Space", HotkeySettings.Defaults().Jarvis, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Space", HotkeyService.OpenSettingsFallback, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Space", HotkeyService.JarvisFallback, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Space", HotkeyService.CancelFallback, StringComparison.OrdinalIgnoreCase);
     }

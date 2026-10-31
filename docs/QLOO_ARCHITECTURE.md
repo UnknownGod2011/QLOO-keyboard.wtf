@@ -14,7 +14,7 @@ QLOO Jarvis is a WinForms tray app (`QLOO.exe`, .NET 8, `src/KeyboardWtf.csproj`
 
 ## 2. Existing agent request and execution flow
 
-1. `Ctrl+Alt+Q` → `HotkeyService` → `CommandRegistry.ToggleJarvisMode` → `GeminiLiveConversationService.StartAsync`.
+1. The Jarvis shortcut (`Ctrl+Alt+Shift+Q`) → `HotkeyService` → `CommandRegistry.ToggleJarvisMode` → `GeminiLiveConversationService.StartAsync`.
 2. The service opens a Gemini Live WebSocket (`gemini-3.1-flash-live-preview`) through the Personal API transport and sends one `setup` message: voice config, `tools = BuildTools()`, and `systemInstruction = BuildSystemInstruction()` (behaviour rules + saved workflows, link aliases and intent memory).
 3. Microphone audio (16 kHz PCM) streams to Gemini; Gemini answers with audio and, when needed, `toolCall` frames.
 4. `LiveToolCallDispatcher` queues each call, applies the duplicate guard and calls `ExecuteToolAsync`. Memory tools are handled in the service; everything else goes to `CommandRegistry.ExecuteJarvisToolAsync` → routing, consent (`JarvisPermissionPolicy`) → `JarvisAutomationService` / connectors / browser automation.
@@ -88,7 +88,7 @@ Qloo is a **local Jarvis tool path**, not a relay connector: it needs no OAuth a
 - `WebSettingsService.Qloo.cs`: `POST /api/qloo/state` and `POST /api/qloo/action` (`enabled`, `add-key`, `remove-key`, `forget`, `correct`, `clear-profile`, `clear-cache`), protected by the existing action-token guard and update-work admission.
 - The Qloo key: `QlooCredentialStore` (DPAPI, `qloo-api-v1.dat`), native `QlooKeyEntryDialog`, `QLOO.exe --import-qloo-key <file>`, or `QLOO_API_KEY`. The page receives only `configured`, `keySource` and a 4-character mask.
 - Toggle semantics: read at Gemini Live session setup. OFF → `BuildToolsWith(null)` and no prompt section, which serialize exactly as before (unit-tested). ON → original declarations first, taste declarations appended.
-- Hotkeys: `HotkeySettings.OpenSettings = "Ctrl+Alt+P"` is now persisted and registered (fallback `Ctrl+Alt+Shift+P`), handled by `CommandRegistry.OpenSettings` → the same `KeyboardWtfApp.OpenSettings` used by the tray.
+- Hotkeys: Jarvis defaults to `Ctrl+Alt+Shift+Q` (fallback `Ctrl+Alt+Shift+J`) because `Ctrl+Alt+Q`, `Ctrl+Alt+J` and `Ctrl+Alt+Space` belong to keyboard.wtf; a one-time migration (`HotkeysRevision`) moves older QLOO settings off `Ctrl+Alt+Q`. `HotkeySettings.OpenSettings = "Ctrl+Alt+P"` is now persisted and registered (fallback `Ctrl+Alt+Shift+P`), handled by `CommandRegistry.OpenSettings` → the same `KeyboardWtfApp.OpenSettings` used by the tray. Cancel keeps `Ctrl+Alt+X` with a new non-conflicting fallback `Ctrl+Alt+Shift+X`.
 
 ## 10. Fallback architecture
 

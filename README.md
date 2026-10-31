@@ -85,11 +85,11 @@ The tray process is `QLOO.exe`. On first run Settings opens in your browser.
 
 | Action | Default | Fallback if taken |
 |---|---|---|
-| Start / end Jarvis | `Ctrl+Alt+Q` | `Ctrl+Alt+J` |
-| Cancel current action | `Ctrl+Alt+X` | `Ctrl+Alt+Escape` |
+| Start / end Jarvis | `Ctrl+Alt+Shift+Q` | `Ctrl+Alt+Shift+J` |
 | Open QLOO Settings | `Ctrl+Alt+P` | `Ctrl+Alt+Shift+P` |
+| Cancel current action (existing) | `Ctrl+Alt+X` | `Ctrl+Alt+Shift+X` |
 
-`Ctrl+Alt+P` avoids Windows-reserved combinations and keyboard.wtf's own defaults (K, D, Q, X and comma). Shortcuts live in `%LOCALAPPDATA%\QLOO\settings.json` (`Hotkeys`) and can be changed through the settings API (`POST /api/settings` with `hotkeys`), which rejects duplicates and rolls back if Windows refuses a combination.
+The two main shortcuts avoid Windows-reserved combinations and every keyboard.wtf shortcut (`Ctrl+Alt+Q/J/K/D/X/Escape/,` and the legacy `Ctrl+Alt+Space`), so QLOO and keyboard.wtf can run side by side; this was verified on a PC running keyboard.wtf, where all three QLOO shortcuts registered and fired. Older QLOO settings that still say `Ctrl+Alt+Q` are migrated once. Shortcuts live in `%LOCALAPPDATA%\QLOO\settings.json` (`Hotkeys`) and can be changed through the settings API (`POST /api/settings` with `hotkeys`), which rejects duplicates and rolls back if Windows refuses a combination.
 
 ### Qloo quota protection
 

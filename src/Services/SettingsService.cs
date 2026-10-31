@@ -43,7 +43,9 @@ public sealed class JarvisWorkflowActionSettings
 
 public sealed class HotkeySettings
 {
-    public string Jarvis { get; set; } = "Ctrl+Alt+Q";
+    // Ctrl+Alt+Q (Jarvis), Ctrl+Alt+J (its fallback) and Ctrl+Alt+Space (legacy push-to-talk) belong to
+    // keyboard.wtf. QLOO must run beside it, so its Jarvis default keeps the Q mnemonic with Shift.
+    public string Jarvis { get; set; } = "Ctrl+Alt+Shift+Q";
     public string Cancel { get; set; } = "Ctrl+Alt+X";
 
     // The loopback settings transport is shared with the original app.  Keep
@@ -116,6 +118,7 @@ public sealed class AppSettings
     // Off restores the original Jarvis tool list and system instruction exactly.
     public bool QlooEnabled { get; set; } = true;
     public int QlooDailyBudget { get; set; } = 150;
+    public int HotkeysRevision { get; set; }
 }
 
 public sealed class SettingsService
@@ -289,6 +292,15 @@ public sealed class SettingsService
         if (string.IsNullOrWhiteSpace(Current.Hotkeys.OpenSettings)
             || IsInaccessibleFunctionKey(Current.Hotkeys.OpenSettings))
             Current.Hotkeys.OpenSettings = HotkeySettings.Defaults().OpenSettings;
+        // One-time move off the inherited keyboard.wtf Jarvis default, which the two apps would share.
+        if (Current.HotkeysRevision < 2)
+        {
+            if (Current.Hotkeys.Jarvis is { } jarvis
+                && (jarvis.Equals("Ctrl+Alt+Q", StringComparison.OrdinalIgnoreCase)
+                    || jarvis.Equals("Ctrl+Alt+Space", StringComparison.OrdinalIgnoreCase)))
+                Current.Hotkeys.Jarvis = HotkeySettings.Defaults().Jarvis;
+            Current.HotkeysRevision = 2;
+        }
 
         // A side-by-side production candidate briefly used F13-F17 to avoid
         // colliding with an already-running legacy build. Most customer

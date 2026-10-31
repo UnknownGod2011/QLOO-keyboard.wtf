@@ -19,6 +19,7 @@ hackathon guide forbids storing Qloo response data in a public repository ([hack
 | [API_EXAMPLES.md](API_EXAMPLES.md) | Copy a working request shape (curl, `YOUR_API_KEY` placeholder) and see a synthetic response. |
 | [DECISION_CAPABILITIES.md](DECISION_CAPABILITIES.md) | Decide whether Qloo can help with a type of user decision, and what Gemini or the local taste memory must handle instead. |
 | [INTEGRATION_DESIGN.md](INTEGRATION_DESIGN.md) | See how Jarvis wires Gemini Live, the taste tools, the preference store and the Qloo client together (code in `src/Services/Taste/` and `src/Services/Qloo/`). |
+| [EVALUATION.md](EVALUATION.md) | See the automated test results, the Windows smoke test and the live Qloo OFF vs ON comparison. |
 
 ## Top 10 facts an implementer must know
 

@@ -910,7 +910,7 @@ public sealed partial class WebSettingsService : IDisposable
                 PushToTalk = GetHotkey(hotkeysEl, "pushToTalk", _settings?.Current.Hotkeys.PushToTalk ?? "Ctrl+Alt+K"),
                 Dictation = GetHotkey(hotkeysEl, "dictation", _settings?.Current.Hotkeys.Dictation ?? "Ctrl+Alt+D"),
                 Jarvis = GetHotkey(hotkeysEl, "jarvis",
-                    GetHotkey(hotkeysEl, "quickSend", _settings?.Current.Hotkeys.Jarvis ?? "Ctrl+Alt+Q")),
+                    GetHotkey(hotkeysEl, "quickSend", _settings?.Current.Hotkeys.Jarvis ?? HotkeySettings.Defaults().Jarvis)),
                 CommandMode = "",
                 QuickSend = "",
                 Cancel = GetHotkey(hotkeysEl, "cancel", _settings?.Current.Hotkeys.Cancel ?? "Ctrl+Alt+X"),

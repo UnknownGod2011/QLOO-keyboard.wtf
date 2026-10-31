@@ -8,8 +8,9 @@ using System.Windows.Forms;
 public sealed class HotkeyService : IDisposable
 {
     private const int WmHotkey = 0x0312;
-    public const string JarvisFallback = "Ctrl+Alt+J";
-    public const string CancelFallback = "Ctrl+Alt+Escape";
+    // Fallbacks avoid keyboard.wtf's own primaries and fallbacks (Ctrl+Alt+Q/J/X/Escape/K/D/,).
+    public const string JarvisFallback = "Ctrl+Alt+Shift+J";
+    public const string CancelFallback = "Ctrl+Alt+Shift+X";
     public const string OpenSettingsFallback = "Ctrl+Alt+Shift+P";
 
     private readonly ConcurrentDictionary<int, (string Name, string Hotkey, Action Handler)> _handlers = new();

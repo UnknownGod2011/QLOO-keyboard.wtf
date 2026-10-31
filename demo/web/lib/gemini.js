@@ -147,13 +147,16 @@ export function createGemini({ env = {}, mock = false, fetchImpl, timeoutMs = 20
   const extractModel = /^[a-z0-9][a-z0-9.\-]{1,60}$/i.test(String(env.GEMINI_EXTRACT_MODEL || '')) ? env.GEMINI_EXTRACT_MODEL : 'gemini-3.5-flash-lite';
   const doFetch = fetchImpl || globalThis.fetch;
 
-  // One bounded retry for transient failures (5xx/429/timeout/truncated JSON).
+  // One bounded retry for transient failures (5xx/429/timeout/truncated JSON). A 429 on the
+  // main model (per-model quota exhausted) retries once on the lighter model instead.
   async function generateJson(args) {
     try {
       return await generateJsonOnce(args);
     } catch (e) {
       const transient = e instanceof GeminiError && (/^http_(5\d\d|429)$/.test(e.code) || ['timeout', 'network', 'empty', 'bad_json'].includes(e.code));
       if (!transient) throw e;
+      const current = args.useModel || model;
+      if (e.code === 'http_429' && current !== extractModel) return generateJsonOnce({ ...args, useModel: extractModel });
       await new Promise((r) => setTimeout(r, e.code === 'http_429' ? 4000 : 400));
       return generateJsonOnce(args);
     }
