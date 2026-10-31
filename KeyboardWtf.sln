@@ -1,0 +1,67 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.8.34408.163
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KeyboardWtf", "src\KeyboardWtf.csproj", "{093948F7-9011-4610-BEE1-02199E347D67}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KeyboardWtf.Tests", "tests\KeyboardWtf.Tests\KeyboardWtf.Tests.csproj", "{46E3EB8D-67C4-4CA9-97A8-2A45D13B1BB1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{BD08438B-1C4A-4FFA-A856-D5285D570BB8}"
+	ProjectSection(SolutionItems) = preProject
+		.vscode\launch.json = .vscode\launch.json
+		.vscode\tasks.json = .vscode\tasks.json
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "staging", "staging", "{3C65B127-1925-433A-83D8-8C2A83AE5BC1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "backend", "backend", "{B17857C4-D2C6-46E3-B1F4-E9B31B0E9629}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KeyboardWtf.Staging.Api", "staging\backend\KeyboardWtf.Staging.Api\KeyboardWtf.Staging.Api.csproj", "{BE028DCD-D91E-49E8-B449-BD59C060DC11}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KeyboardWtf.Staging.Api.Tests", "staging\backend\KeyboardWtf.Staging.Api.Tests\KeyboardWtf.Staging.Api.Tests.csproj", "{1E6CE32B-D192-483C-9BAC-C9B3198FF58A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{A31FF46C-11D3-4B18-B466-4D0543E99F9C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KeyboardWtf.ReleaseSigner", "tools\KeyboardWtf.ReleaseSigner\KeyboardWtf.ReleaseSigner.csproj", "{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{093948F7-9011-4610-BEE1-02199E347D67}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{093948F7-9011-4610-BEE1-02199E347D67}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{093948F7-9011-4610-BEE1-02199E347D67}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{093948F7-9011-4610-BEE1-02199E347D67}.Release|Any CPU.Build.0 = Release|Any CPU
+		{46E3EB8D-67C4-4CA9-97A8-2A45D13B1BB1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{46E3EB8D-67C4-4CA9-97A8-2A45D13B1BB1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{46E3EB8D-67C4-4CA9-97A8-2A45D13B1BB1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{46E3EB8D-67C4-4CA9-97A8-2A45D13B1BB1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{BE028DCD-D91E-49E8-B449-BD59C060DC11}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BE028DCD-D91E-49E8-B449-BD59C060DC11}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BE028DCD-D91E-49E8-B449-BD59C060DC11}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BE028DCD-D91E-49E8-B449-BD59C060DC11}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1E6CE32B-D192-483C-9BAC-C9B3198FF58A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1E6CE32B-D192-483C-9BAC-C9B3198FF58A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1E6CE32B-D192-483C-9BAC-C9B3198FF58A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1E6CE32B-D192-483C-9BAC-C9B3198FF58A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DC8F0141-4845-4FAE-972A-A1E4B749D533}
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B17857C4-D2C6-46E3-B1F4-E9B31B0E9629} = {3C65B127-1925-433A-83D8-8C2A83AE5BC1}
+		{BE028DCD-D91E-49E8-B449-BD59C060DC11} = {B17857C4-D2C6-46E3-B1F4-E9B31B0E9629}
+		{1E6CE32B-D192-483C-9BAC-C9B3198FF58A} = {B17857C4-D2C6-46E3-B1F4-E9B31B0E9629}
+		{883B0E49-30A3-4C9F-B5AB-C7187E8EB20B} = {A31FF46C-11D3-4B18-B466-4D0543E99F9C}
+	EndGlobalSection
+EndGlobal

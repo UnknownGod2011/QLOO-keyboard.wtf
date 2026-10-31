@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch keyboard.wtf",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}\\bin\\Debug\\bin\\QLOO.dll",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build keyboard.wtf (Debug)",
+      "justMyCode": true
+    }
+  ]
+}

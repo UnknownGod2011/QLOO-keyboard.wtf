@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>QLOO — Jarvis settings</title>
+  <link rel="stylesheet" href="/connectors/connectors-panel.css">
+  <style>
+    :root { color-scheme: dark; --bg:#0d1017; --card:#151a24; --text:#f3f6fc; --muted:#9da9ba; --line:#293244; --accent:#82b1ff; --ok:#93d8b6; --bad:#ff9c9c; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 Segoe UI,system-ui,sans-serif; }
+    main { max-width:760px; margin:0 auto; padding:42px 24px 64px; } h1 { margin:0; font-size:31px; letter-spacing:-.03em; } h2 { margin:0 0 10px; font-size:18px; }
+    .lead { color:var(--muted); margin:6px 0 28px; } .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin:16px 0; }
+    label { display:block; margin:14px 0 5px; font-weight:600; } input, select { width:100%; min-height:39px; border:1px solid var(--line); border-radius:7px; background:#0f141d; color:var(--text); padding:8px 10px; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:14px; } button { border:0; border-radius:7px; padding:10px 15px; color:#06101b; background:var(--accent); font-weight:700; cursor:pointer; } button:disabled { opacity:.65; cursor:wait; }
+    code { background:#0a0e15; border:1px solid var(--line); border-radius:4px; padding:1px 5px; } .note { color:var(--muted); margin:6px 0 0; } .status { min-height:24px; margin-top:12px; color:var(--ok); } .status.error { color:var(--bad); }
+    @media(max-width:580px){ .row{grid-template-columns:1fr;} main{padding:28px 16px;} }
+  </style>
+</head>
+<body>
+<main>
+  <h1>QLOO</h1>
+  <p class="lead">Jarvis-only desktop assistant. Gemini Personal API is the sole inference backend.</p>
+  <section class="card" id="personal-api">
+    <h2>Personal Gemini API</h2>
+    <p class="note">Keys are entered in a native Windows dialog and stored in the QLOO profile using the current Windows account’s DPAPI protection. The browser settings page never receives the key.</p>
+    <div id="personalApiKeys" class="note" role="status">Loading secure key state…</div>
+    <button id="addGeminiKey" type="button" style="margin-top:12px">Add Gemini API key</button>
+    <p id="personalApiStatus" class="note" role="status"></p>
+  </section>
+  <section class="card" id="assistant">
+    <h2>Jarvis</h2>
+    <div class="row">
+      <div><label for="assistantName">Assistant name</label><input id="assistantName" maxlength="40"></div>
+      <div><label for="geminiVoice">Voice</label><select id="geminiVoice"></select></div>
+    </div>
+    <div class="row">
+      <div><label for="jarvisPermissionMode">Action mode</label><select id="jarvisPermissionMode"><option value="AlwaysAsk">Ask before actions</option><option value="AutoExecute">Auto-execute actions</option></select></div>
+      <div><label for="preferredBrowser">Preferred browser (optional)</label><input id="preferredBrowser" placeholder="Chrome, Edge, Firefox…"></div>
+    </div>
+    <label><input id="browserAutomationEnabled" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">Enable browser automation</label>
+    <p class="note">Start or end Jarvis: <code>Ctrl+Alt+Q</code>. Cancel a current action: <code>Ctrl+Alt+X</code>.</p>
+  </section>
+  <section class="card" id="browser-automation">
+    <h2>Browser Automation data disclosure</h2>
+    <p class="note">When you start a browser task, the Chrome Helper sends the controlled tab's URL/title, bounded visible page text, selected text, form/control state, and action receipts to the local QLOO app through Chrome Native Messaging. This can include personal information or communications present in the task you selected. When page understanding needs AI, QLOO sends the user request and a bounded task snapshot - plus a current-tab screenshot only for visual recovery - to the configured Gemini browser model.</p>
+    <p class="note">The extension does not read cookies, password values, OTPs, authentication storage, or file contents. Password, CAPTCHA, file-upload, payment, checkout, banking, and account-security steps stay manual. Data is not sold, used for advertising, creditworthiness, or unrelated profiling. Compact local diagnostic metadata remains until you delete the app log or local app data; page text and screenshots are not written to browser-task history.</p>
+    <label id="browserAutomationConsentChoice" style="font-weight:normal"><input id="browserAutomationConsentCheck" type="checkbox" style="width:auto;min-height:auto;margin-right:8px">I understand this disclosure and consent to browser-task data being processed for tasks I explicitly ask Jarvis to perform.</label>
+    <div class="row" style="margin-top:12px">
+      <button id="browserAutomationConsentAccept" type="button">I understand - enable Browser Automation</button>
+      <button id="browserAutomationConsentWithdraw" type="button" hidden>Withdraw consent and disable</button>
+    </div>
+    <p id="browserAutomationConsentStatus" class="note" role="status">Consent is required before the first browser task.</p>
+  </section>
+  <section class="card" id="connectors">
+    <h2>Connectors</h2>
+    <p class="note">Gmail, Calendar and other native connectors use an independently configured QLOO connector relay. Connector sign-in is separate from Gemini inference and does not enable a managed or usage-billed AI backend.</p>
+    <p class="note">Set both <code>QLOO_CONNECTOR_BACKEND_URL</code> and <code>QLOO_CONNECTOR_WEB_URL</code> before connecting a provider. Without both, Jarvis remains available for local and browser tasks but connector authorization is unavailable.</p>
+    <div class="row" style="margin-top:14px">
+      <button id="connectorSignIn" type="button">Sign in to connector service</button>
+      <button id="connectorSignOut" type="button" hidden>Sign out of connector service</button>
+    </div>
+    <p id="connectorSessionStatus" class="note" role="status">Checking connector service…</p>
+    <div id="paidAccountIdentity" hidden></div>
+    <div id="settings-connectors-panel" style="margin-top:16px"></div>
+    <hr style="border:0;border-top:1px solid var(--line);margin:20px 0">
+    <h2>Browser Helper</h2>
+    <p class="note">QLOO uses its own Chrome native host and extension identity. Connecting it does not replace the keyboard.wtf Helper.</p>
+    <button id="connectBrowser" type="button" style="margin-top:12px">Prepare QLOO Chrome Helper</button>
+    <p class="note">After the folder opens, load its unpacked extension from <code>chrome://extensions</code> and enable Developer mode.</p>
+    <p id="browserHelperStatus" class="note" role="status"></p>
+  </section>
+  <button id="save">Save settings</button><div id="status" class="status" role="status"></div>
+</main>
+<script type="module" src="/connectors/connectors-settings.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const status = $('status');
+  const setStatus = (text, bad = false) => { status.textContent = text; status.className = bad ? 'status error' : 'status'; };
+  let personalState = null;
+  async function personalAction(action, extra = {}) {
+    const response = await fetch('/api/personal-ai/action', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action, revision:personalState?.revision ?? 0, ...extra}) });
+    const result = await response.json();
+    if (!response.ok || result.ok !== true) throw new Error(result.message || 'Personal API action failed.');
+    $('personalApiStatus').textContent = result.message || '';
+    if (result.state) renderPersonalState(result.state);
+    else await loadPersonalState();
+  }
+  function renderPersonalState(state) {
+    personalState = state;
+    const root = $('personalApiKeys'); root.replaceChildren();
+    const rows = Array.isArray(state?.keys) ? state.keys : [];
+    if (!rows.some(row => row.enabled && row.validated)) {
+      const empty = document.createElement('span'); empty.textContent = 'No validated Gemini key is configured.'; root.append(empty);
+    }
+    for (const key of rows) {
+      const row = document.createElement('div'); row.className = 'row'; row.style.marginTop = '10px';
+      const label = document.createElement('span'); label.textContent = `${key.label || 'Gemini key'} · ${key.masked || '••••'} · ${key.enabled && key.validated ? 'Ready' : 'Inactive'}`;
+      const actions = document.createElement('div');
+      if (!key.enabled || !key.validated) {
+        const validate = document.createElement('button'); validate.type = 'button'; validate.textContent = 'Validate';
+        validate.addEventListener('click', () => personalAction('validate', {id:key.id, keyRevision:key.revision}).catch(error => $('personalApiStatus').textContent = error.message));
+        actions.append(validate);
+      }
+      const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove';
+      remove.addEventListener('click', () => {
+        if (!window.confirm(`Remove ${key.label || 'this Gemini API key'} from the QLOO profile?`)) return;
+        personalAction('remove', {id:key.id}).catch(error => $('personalApiStatus').textContent = error.message);
+      });
+      actions.append(remove); row.append(label, actions); root.append(row);
+    }
+  }
+  async function loadPersonalState() {
+    const response = await fetch('/api/personal-ai/state', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', cache:'no-store' });
+    const result = await response.json();
+    if (!response.ok || result.ok !== true) throw new Error(result.message || 'Could not load secure Personal API state.');
+    renderPersonalState(result.state);
+  }
+  async function load() {
+    const response = await fetch('/api/settings');
+    if (!response.ok) throw new Error('Could not load QLOO settings.');
+    const loaded = await response.json();
+    $('assistantName').value = loaded.assistantName || 'Jarvis';
+    $('jarvisPermissionMode').value = loaded.jarvisPermissionMode || 'AlwaysAsk';
+    $('preferredBrowser').value = loaded.preferredBrowser || '';
+    $('browserAutomationEnabled').checked = !!loaded.browserAutomation?.enabled;
+    renderBrowserConsent(loaded.browserAutomation);
+    const connector = loaded.connectorSession || {};
+    $('paidAccountIdentity').dataset.connectorIdentity = connector.identity || '';
+    $('connectorSignIn').hidden = !connector.enabled || !!connector.signedIn;
+    $('connectorSignOut').hidden = !connector.enabled || !connector.signedIn;
+    $('connectorSessionStatus').textContent = connector.enabled
+      ? (connector.signedIn ? 'Connector relay signed in.' : 'Sign in to authorize your connector relay.')
+      : 'Connector relay is not configured. QLOO Gemini and local Jarvis remain available.';
+    const select = $('geminiVoice'); select.replaceChildren();
+    for (const voice of loaded.geminiVoices || []) {
+      const option = document.createElement('option'); option.value = voice.name; option.textContent = voice.style ? `${voice.name} — ${voice.style}` : voice.name; select.append(option);
+    }
+    select.value = loaded.geminiVoice || 'Kore';
+    await loadPersonalState();
+  }
+  // Browser Automation consent (same disclosure and /api/browser-automation/consent
+  // flow as the source settings page). Without it the server keeps automation disabled.
+  function renderBrowserConsent(browser) {
+    const accepted = browser?.consentAccepted === true;
+    $('browserAutomationConsentCheck').checked = false;
+    $('browserAutomationConsentChoice').style.display = accepted ? 'none' : '';
+    $('browserAutomationConsentAccept').hidden = accepted;
+    $('browserAutomationConsentWithdraw').hidden = !accepted;
+    $('browserAutomationConsentStatus').textContent = accepted
+      ? `Disclosure accepted (version ${browser.consentVersion || 0}). You can withdraw consent at any time.`
+      : 'Consent is required before the first browser task.';
+    $('browserAutomationEnabled').dataset.consent = accepted ? 'true' : 'false';
+  }
+  async function setBrowserConsent(accepted) {
+    const node = $('browserAutomationConsentStatus');
+    if (accepted && !$('browserAutomationConsentCheck').checked) { node.textContent = 'Check the consent box to continue.'; return; }
+    try {
+      const response = await fetch('/api/browser-automation/consent', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({accepted}) });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || 'Consent update failed.');
+      await load();
+      node.textContent = accepted ? 'Browser Automation enabled.' : 'Browser Automation consent withdrawn.';
+    } catch (error) { node.textContent = error.message || 'Consent update failed.'; }
+  }
+  $('browserAutomationConsentAccept').addEventListener('click', () => setBrowserConsent(true));
+  $('browserAutomationConsentWithdraw').addEventListener('click', () => setBrowserConsent(false));
+  $('browserAutomationEnabled').addEventListener('change', () => {
+    const box = $('browserAutomationEnabled');
+    if (box.checked && box.dataset.consent !== 'true') {
+      box.checked = false;
+      $('browser-automation').scrollIntoView({ behavior:'smooth', block:'center' });
+      $('browserAutomationConsentStatus').textContent = 'Accept the Browser Automation disclosure first.';
+    }
+  });
+  $('addGeminiKey').addEventListener('click', async () => {
+    const button = $('addGeminiKey'); button.disabled = true; $('personalApiStatus').textContent = 'Opening secure Windows key entry…';
+    try { await personalAction('add'); }
+    catch (error) { $('personalApiStatus').textContent = error.message || 'Could not add a Gemini key.'; }
+    finally { button.disabled = false; }
+  });
+  $('save').addEventListener('click', async () => {
+    const button = $('save'); button.disabled = true; setStatus('Saving…');
+    const body = { assistantName:$('assistantName').value.trim(), geminiVoice:$('geminiVoice').value, jarvisPermissionMode:$('jarvisPermissionMode').value, preferredBrowser:$('preferredBrowser').value.trim(), browserAutomationEnabled:$('browserAutomationEnabled').checked };
+    try {
+      const response = await fetch('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || 'Settings were not saved.');
+      await load(); setStatus('Saved securely.');
+    } catch (error) { setStatus(error.message || 'Settings were not saved.', true); }
+    finally { button.disabled = false; }
+  });
+  async function connectorAction(path, label) {
+    const node = $('connectorSessionStatus'); node.textContent = label;
+    try {
+      const response = await fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || 'Connector service action failed.');
+      await load(); node.textContent = result.connectorSession?.signedIn ? 'Connector relay signed in.' : 'Signed out.';
+    } catch (error) { node.textContent = error.message || 'Connector service action failed.'; }
+  }
+  $('connectorSignIn').addEventListener('click', () => connectorAction('/api/paid/sign-in', 'Opening connector sign-in…'));
+  $('connectorSignOut').addEventListener('click', () => connectorAction('/api/paid/sign-out', 'Signing out…'));
+  $('connectBrowser').addEventListener('click', async () => {
+    const node = $('browserHelperStatus'); node.textContent = 'Preparing QLOO Helper…';
+    try {
+      const response = await fetch('/api/browser-helper/connect', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+      const result = await response.json();
+      if (!response.ok || result.ok !== true) throw new Error(result.error || 'QLOO Helper setup failed.');
+      node.textContent = `Helper folder prepared: ${result.extensionFolder || 'see opened folder'}`;
+    } catch (error) { node.textContent = error.message || 'QLOO Helper setup failed.'; }
+  });
+  load().catch(error => setStatus(error.message || 'Could not load settings.', true));
+})();
+</script>
+</body>
+</html>

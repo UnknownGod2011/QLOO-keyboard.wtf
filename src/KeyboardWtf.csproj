@@ -1,0 +1,108 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Nullable>disable</Nullable>
+    <RootNamespace>KeyboardWtf</RootNamespace>
+    <AssemblyName>QLOO</AssemblyName>
+    <Version>0.1.0</Version>
+    <FileVersion>0.1.0.0</FileVersion>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <DefineConstants>$(DefineConstants);QLOO_JARVIS</DefineConstants>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <ApplicationIcon />
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <BaseOutputPath>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\bin\'))</BaseOutputPath>
+    <OutputPath>$(BaseOutputPath)$(Configuration)\bin\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Services\WebSettingsService.Luma.cs" />
+    <Compile Remove="Services\LumaLocalTokenService.cs" />
+    <Compile Remove="Services\LumaLiveProtocol.cs" />
+    <EmbeddedResource Include="Resources\web\settings.html" LogicalName="web/settings.html" />
+    <EmbeddedResource Include="..\production\site\connectors-panel.js" LogicalName="web/connectors/connectors-panel.js" />
+    <EmbeddedResource Include="..\production\site\connectors-settings.js" LogicalName="web/connectors/connectors-settings.js" />
+    <EmbeddedResource Include="..\production\site\connectors-panel.css" LogicalName="web/connectors/connectors-panel.css" />
+    <EmbeddedResource Include="..\production\site\connector-icons\*.svg" LogicalName="web/connectors/icons/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Resources\web\browser-automation-fixture.html" LogicalName="web/browser-automation-fixture.html" />
+    <EmbeddedResource Include="Resources\icons\actions\*.svg" LogicalName="icons/actions/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Resources\icons\modes\*.svg" LogicalName="icons/modes/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Resources\icons\connectors\*.png" LogicalName="icons/connectors/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="package\tts\voices\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>tts\voices\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\manifest.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\manifest.json</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\service-worker.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\service-worker.js</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\content-script.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\content-script.js</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\popup.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\popup.html</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\popup.css">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\popup.css</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\popup.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\popup.js</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\README.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\README.md</Link>
+    </Content>
+    <Content Include="..\extensions\keyboard-wtf-browser-helper-v2\icons\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>browser-helper\icons\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.*" />
+    <PackageReference Include="Vosk" Version="0.3.*" />
+    <PackageReference Include="Whisper.net" Version="1.9.*" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.9.*" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <PackageReference Include="OpenCvSharp4.Windows" Version="4.13.0.20260602" />
+  </ItemGroup>
+
+  <Target Name="CopyWhisperNative" AfterTargets="Build" Condition="$(OS) == 'Windows_NT'">
+    <ItemGroup>
+      <WhisperNativeDlls Include="$(OutputPath)runtimes\win-x64\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(WhisperNativeDlls)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <Message Text="Copied Whisper native DLLs to output" Importance="High" Condition="@(WhisperNativeDlls->Count()) > 0" />
+  </Target>
+
+  <Target Name="CopyWhisperNativeToPublish" AfterTargets="Publish" Condition="$(OS) == 'Windows_NT'">
+    <ItemGroup>
+      <WhisperPublishNativeDlls Include="$(OutputPath)runtimes\win-x64\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(WhisperPublishNativeDlls)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(WhisperPublishNativeDlls)" DestinationFolder="$(PublishDir)runtimes\win-x64\" SkipUnchangedFiles="true" />
+    <Message Text="Copied Whisper native DLLs to publish output" Importance="High" Condition="@(WhisperPublishNativeDlls->Count()) > 0" />
+  </Target>
+
+</Project>

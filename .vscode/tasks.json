@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build keyboard.wtf (Debug)",
+      "type": "shell",
+      "command": "dotnet build .\\KeyboardWtf.sln -c Debug",
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Run keyboard.wtf",
+      "type": "shell",
+      "command": "dotnet run --project .\\src\\KeyboardWtf.csproj",
+      "group": "test",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Publish keyboard.wtf (win-x64)",
+      "type": "shell",
+      "command": "dotnet publish .\\src\\KeyboardWtf.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true",
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}

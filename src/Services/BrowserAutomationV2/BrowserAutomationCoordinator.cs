@@ -1,0 +1,6609 @@
+namespace KeyboardWtf.Services.BrowserAutomationV2;
+
+using KeyboardWtf.Helpers;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Text.RegularExpressions;
+using KeyboardWtf.Services.PaidStaging;
+using KeyboardWtf.Services.Updates;
+
+public sealed class BrowserAutomationStartResult
+{
+    public bool Started { get; init; }
+    public bool NeedsClarification { get; init; }
+    public bool NeedsConsent { get; init; }
+    public string TaskId { get; init; } = "";
+    public string Message { get; init; } = "";
+    public string RoutingReason { get; init; } = "";
+}
+
+public sealed class BrowserAutomationCoordinator : IDisposable
+{
+    private static readonly TimeSpan MaximumTaskRuntime = TimeSpan.FromMinutes(5);
+    private const int MaximumRecentTerminalOutcomes = 4;
+    private const int MaximumPlannerRequestLength = 10000;
+    private const string CapturedContextMarker = "\n\nAUTHORITATIVE USER-PROVIDED ";
+
+    private sealed class Runtime
+    {
+        public string TaskId { get; init; } = Guid.NewGuid().ToString("N");
+        public string Request { get; set; } = "";
+        // Status/UI only. Never include the task-scoped selected/clipboard appendix.
+        public string SnapshotRequest { get; set; } = "";
+        public DateTime StartedUtc { get; init; } = DateTime.UtcNow;
+        public CancellationTokenSource Cancellation { get; init; } = new();
+        public Ai.Backends.AiBackendOperation BackendOperation { get; set; }
+        public AsyncPauseGate PauseGate { get; } = new();
+        public List<string> History { get; } = new();
+        public ConcurrentQueue<string> PendingGuidance { get; } = new();
+        public List<string> VerifiedCheckpoints { get; } = new();
+        public List<BrowserActionReceipt> Receipts { get; } = new();
+        public Dictionary<string, int> ActionAttempts { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, int> SemanticActionAttempts { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> NoProgressActionStates { get; } = new(StringComparer.Ordinal);
+        public HashSet<int> ControlledTabs { get; } = new();
+        public bool CurrentPageIntent { get; init; }
+        public int InitialTabId { get; set; }
+        public bool InitialTabWasProtectedOrBlank { get; set; }
+        public bool FirstNavigationStabilized { get; set; }
+        public bool InitialTabIsEditableDestination { get; set; }
+        public bool DestinationTabOpened { get; set; }
+        public BrowserTaskState State { get; set; } = BrowserTaskState.Queued;
+        public string CurrentAction { get; set; } = "Queued";
+        public BrowserPageSnapshot Page { get; set; }
+        public BrowserAutomationOutcome? Outcome { get; set; }
+        public string ResultSummary { get; set; } = "";
+        // Task-scoped only. This is never written to browser workflow memory.
+        // It allows a grounded source result to survive a source-to-editor tab
+        // transition without treating an old result as evidence for a new task.
+        public string PreparedDraft { get; set; } = "";
+        public string LastError { get; set; } = "";
+        public bool VisionRecovery { get; set; }
+        public int RecoveryAttempts { get; set; }
+        public int ConsecutiveRejectedStrategies { get; set; }
+        public bool UserPaused { get; set; }
+        public BrowserUserIntervention Intervention { get; set; }
+        public bool SkipUnavailableOptionalInputs { get; set; }
+        public HashSet<string> SkippedInterventions { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, string> AuthorizedSkippedFieldStates { get; } = new(StringComparer.Ordinal);
+        public string CancellationReason { get; set; } = "";
+        public BrowserTaskState? LastAnnouncedState { get; set; }
+        public bool SuppressCancellationAnnouncement { get; set; }
+        public bool MissingTabRecoveryAttempted { get; set; }
+        public int GuidanceRevision;
+        public int CorrectionRevision;
+        public string PendingDestinationCorrectionLabel { get; set; } = "";
+        public string PendingDestinationCorrectionUrl { get; set; } = "";
+        public string CorrectedDestinationUrl { get; set; } = "";
+        public string SupersededDestinationUrl { get; set; } = "";
+        public bool AdoptFreshActiveTabOnResume { get; set; }
+        public string OrderedSourceIdentity { get; set; } = "";
+        public bool OrderedSourceCollectionVerified { get; set; }
+        public Task Execution { get; set; }
+    }
+
+    private readonly SettingsService _settings;
+    private readonly NotificationService _notifications;
+    private readonly BrowserHelperBridge _bridge;
+    private readonly BrowserAutomationPlanner _planner;
+    private readonly BrowserAutomationVerifier _verifier = new();
+    private readonly BrowserAutomationTaskClassifier _classifier = new();
+    private readonly BrowserAutomationSafetyPolicy _safety = new();
+    private readonly object _sync = new();
+    private Runtime _active;
+    private BrowserAutomationSnapshot _last = new();
+    private readonly List<BrowserAutomationSnapshot> _recentTerminalOutcomes = new();
+    private DateTime _lastConsentPromptUtc;
+    private bool _disposed;
+    private readonly PaidAccountService _paidAccount;
+    private readonly UpdateWorkAdmissionGate _updateWorkAdmission;
+
+    public BrowserAutomationCoordinator(
+        SettingsService settings,
+        NotificationService notifications,
+        BrowserHelperBridge bridge,
+        BrowserAutomationPlanner planner)
+        : this(settings, notifications, bridge, planner, null)
+    {
+    }
+
+    internal BrowserAutomationCoordinator(
+        SettingsService settings,
+        NotificationService notifications,
+        BrowserHelperBridge bridge,
+        BrowserAutomationPlanner planner,
+        PaidAccountService paidAccount,
+        UpdateWorkAdmissionGate updateWorkAdmission = null)
+    {
+        _settings = settings;
+        _notifications = notifications;
+        _bridge = bridge;
+        _planner = planner;
+        _paidAccount = paidAccount;
+        _updateWorkAdmission = updateWorkAdmission;
+    }
+
+    public event Action<BrowserAutomationSnapshot> StatusChanged;
+    public event Action<JarvisLifecycleAnnouncement> AnnouncementRequested;
+
+    public BrowserAutomationTaskClassifier Classifier => _classifier;
+    public BrowserHelperStatus HelperStatus => _bridge.Status;
+
+    public BrowserAutomationSnapshot Snapshot()
+    {
+        lock (_sync)
+            return BuildSnapshot(_active) ?? _last;
+    }
+
+    public BrowserClassification Classify(string request) => _classifier.Classify(request);
+
+    public async Task<BrowserActionReceipt> ActivateExistingTabAsync(
+        string selection,
+        CancellationToken token = default)
+    {
+        var status = _bridge.Status;
+        if (!status.Connected
+            || !string.Equals(
+                status.ServiceWorkerVersion,
+                BrowserHelperProtocol.Version,
+                StringComparison.Ordinal)
+            || status.WindowId is not int windowId)
+        {
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(status.LastError)
+                    ? "Existing Chrome Helper is not connected."
+                    : status.LastError);
+        }
+
+        var receipt = await _bridge.ActivateExistingTabAsync(windowId, selection, token);
+        // Identity-only diagnostic: compare a parsed ordinal with the Helper's
+        // selected window/tab and out-of-range result, without logging private
+        // tab titles or URLs.
+        AppLog.Info(
+            $"Chrome exact tab activation: selection={selection} requestedWindow={windowId} "
+            + $"receiptWindow={receipt.WindowId} tabId={receipt.TabId} tabCount={receipt.TabCount} "
+            + $"ok={receipt.Ok} noVisibleChange={receipt.NoVisibleChange}");
+        return receipt;
+    }
+
+    public bool TryAddTaskGuidance(string guidance, out string reason)
+    {
+        reason = "";
+        lock (_sync)
+        {
+            if (_active == null || IsTerminal(_active.State))
+            {
+                reason = "There is no active browser task to guide.";
+                return false;
+            }
+
+            var explicitlyTaskDirected = IsExplicitTaskDirectedGuidance(guidance);
+            var explicitCorrection = IsExplicitTaskCorrection(guidance)
+                || IsCorrectionGroundedInActiveTask(
+                    _active.Intervention,
+                    _active.Page,
+                    guidance);
+            var groundedTaskValue = IsValueGuidanceGroundedInActiveTask(
+                _active.Intervention,
+                _active.Page,
+                guidance);
+            var skipRequest = _active.State == BrowserTaskState.NeedsUserAction
+                && IsSkipInterventionGuidance(guidance);
+            var activeIntervention = skipRequest
+                ? ReconcileInterventionWithPageMetadata(
+                    _active.Intervention,
+                    _active.Page)
+                : _active.Intervention;
+            var adoptFreshActiveTab = CanAcceptAuthorizedPageHandoff(_active.State)
+                && ShouldAdoptFreshActiveTabForGuidance(
+                    activeIntervention,
+                    guidance,
+                    _active.Page,
+                    _bridge.Status);
+            if (skipRequest && activeIntervention?.CanSkip != true)
+            {
+                reason = BuildRequiredInterventionResponse(activeIntervention);
+                return false;
+            }
+
+            if (!IsClearlyTaskRelevantGuidance(guidance)
+                && !explicitlyTaskDirected
+                && !groundedTaskValue
+                && !skipRequest
+                && !adoptFreshActiveTab
+                && !(_active.State == BrowserTaskState.NeedsUserAction
+                    && IsRelevantManualAnswer(
+                        _active.Intervention,
+                        guidance,
+                        _active.Page)))
+            {
+                reason = "That is a separate Jarvis or browser command, not guidance for the active browser task.";
+                return false;
+            }
+
+            _active.PendingGuidance.Enqueue(
+                skipRequest
+                    ? BuildSkippedInterventionGuidance(activeIntervention, guidance)
+                    : explicitCorrection
+                    ? $"Latest explicit user correction: {guidance.Trim()}"
+                    : $"User guidance: {guidance.Trim()}");
+            if (skipRequest)
+            {
+                _active.SkippedInterventions.Add(
+                    InterventionFingerprint(activeIntervention));
+                CaptureAuthorizedOptionalSkip(
+                    _active,
+                    activeIntervention);
+                if (AllowsSkippingUnavailableOptionalInputs(guidance))
+                    _active.SkipUnavailableOptionalInputs = true;
+            }
+            _active.GuidanceRevision++;
+            if (explicitCorrection)
+                Interlocked.Increment(ref _active.CorrectionRevision);
+            var previousDestination = "";
+            if (explicitCorrection)
+            {
+                previousDestination = _active.CorrectedDestinationUrl;
+                if (string.IsNullOrWhiteSpace(previousDestination))
+                {
+                    TryResolveExplicitDestination(
+                        _active.Request,
+                        out _,
+                        out previousDestination);
+                }
+                var snapshotRequest = string.IsNullOrWhiteSpace(_active.SnapshotRequest)
+                    ? RequestWithoutCapturedContext(_active.Request)
+                    : _active.SnapshotRequest;
+                _active.Request = BuildCorrectedTaskRequest(_active.Request, guidance);
+                _active.SnapshotRequest = BuildCorrectedTaskRequest(
+                    snapshotRequest,
+                    guidance);
+                var correctedSource =
+                    BrowserAutomationVerifier.ExtractOrderedSourceIdentity(_active.Request);
+                if (!string.Equals(
+                        correctedSource,
+                        _active.OrderedSourceIdentity,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    _active.OrderedSourceIdentity = correctedSource;
+                    _active.OrderedSourceCollectionVerified = false;
+                }
+            }
+            if (explicitCorrection
+                && TryResolveTaskCorrectionDestination(
+                    guidance,
+                    out var destinationLabel,
+                    out var destinationUrl))
+            {
+                if (!string.IsNullOrWhiteSpace(previousDestination)
+                    && !SameHost(previousDestination, destinationUrl))
+                {
+                    _active.SupersededDestinationUrl = previousDestination;
+                }
+                _active.CorrectedDestinationUrl = destinationUrl;
+                _active.PendingDestinationCorrectionLabel = destinationLabel;
+                _active.PendingDestinationCorrectionUrl = destinationUrl;
+            }
+            if (adoptFreshActiveTab)
+                _active.AdoptFreshActiveTabOnResume = true;
+            _active.UserPaused = false;
+            _active.Intervention = null;
+            _active.PauseGate.Resume();
+            SetState(
+                _active,
+                BrowserTaskState.ReadingPage,
+                skipRequest
+                    ? "Continuing without the optional item"
+                    : "Applying user guidance to the same task");
+            return true;
+        }
+    }
+
+    public BrowserAutomationStartResult Start(string request)
+    {
+        var classification = _classifier.Classify(request);
+        AppLog.Info(
+            $"Browser routing: decision={classification.Decision} current={classification.RefersToCurrentPage} reason={classification.Reason}");
+
+        if (classification.Decision == BrowserAutomationDecision.SimpleTool)
+        {
+            return new BrowserAutomationStartResult
+            {
+                Message = "This request should use the existing fast URL/search/browser tool, not smart browser automation.",
+                RoutingReason = classification.Reason,
+            };
+        }
+
+        if (classification.Decision == BrowserAutomationDecision.AskUser)
+        {
+            return new BrowserAutomationStartResult
+            {
+                NeedsClarification = true,
+                Message = classification.PrefersSelectedContent
+                    ? "Should I answer the selected text, or fill/change the live page?"
+                    : "Do you want me to interact with the live webpage, or only open/search it?",
+                RoutingReason = classification.Reason,
+            };
+        }
+
+        if (!_settings.HasBrowserAutomationConsent)
+        {
+            if (DateTime.UtcNow - _lastConsentPromptUtc > TimeSpan.FromSeconds(20))
+            {
+                _lastConsentPromptUtc = DateTime.UtcNow;
+                WebSettingsService.Instance.OpenInBrowser("#browser-automation");
+            }
+            return new BrowserAutomationStartResult
+            {
+                NeedsClarification = true,
+                NeedsConsent = true,
+                Message = "Review and accept the Browser Automation data disclosure in Settings before the first browser task.",
+                RoutingReason = classification.Reason,
+            };
+        }
+
+        if (!_settings.Current.BrowserAutomationEnabled)
+        {
+            return new BrowserAutomationStartResult
+            {
+                Message = "Browser Automation is disabled in Settings.",
+                RoutingReason = classification.Reason,
+            };
+        }
+
+#if !QLOO_JARVIS
+        if (_paidAccount?.Enabled == true)
+        {
+            if (!_paidAccount.IsSignedIn)
+            {
+                return new BrowserAutomationStartResult
+                {
+                    Message = "Sign in with Google in Account & Billing before starting browser automation.",
+                    RoutingReason = classification.Reason,
+                };
+            }
+            if (_paidAccount.RequiresManagedCredits && _paidAccount.Account?.AvailableCreditMicros <= 0)
+            {
+                return new BrowserAutomationStartResult
+                {
+                    Message = "This account has no usable credits. Open Account & Billing to add credits.",
+                    RoutingReason = classification.Reason,
+                };
+            }
+        }
+#endif
+
+        var helperStatus = _bridge.Status;
+        if (!helperStatus.CommandChannelReady
+            && !BrowserHelperBridge.CanBootstrapDisposableProtectedTab(helperStatus))
+        {
+            var error = string.IsNullOrWhiteSpace(helperStatus.LastError)
+                ? "Existing Chrome Helper is not connected. Open a normal Chrome page, then use Reconnect Helper in Settings."
+                : helperStatus.LastError;
+            return new BrowserAutomationStartResult
+            {
+                Message = error,
+                RoutingReason = classification.Reason,
+            };
+        }
+
+        IDisposable updateWork = null;
+        if (_updateWorkAdmission != null && !_updateWorkAdmission.TryAcquire(out updateWork))
+            return new BrowserAutomationStartResult
+            {
+                Message = "An update is preparing installation. Please wait.",
+                RoutingReason = classification.Reason,
+            };
+        var executionScheduled = false;
+        try
+        {
+            Runtime runtime;
+            lock (_sync)
+            {
+                if (_active != null
+                    && !IsTerminal(_active.State)
+                    && _active.Execution?.IsCompleted == true)
+                {
+                    SetTerminal(
+                        _active,
+                        BrowserTaskState.Failed,
+                        BrowserAutomationOutcome.Failed,
+                        "The previous browser task ended without terminal cleanup.",
+                        "");
+                }
+                if (_active != null && !IsTerminal(_active.State))
+                {
+                    return new BrowserAutomationStartResult
+                    {
+                        Message = $"Another browser task is already running: {_active.CurrentAction}",
+                        TaskId = _active.TaskId,
+                        RoutingReason = classification.Reason,
+                    };
+                }
+
+                runtime = new Runtime
+                {
+                    Request = request.Trim(),
+                    SnapshotRequest = RequestWithoutCapturedContext(request),
+                    CurrentPageIntent = classification.RefersToCurrentPage,
+                    OrderedSourceIdentity = BrowserAutomationVerifier.ExtractOrderedSourceIdentity(request),
+                    SkipUnavailableOptionalInputs = AllowsSkippingUnavailableOptionalInputs(request),
+                    State = BrowserTaskState.Queued,
+                    CurrentAction = "Queued",
+                };
+                runtime.BackendOperation = _paidAccount?.BeginAiOperation(runtime.Cancellation.Token);
+                _active = runtime;
+                _planner.BeginTask(runtime.TaskId);
+                runtime.Cancellation.CancelAfter(MaximumTaskRuntime);
+                Publish(runtime);
+                runtime.Execution = Task.Run(
+                    () => ExecuteAsync(runtime, classification.RefersToCurrentPage),
+                    runtime.Cancellation.Token);
+                executionScheduled = true;
+                // Also releases when cancellation prevents the delegate from starting.
+                _ = runtime.Execution.ContinueWith(_ =>
+                {
+                    try { runtime.BackendOperation?.Dispose(); }
+                    finally { updateWork?.Dispose(); }
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+
+            return new BrowserAutomationStartResult
+            {
+                Started = true,
+                TaskId = runtime.TaskId,
+                Message = "Browser automation started in the existing Chrome session.",
+                RoutingReason = classification.Reason,
+            };
+        }
+        finally
+        {
+            // If attaching the existing continuation fails after scheduling,
+            // retain ownership rather than falsely declaring that worker idle.
+            if (!executionScheduled) updateWork?.Dispose();
+        }
+    }
+
+    public bool Pause()
+    {
+        lock (_sync)
+        {
+            if (_active == null || IsTerminal(_active.State))
+                return false;
+            _active.UserPaused = true;
+            _active.PauseGate.Pause();
+            SetState(_active, BrowserTaskState.Paused, "Paused by user");
+            return true;
+        }
+    }
+
+    public bool Resume()
+    {
+        lock (_sync)
+        {
+            if (_active == null || IsTerminal(_active.State))
+                return false;
+            _active.UserPaused = false;
+            _active.Intervention = null;
+            _active.PauseGate.Resume();
+            SetState(_active, BrowserTaskState.ReadingPage, "Resuming from the live page");
+            return true;
+        }
+    }
+
+    public async Task<bool> CancelAsync(
+        string reason = "Cancelled by user",
+        bool announceOutcome = true)
+    {
+        if (!TryBeginCancellation(reason, announceOutcome, out var runtime, out var cleanupRequired))
+            return false;
+        if (cleanupRequired)
+            await CompleteCancellationAsync(runtime);
+        return true;
+    }
+
+    public IReadOnlyList<BrowserAutomationSnapshot> RecentTerminalOutcomes()
+    {
+        lock (_sync)
+            return _recentTerminalOutcomes.ToArray();
+    }
+
+    public void ClearRecentTerminalOutcomes()
+    {
+        lock (_sync)
+            _recentTerminalOutcomes.Clear();
+    }
+
+    public bool RequestCancel(
+        string reason = "Cancelled by user",
+        bool announceOutcome = true)
+    {
+        if (!TryBeginCancellation(reason, announceOutcome, out var runtime, out var cleanupRequired))
+            return false;
+        if (cleanupRequired)
+            _ = CompleteCancellationAsync(runtime);
+        return true;
+    }
+
+    private bool TryBeginCancellation(
+        string reason,
+        bool announceOutcome,
+        out Runtime runtime,
+        out bool cleanupRequired)
+    {
+        lock (_sync)
+        {
+            runtime = _active;
+            cleanupRequired = false;
+            if (runtime == null)
+                return false;
+
+            // Partial is terminal execution-wise, but accepting an explicit
+            // cancel still clears its remaining progress UI and task context.
+            if (runtime.State == BrowserTaskState.Partial)
+            {
+                runtime.SuppressCancellationAnnouncement = !announceOutcome;
+                runtime.Intervention = null;
+                SetTerminal(
+                    runtime,
+                    BrowserTaskState.Cancelled,
+                    BrowserAutomationOutcome.Cancelled,
+                    "Browser automation cancelled.",
+                    "");
+                return true;
+            }
+            if (IsTerminal(runtime.State))
+                return false;
+
+            runtime.UserPaused = false;
+            runtime.Intervention = null;
+            runtime.CancellationReason = reason;
+            runtime.SuppressCancellationAnnouncement = !announceOutcome;
+            SetState(runtime, BrowserTaskState.Cancelling, reason);
+            runtime.Cancellation.Cancel();
+            runtime.PauseGate.Resume();
+            // Local cancellation owns the visible lifecycle immediately. The
+            // helper and execution cleanup continue against this same runtime,
+            // but neither may republish stale progress or success afterward.
+            SetTerminal(
+                runtime,
+                BrowserTaskState.Cancelled,
+                BrowserAutomationOutcome.Cancelled,
+                "Browser automation cancelled.",
+                "");
+            cleanupRequired = true;
+        }
+
+        AppLog.Info($"Browser automation cancel requested: task={runtime.TaskId}");
+        return true;
+    }
+
+    private async Task CompleteCancellationAsync(Runtime runtime)
+    {
+        try
+        {
+            await _bridge.CancelTaskAsync(runtime.TaskId);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, $"Chrome Helper cancellation failed: task={runtime.TaskId}");
+        }
+
+        try
+        {
+            if (runtime.Execution != null)
+                await runtime.Execution.WaitAsync(TimeSpan.FromSeconds(4));
+        }
+        catch
+        {
+            // ExecuteAsync owns terminal cleanup and logs.
+        }
+
+        // A task cancelled before Task.Run enters ExecuteAsync has no finally
+        // block to release its request. This touches only that completed,
+        // cancelled runtime; a newer task and any still-running execution
+        // retain their own context and status ownership.
+        if (runtime.State == BrowserTaskState.Cancelled
+            && runtime.Execution?.IsCompleted == true)
+        {
+            ReleaseTaskContent(runtime);
+        }
+
+        // The terminal state was published synchronously by
+        // TryBeginCancellation; this method only completes bounded cleanup.
+    }
+
+    public void AddGuidance(string guidance)
+    {
+        TryAddTaskGuidance(guidance, out _);
+    }
+
+    private async Task ExecuteAsync(Runtime runtime, bool currentPageIntent)
+    {
+        var token = runtime.Cancellation.Token;
+        BrowserPlannerDecision lastDecision = null;
+        try
+        {
+            using var backendScope = _paidAccount?.EnterAiOperation(runtime.BackendOperation);
+            _safety.EvaluateRequest(runtime.Request);
+            SetState(runtime, BrowserTaskState.ReadingPage, "Connecting to the existing Chrome tab");
+
+            // The active tab is always leased first. For a new-site request the planner
+            // opens one task-owned tab from this known same-window context.
+            runtime.Page = await _bridge.BeginTaskAsync(runtime.TaskId, useCurrentTab: true, token);
+            runtime.InitialTabId = runtime.Page.TabId;
+            runtime.InitialTabWasProtectedOrBlank = IsProtectedOrBlankUrl(runtime.Page.Url);
+            runtime.InitialTabIsEditableDestination = currentPageIntent
+                && runtime.Page.ActiveEditable
+                && RequiresDestinationEditorTransfer(runtime.Request);
+            AddControlledTab(runtime, runtime.Page);
+            runtime.History.Add(currentPageIntent
+                ? "Started from the user's active current-page tab."
+                : "Started from the active Chrome window; open one task-owned tab if a new site is required.");
+            SetState(runtime, BrowserTaskState.Planning, "Planning the next browser step");
+
+            if (TryResolveExplicitDestination(
+                    runtime.Request,
+                    out var explicitDestinationLabel,
+                    out var explicitDestinationUrl))
+            {
+                var destinationGuidanceRevision = Volatile.Read(
+                    ref runtime.GuidanceRevision);
+                var destinationCorrectionRevision = Volatile.Read(
+                    ref runtime.CorrectionRevision);
+                var destinationEstablished = await EstablishAuthoritativeDestinationAsync(
+                    runtime,
+                    explicitDestinationLabel,
+                    explicitDestinationUrl,
+                    "the explicit destination in the original request",
+                    token);
+                if (!destinationEstablished)
+                {
+                    if (destinationGuidanceRevision
+                            != Volatile.Read(ref runtime.GuidanceRevision)
+                        || InFlightResultWasSuperseded(
+                            destinationCorrectionRevision,
+                            Volatile.Read(ref runtime.CorrectionRevision)))
+                    {
+                        runtime.History.Add(
+                            "Ignored the original destination result because newer explicit task guidance is authoritative.");
+                    }
+                    else
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Failed,
+                            $"The explicitly requested {explicitDestinationLabel} destination could not be established safely.");
+                        return;
+                    }
+                }
+            }
+
+            if (currentPageIntent
+                && TryBuildDirectActiveCursorPasteAction(
+                    runtime.Request,
+                    runtime.Page,
+                    out var directPaste))
+            {
+                SetState(runtime, BrowserTaskState.Executing, "Pasting at the verified active editor cursor");
+                var pasteReceipt = await ExecutePlannerActionAsync(
+                    runtime,
+                    directPaste,
+                    token);
+                runtime.Receipts.Add(pasteReceipt);
+                var pasteVerification = _verifier.VerifyAction(
+                    directPaste,
+                    pasteReceipt);
+                runtime.History.Add(pasteVerification.Verified
+                    ? $"Direct active-cursor paste verified: {pasteVerification.Evidence}"
+                    : $"Direct active-cursor paste did not verify: {pasteVerification.Error}");
+                runtime.Page = await _bridge.ObserveAsync(
+                    runtime.TaskId,
+                    pasteReceipt.TabId ?? runtime.Page.TabId,
+                    token);
+                AddControlledTab(runtime, runtime.Page);
+
+                if (pasteVerification.Verified)
+                {
+                    var directDecision = new BrowserPlannerDecision
+                    {
+                        Action = directPaste,
+                        Done = true,
+                        CompletionKind = "editor_text",
+                        CompletionValue = directPaste.Text,
+                        ResultSummary = "The requested text was placed at the active editor cursor.",
+                    };
+                    var terminal = _verifier.VerifyTerminal(
+                        runtime.Request,
+                        directDecision,
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.OrderedSourceCollectionVerified);
+                    if (terminal.Verified)
+                    {
+                        Complete(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            directDecision.ResultSummary,
+                            terminal.Evidence);
+                        return;
+                    }
+                    runtime.History.Add($"Direct active-cursor completion rejected: {terminal.Error}");
+                }
+            }
+
+            if (currentPageIntent
+                && TryBuildDirectCurrentPageAction(
+                    runtime.Request,
+                    runtime.Page,
+                    out var directAction))
+            {
+                var directControl = runtime.Page.Controls.First(control =>
+                    string.Equals(control.Id, directAction.TargetId, StringComparison.Ordinal));
+                if (DirectActionAlreadySatisfied(directAction, directControl))
+                {
+                    Complete(
+                        runtime,
+                        BrowserAutomationOutcome.Completed,
+                        $"The requested {directAction.TargetName} control is already in the requested state.",
+                        "Fresh live control state independently verified the request.");
+                    return;
+                }
+
+                var directSafety = _safety.EvaluateAction(
+                    runtime.Request,
+                    directAction);
+                if (directSafety.MayStart)
+                {
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Executing,
+                        $"Using the exact visible {directAction.TargetName} control");
+                    var directReceipt = await ExecutePlannerActionAsync(
+                        runtime,
+                        directAction,
+                        token);
+                    runtime.Receipts.Add(directReceipt);
+                    var directVerification = _verifier.VerifyAction(
+                        directAction,
+                        directReceipt);
+                    runtime.History.Add(directVerification.Verified
+                        ? $"Direct current-page action verified: {directVerification.Evidence}"
+                        : $"Direct current-page action did not verify: {directVerification.Error}");
+                    runtime.Page = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        directReceipt.TabId ?? runtime.Page.TabId,
+                        token);
+                    AddControlledTab(runtime, runtime.Page);
+
+                    if (directVerification.Verified)
+                    {
+                        Complete(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            $"The requested {directAction.TargetName} control was activated.",
+                            directVerification.Evidence);
+                        return;
+                    }
+
+                    if (CanExhaustStrategy(directReceipt))
+                    {
+                        RememberNoProgressStrategy(
+                            runtime.NoProgressActionStates,
+                            runtime.Page,
+                            directAction);
+                        runtime.History.Add(
+                            $"No-progress ledger: {DescribeAction(directAction)} is exhausted on this unchanged page state; the planner must use a different mechanism.");
+                    }
+                }
+            }
+
+            for (var step = 1; step <= 24; step++)
+            {
+                token.ThrowIfCancellationRequested();
+                await WaitForTaskReadyAsync(runtime, token);
+
+                RecordOrderedSourceCollectionEvidence(runtime);
+                DrainPendingGuidance(runtime);
+                if (TryTakePendingDestinationCorrection(
+                        runtime,
+                        out var correctedDestinationLabel,
+                        out var correctedDestinationUrl))
+                {
+                    var correctionRevision = Volatile.Read(
+                        ref runtime.CorrectionRevision);
+                    var correctionEstablished = await EstablishAuthoritativeDestinationAsync(
+                        runtime,
+                        correctedDestinationLabel,
+                        correctedDestinationUrl,
+                        "the latest explicit user correction",
+                        token);
+                    if (!correctionEstablished)
+                    {
+                        if (InFlightResultWasSuperseded(
+                                correctionRevision,
+                                Volatile.Read(ref runtime.CorrectionRevision)))
+                        {
+                            runtime.History.Add(
+                                "Ignored a corrected destination result because an even newer explicit correction is authoritative.");
+                            continue;
+                        }
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Failed,
+                            $"The corrected {correctedDestinationLabel} destination could not be established safely.");
+                        return;
+                    }
+                    continue;
+                }
+
+                SetState(runtime, BrowserTaskState.Planning, $"Planning step {step}");
+                var plannerGuidanceRevision = Volatile.Read(ref runtime.GuidanceRevision);
+                var plannerCorrectionRevision = Volatile.Read(ref runtime.CorrectionRevision);
+                lastDecision = await _planner.PlanAsync(
+                    runtime.Request,
+                    runtime.Page,
+                    BuildPlannerHistory(runtime.History, runtime.VerifiedCheckpoints),
+                    _settings.Current.BrowserAutomationModel,
+                    token,
+                    _ => SetState(runtime, BrowserTaskState.Planning,
+                        "Waiting briefly for AI request allowance"));
+                await WaitForTaskReadyAsync(runtime, token);
+                if (plannerGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                {
+                    runtime.History.Add(
+                        "Discarded a planner decision because newer explicit task guidance arrived before execution.");
+                    continue;
+                }
+                if (PlannerPageWasSupersededDuringPlanning(
+                        runtime.Page,
+                        _bridge.Status))
+                {
+                    var pageBeforePlanningProgress = runtime.Page;
+                    runtime.History.Add(
+                        "Discarded a planner decision because the controlled tab navigated while that decision was being generated. "
+                        + "The fresh live page is authoritative over the stale planner snapshot.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.WaitingForPage,
+                        "Reading browser progress that arrived during planning");
+                    runtime.Page = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        runtime.Page.TabId,
+                        token);
+                    AddControlledTab(runtime, runtime.Page);
+                    var observedNavigation = CreateObservedNavigationReceipt(
+                        runtime.TaskId,
+                        pageBeforePlanningProgress,
+                        runtime.Page);
+                    if (observedNavigation != null)
+                    {
+                        runtime.Receipts.Add(observedNavigation);
+                        runtime.History.Add(
+                            "Recorded the same-tab navigation that completed during planning as verified live progress.");
+                    }
+                    continue;
+                }
+                runtime.History.Add(
+                    $"Planner ({_planner.LastModel}) evaluated: {Short(lastDecision.Evaluation, 360)}; next goal: {Short(lastDecision.NextGoal, 240)}");
+                CapturePreparedDraft(runtime, lastDecision);
+
+                if (ShouldForceVisualRecovery(
+                    runtime.Request,
+                    runtime.Page,
+                    lastDecision,
+                    runtime.VisionRecovery))
+                {
+                    runtime.History.Add(
+                        "No grounded controls were available for the requested page mutation; using one bounded visual recovery before accepting completion or requesting manual help.");
+                    lastDecision.Done = false;
+                    lastDecision.NeedsUserAction = false;
+                    lastDecision.UserAction = "";
+                    lastDecision.NextGoal = "Visually inspect the current viewport and map the requested control to a live page element";
+                    lastDecision.Action = new BrowserPlannerAction { Type = "vision" };
+                }
+
+                if (lastDecision.NeedsUserAction
+                    || lastDecision.Action.Type == "needs_user_action")
+                {
+                    var intervention = ReconcileInterventionWithPageMetadata(
+                        BuildPlannerIntervention(lastDecision),
+                        runtime.Page);
+                    var skippedTerminal = VerifyAuthorizedNoMutationCompletion(
+                        runtime.Request,
+                        new BrowserPlannerDecision { Done = true },
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.AuthorizedSkippedFieldStates,
+                        new BrowserVerificationResult());
+                    if (ShouldSkipIntervention(
+                            runtime.SkipUnavailableOptionalInputs,
+                            runtime.SkippedInterventions,
+                            intervention)
+                        && skippedTerminal.Verified)
+                    {
+                        Complete(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            "The optional item was left unchanged as requested.",
+                            skippedTerminal.Evidence);
+                        return;
+                    }
+                    if (IsRequestedInterventionAlreadySatisfied(
+                            intervention,
+                            runtime.Page,
+                            lastDecision.CompletionChecks))
+                    {
+                        var terminal = _verifier.VerifyTerminal(
+                            runtime.Request,
+                            lastDecision,
+                            runtime.Page,
+                            runtime.Receipts,
+                            runtime.OrderedSourceCollectionVerified);
+                        runtime.History.Add(
+                            "Ignored a requested user intervention because the fresh live field state already answers it. "
+                            + (terminal.Verified
+                                ? "The visible task outcome is complete."
+                                : $"Continue only for the remaining verified gap: {terminal.Error}"));
+                        AppLog.Info(
+                            $"Browser intervention already satisfied by live field state: task={runtime.TaskId} missingCharacters={intervention.Missing?.Length ?? 0} complete={terminal.Verified}");
+                        if (terminal.Verified)
+                        {
+                            Complete(
+                                runtime,
+                                BrowserAutomationOutcome.Completed,
+                                "The requested form values are present on the live page.",
+                                terminal.Evidence);
+                            return;
+                        }
+                        continue;
+                    }
+                    await WaitForUserInterventionAsync(
+                        runtime,
+                        intervention,
+                        "User resumed after the requested step; page state was refreshed.",
+                        token);
+                    continue;
+                }
+
+                if (lastDecision.Done || lastDecision.Action.Type == "done")
+                {
+                    SetState(runtime, BrowserTaskState.Verifying, "Verifying the requested outcome");
+                    runtime.Page = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        runtime.Page.TabId,
+                        token);
+                    if (plannerGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                    {
+                        runtime.History.Add("Final observation was superseded by newer task guidance; continuing the requested work.");
+                        continue;
+                    }
+                    var terminal = _verifier.VerifyTerminal(
+                        runtime.Request,
+                        lastDecision,
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.OrderedSourceCollectionVerified);
+                    if (!terminal.Verified)
+                    {
+                        terminal = VerifyAuthorizedNoMutationCompletion(
+                            runtime.Request,
+                            lastDecision,
+                            runtime.Page,
+                            runtime.Receipts,
+                            runtime.AuthorizedSkippedFieldStates,
+                            terminal);
+                    }
+                    if (terminal.Verified)
+                    {
+                        if (TryCompleteWithGuidanceRevision(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            lastDecision.ResultSummary,
+                            terminal.Evidence,
+                            plannerGuidanceRevision))
+                            return;
+                        continue;
+                    }
+
+                    runtime.RecoveryAttempts++;
+                    runtime.History.Add($"Completion rejected by verifier: {terminal.Error}");
+                    if (runtime.RecoveryAttempts >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            $"Useful browser progress remains open, but completion could not be verified: {terminal.Error}");
+                        return;
+                    }
+                    continue;
+                }
+
+                if (lastDecision.Action.Type == "copy_clipboard")
+                {
+                    await runtime.PauseGate.WaitAsync(token);
+                    token.ThrowIfCancellationRequested();
+                    var prepared = BrowserAutomationText.Truncate(
+                        string.IsNullOrWhiteSpace(lastDecision.Action.Text)
+                            ? runtime.PreparedDraft
+                            : lastDecision.Action.Text.Trim(),
+                        8000);
+                    if (prepared.Length == 0)
+                        throw new InvalidOperationException("The planner provided no result to transfer.");
+
+                    if (RequiresDestinationEditorTransfer(runtime.Request))
+                    {
+                        runtime.PreparedDraft = prepared;
+                        lastDecision.CompletionValue = prepared;
+                        runtime.History.Add(
+                            $"Prepared an ephemeral source result for the destination editor (length {prepared.Length}); clipboard was not treated as terminal completion.");
+
+                        if (runtime.InitialTabIsEditableDestination
+                            && runtime.Page.TabId != runtime.InitialTabId
+                            && runtime.ControlledTabs.Contains(runtime.InitialTabId))
+                        {
+                            SetState(
+                                runtime,
+                                BrowserTaskState.Executing,
+                                "Returning to the task's verified destination editor tab");
+                            var activation = await _bridge.ExecuteAsync(
+                                new BrowserActionRequest
+                                {
+                                    TaskId = runtime.TaskId,
+                                    Type = "activate_tab",
+                                    WindowId = runtime.Page.WindowId,
+                                    TabId = runtime.InitialTabId,
+                                    ControlId = $"tab:{runtime.InitialTabId}",
+                                },
+                                token);
+                            runtime.Receipts.Add(activation);
+                            LogActionReceipt(runtime.TaskId, activation);
+                            if (!activation.Ok)
+                            {
+                                throw new InvalidOperationException(
+                                    string.IsNullOrWhiteSpace(activation.Error)
+                                        ? "The destination editor tab could not be reactivated."
+                                        : activation.Error);
+                            }
+                            runtime.Page = await _bridge.ObserveAsync(
+                                runtime.TaskId,
+                                runtime.InitialTabId,
+                                token);
+                            AddControlledTab(runtime, runtime.Page);
+                            runtime.History.Add(
+                                "Returned deterministically to the task's original verified editor tab.");
+                        }
+
+                        if (runtime.InitialTabIsEditableDestination
+                            && runtime.Page.TabId == runtime.InitialTabId
+                            && runtime.Page.ActiveEditable)
+                        {
+                            var transfer = new BrowserPlannerAction
+                            {
+                                Type = "paste",
+                                TargetId = runtime.Page.ActiveEditorId,
+                                TargetRole = runtime.Page.ActiveEditorRole,
+                                TargetName = runtime.Page.ActiveEditorName,
+                                Text = runtime.PreparedDraft,
+                            };
+                            SetState(
+                                runtime,
+                                BrowserTaskState.Executing,
+                                "Placing the prepared result in the destination editor");
+                            var transferReceipt = await ExecutePlannerActionAsync(
+                                runtime,
+                                transfer,
+                                token);
+                            runtime.Receipts.Add(transferReceipt);
+                            var transferVerification = _verifier.VerifyAction(
+                                transfer,
+                                transferReceipt);
+                            runtime.History.Add(transferVerification.Verified
+                                ? $"Destination transfer verified: {transferVerification.Evidence}"
+                                : $"Destination transfer not verified: {transferVerification.Error}");
+                            runtime.Page = await _bridge.ObserveAsync(
+                                runtime.TaskId,
+                                transferReceipt.TabId ?? runtime.Page.TabId,
+                                token);
+                            AddControlledTab(runtime, runtime.Page);
+                            if (transferVerification.Verified)
+                            {
+                                var terminal = _verifier.VerifyTerminal(
+                                    runtime.Request,
+                                    lastDecision,
+                                    runtime.Page,
+                                    runtime.Receipts,
+                                    runtime.OrderedSourceCollectionVerified);
+                                if (terminal.Verified)
+                                {
+                                    Complete(
+                                        runtime,
+                                        BrowserAutomationOutcome.Completed,
+                                        string.IsNullOrWhiteSpace(lastDecision.ResultSummary)
+                                            ? "The requested result was placed in the destination editor."
+                                            : lastDecision.ResultSummary,
+                                        terminal.Evidence);
+                                    return;
+                                }
+                                runtime.History.Add(
+                                    $"Destination transfer terminal verification rejected: {terminal.Error}");
+                            }
+                        }
+
+                        SetState(
+                            runtime,
+                            BrowserTaskState.Planning,
+                            "Continuing to the destination editor");
+                        continue;
+                    }
+
+                    SetState(runtime, BrowserTaskState.Executing, "Copying verified result to clipboard");
+                    var before = ClipboardHelper.GetText();
+                    if (!ClipboardHelper.SetText(prepared))
+                        throw new InvalidOperationException("Windows did not accept the clipboard update.");
+                    var after = ClipboardHelper.GetText();
+                    if (!string.Equals(after, prepared, StringComparison.Ordinal))
+                        throw new InvalidOperationException("Clipboard read-back did not match.");
+                    lastDecision.CompletionValue = after;
+                    lastDecision.ResultSummary = string.IsNullOrWhiteSpace(lastDecision.ResultSummary)
+                        ? "The requested result was copied to the clipboard."
+                        : lastDecision.ResultSummary;
+                    runtime.History.Add($"Clipboard changed and was read back (previous length {before.Length}, new length {after.Length}).");
+                    SetState(runtime, BrowserTaskState.Verifying, "Verifying clipboard");
+                    var verified = _verifier.VerifyTerminal(
+                        runtime.Request,
+                        lastDecision,
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.OrderedSourceCollectionVerified);
+                    if (!verified.Verified)
+                        throw new InvalidOperationException(verified.Error);
+                    Complete(
+                        runtime,
+                        BrowserAutomationOutcome.Completed,
+                        lastDecision.ResultSummary,
+                        verified.Evidence);
+                    return;
+                }
+
+                if (lastDecision.Action.Type == "vision")
+                {
+                    runtime.VisionRecovery = true;
+                    runtime.RecoveryAttempts++;
+                    runtime.History.Add("DOM/accessibility grounding was insufficient; one current-viewport visual recovery was requested.");
+                    if (runtime.RecoveryAttempts > 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Blocked,
+                            "The requested visible control could not be grounded after bounded recovery.");
+                        return;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(lastDecision.Action.TargetId))
+                    {
+                        var visualAnchor = FindMatchingControl(
+                            runtime.Page,
+                            lastDecision.Action);
+                        if (visualAnchor == null)
+                        {
+                            throw new InvalidOperationException(
+                                "The visual question anchor is no longer present in the live page.");
+                        }
+
+                        await runtime.PauseGate.WaitAsync(token);
+                        token.ThrowIfCancellationRequested();
+                        var anchorReceipt = await FocusControlAsync(
+                            runtime.TaskId,
+                            runtime.Page,
+                            visualAnchor,
+                            token);
+                        runtime.Receipts.Add(anchorReceipt);
+                        if (!anchorReceipt.Ok)
+                        {
+                            throw new InvalidOperationException(
+                                string.IsNullOrWhiteSpace(anchorReceipt.Error)
+                                    ? "The visual question could not be brought into view."
+                                    : anchorReceipt.Error);
+                        }
+                        runtime.Page = await _bridge.ObserveAsync(
+                            runtime.TaskId,
+                            runtime.Page.TabId,
+                            token);
+                    }
+
+                    // The next planner call receives the same fresh controls plus a
+                    // screenshot-bearing action receipt once visual planning is enabled.
+                    var capture = await _bridge.ExecuteAsync(
+                        new BrowserActionRequest
+                        {
+                            TaskId = runtime.TaskId,
+                            Type = "capture_screenshot",
+                            TabId = runtime.Page.TabId,
+                        },
+                        token);
+                    runtime.Receipts.Add(capture);
+                    if (!capture.Ok || string.IsNullOrWhiteSpace(capture.ScreenshotDataUrl))
+                        throw new InvalidOperationException(
+                            string.IsNullOrWhiteSpace(capture.Error)
+                                ? "The Chrome Helper could not capture the visible tab."
+                                : capture.Error);
+                    runtime.Page = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        runtime.Page.TabId,
+                        token);
+                    SetState(runtime, BrowserTaskState.AnalyzingImage, "Analyzing the visible page");
+                    var visualGuidanceRevision = Volatile.Read(ref runtime.GuidanceRevision);
+                    var visualDecision = await _planner.PlanWithVisionAsync(
+                        runtime.Request,
+                        runtime.Page,
+                        BuildPlannerHistory(runtime.History, runtime.VerifiedCheckpoints),
+                        capture.ScreenshotDataUrl,
+                        _settings.Current.BrowserAutomationModel,
+                        token,
+                        _ => SetState(runtime, BrowserTaskState.AnalyzingImage,
+                            "Waiting briefly for AI request allowance"));
+                    await WaitForTaskReadyAsync(runtime, token);
+                    if (visualGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                    {
+                        runtime.History.Add(
+                            "Discarded a visual planner decision because newer explicit task guidance arrived before execution.");
+                        continue;
+                    }
+                    runtime.History.Add(
+                        $"Visual recovery ({_planner.LastModel}) selected: {Short(visualDecision.NextGoal, 260)}");
+
+                    if (visualDecision.NeedsUserAction
+                        || visualDecision.Action.Type is "needs_user_action" or "vision")
+                    {
+                        await WaitForUserInterventionAsync(
+                            runtime,
+                            BuildPlannerIntervention(
+                                visualDecision,
+                                "The visual target could not be grounded confidently."),
+                            "User resumed after the visual/manual step; page state was refreshed.",
+                            token);
+                        continue;
+                    }
+
+                    if (visualDecision.Done || visualDecision.Action.Type == "done")
+                    {
+                        runtime.History.Add("Visual analysis found no further action; terminal state will be rechecked from fresh live data.");
+                        continue;
+                    }
+
+                    var visualSafety = _safety.EvaluateAction(
+                        runtime.Request,
+                        visualDecision.Action);
+                    if (!visualSafety.MayStart)
+                    {
+                        await WaitForUserInterventionAsync(
+                            runtime,
+                            BuildRequiredIntervention(visualSafety.Reason),
+                            "User resumed after the required safety step; page state was refreshed.",
+                            token);
+                        continue;
+                    }
+
+                    var visualControl = GroundActionIdentity(
+                        runtime.Page,
+                        visualDecision.Action);
+                    if (TryGetDeclaredGoalTargetConflict(
+                            visualDecision.NextGoal,
+                            visualDecision.Action,
+                            visualControl,
+                            out var visualConstraintConflict)
+                        || TryGetExplicitConstraintConflict(
+                            runtime.Request,
+                            visualDecision.Action,
+                            visualControl,
+                            out visualConstraintConflict))
+                    {
+                        runtime.ConsecutiveRejectedStrategies++;
+                        runtime.History.Add(
+                            $"Visually grounded action rejected: {visualConstraintConflict} "
+                            + "Re-plan from the current live page without undoing verified checkpoints.");
+                        SetState(
+                            runtime,
+                            BrowserTaskState.Planning,
+                            "Rejecting a visual control that contradicts the requested outcome");
+                        if (runtime.ConsecutiveRejectedStrategies >= 3)
+                        {
+                            Fail(
+                                runtime,
+                                BrowserAutomationOutcome.Partial,
+                                "The browser remains at the last useful state, but the available visually grounded actions conflict with an explicit task constraint.");
+                            return;
+                        }
+                        continue;
+                    }
+
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Executing,
+                        string.IsNullOrWhiteSpace(visualDecision.NextGoal)
+                            ? "Using the visually grounded control"
+                            : visualDecision.NextGoal);
+                    if (RejectKnownNoProgressStrategy(
+                        runtime,
+                        visualDecision.Action,
+                        "visual"))
+                    {
+                        if (runtime.ConsecutiveRejectedStrategies >= 3)
+                        {
+                            Fail(
+                                runtime,
+                                BrowserAutomationOutcome.Partial,
+                                "The browser remains at the last useful state, but the planner could not produce a genuinely different recovery strategy.");
+                            return;
+                        }
+                        continue;
+                    }
+                    runtime.ConsecutiveRejectedStrategies = 0;
+                    BrowserActionReceipt visualReceipt;
+                    try
+                    {
+                        visualReceipt = await ExecutePlannerActionAsync(
+                            runtime,
+                            visualDecision.Action,
+                            token,
+                            visualDecision.NextGoal,
+                            visualGuidanceRevision);
+                    }
+                    catch (Exception ex) when (!token.IsCancellationRequested
+                        && visualGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                    {
+                        runtime.History.Add(
+                            $"Ignored a stale visual browser action after newer explicit task guidance: {Short(ex.Message, 180)}");
+                        continue;
+                    }
+                    if (visualGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                    {
+                        runtime.History.Add(
+                            "Ignored a stale visual browser action result because newer explicit task guidance is authoritative.");
+                        runtime.Page = await _bridge.ObserveAsync(
+                            runtime.TaskId,
+                            visualReceipt.TabId ?? runtime.Page.TabId,
+                            token);
+                        continue;
+                    }
+                    runtime.Receipts.Add(visualReceipt);
+                    var visualVerification = _verifier.VerifyAction(
+                        visualDecision.Action,
+                        visualReceipt);
+                    runtime.History.Add(visualVerification.Verified
+                        ? $"Visual action verified: {visualVerification.Evidence}"
+                        : $"Visual action not verified: {visualVerification.Error}");
+                    if (!visualVerification.Verified
+                        && CanExhaustStrategy(visualReceipt))
+                    {
+                        RememberNoProgressStrategy(
+                            runtime.NoProgressActionStates,
+                            runtime.Page,
+                            visualDecision.Action);
+                        runtime.History.Add(
+                            $"No-progress ledger: {DescribeAction(visualDecision.Action)} is exhausted on this unchanged page state; the next attempt must change strategy.");
+                    }
+                    if (!visualVerification.Verified && runtime.RecoveryAttempts >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            $"Visual recovery could not produce a verified page change: {visualVerification.Error}");
+                        return;
+                    }
+                    runtime.Page = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        visualReceipt.TabId ?? runtime.Page.TabId,
+                        token);
+                    continue;
+                }
+
+                TryGroundSearchEnter(
+                    runtime.Page,
+                    lastDecision.Action,
+                    lastDecision.NextGoal);
+                var groundedControl = GroundActionIdentity(
+                    runtime.Page,
+                    lastDecision.Action);
+                if (TryGetSatisfiedSearchPrerequisite(
+                    runtime.Page,
+                    lastDecision.Action,
+                    lastDecision.NextGoal,
+                    runtime.Receipts,
+                    out var satisfiedSearchPrerequisite))
+                {
+                    runtime.ConsecutiveRejectedStrategies++;
+                    runtime.History.Add(
+                        $"Stale search prerequisite rejected: {satisfiedSearchPrerequisite} "
+                        + "Inspect the current progressed page and complete the remaining user goal without repeating the old search.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Preserving the verified search result page");
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains on the verified result page, but the planner repeatedly tried to rerun an already completed search prerequisite.");
+                        return;
+                    }
+                    continue;
+                }
+                if (TryGetMissingRequiredDate(
+                    BuildUserConstraintContext(runtime),
+                    lastDecision.NextGoal,
+                    lastDecision.Action,
+                    groundedControl,
+                    out var missingDate))
+                {
+                    await WaitForUserInterventionAsync(
+                        runtime,
+                        BuildRequiredIntervention(
+                            missingDate,
+                            "The requested task cannot be completed correctly without this date."),
+                        "User supplied the requested missing date information; the live page was refreshed before continuing.",
+                        token);
+                    continue;
+                }
+                if (TryGetAmbiguousExplicitDateTarget(
+                    lastDecision.NextGoal,
+                    lastDecision.Action,
+                    groundedControl,
+                    out var ambiguousDateTarget))
+                {
+                    runtime.ConsecutiveRejectedStrategies++;
+                    runtime.History.Add(
+                        $"Grounded date action rejected: {ambiguousDateTarget} "
+                        + "Use a date control with full month/year semantics, type the date, navigate the calendar, or use one bounded visual recovery.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Re-grounding an ambiguous date control");
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains at the last useful state, but the requested date could not be grounded unambiguously.");
+                        return;
+                    }
+                    continue;
+                }
+                if (groundedControl != null
+                    && DirectActionAlreadySatisfied(lastDecision.Action, groundedControl))
+                {
+                    runtime.History.Add(
+                        $"Live checkpoint preserved: {DescribeAction(lastDecision.Action)} "
+                        + "is already in the requested state. Continue from here without repeating it.");
+                    RememberVerifiedCheckpoint(
+                        runtime.VerifiedCheckpoints,
+                        lastDecision.Action,
+                        lastDecision.NextGoal,
+                        new BrowserActionReceipt
+                        {
+                            Ok = true,
+                            Action = lastDecision.Action.Type,
+                            TargetId = groundedControl.Id,
+                            TargetRole = groundedControl.Role,
+                            TargetName = ControlName(groundedControl),
+                            ValueMatches = lastDecision.Action.Type is "type" or "paste",
+                            SelectedChanged = groundedControl.Selected,
+                            CheckedChanged = groundedControl.Checked,
+                            WindowId = runtime.Page.WindowId,
+                            TabId = runtime.Page.TabId,
+                        });
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Preserving an already completed browser step");
+                    continue;
+                }
+                if (TryGetNavigationRegression(
+                    runtime.Request,
+                    runtime.Page,
+                    lastDecision.Action,
+                    out var navigationRegression))
+                {
+                    runtime.ConsecutiveRejectedStrategies++;
+                    runtime.History.Add(
+                        $"Navigation rejected before execution: {navigationRegression} "
+                        + "Continue from the current progressed page or choose a genuinely different live control.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Preserving the current progressed page");
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains at the last useful state, but the planner repeatedly tried to discard current progress.");
+                        return;
+                    }
+                    continue;
+                }
+                if (IsNavigationToSupersededDestination(
+                        lastDecision.Action,
+                        runtime.CorrectedDestinationUrl,
+                        runtime.SupersededDestinationUrl))
+                {
+                    runtime.History.Add(
+                        "Rejected a stale navigation back to the destination superseded by the latest explicit user correction.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Keeping the corrected browser destination");
+                    continue;
+                }
+                if (TryGetDeclaredGoalTargetConflict(
+                        lastDecision.NextGoal,
+                        lastDecision.Action,
+                        groundedControl,
+                        out var constraintConflict)
+                    || TryGetExplicitConstraintConflict(
+                        runtime.Request,
+                        lastDecision.Action,
+                        groundedControl,
+                        out constraintConflict))
+                {
+                    runtime.ConsecutiveRejectedStrategies++;
+                    runtime.History.Add(
+                        $"Grounded action rejected: {constraintConflict} "
+                        + "Re-plan from the current live page without undoing verified checkpoints.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Rejecting a control that contradicts the requested outcome");
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains at the last useful state, but the available grounded actions conflict with an explicit task constraint.");
+                        return;
+                    }
+                    continue;
+                }
+                var actionSafety = _safety.EvaluateAction(
+                    BuildUserConstraintContext(runtime),
+                    lastDecision.Action);
+                if (!actionSafety.MayStart)
+                {
+                    if (IsUnrequestedFinalActionRejection(actionSafety))
+                    {
+                        runtime.ConsecutiveRejectedStrategies++;
+                        runtime.History.Add(
+                            $"Unrequested final action rejected: {actionSafety.Reason} "
+                            + "Do not ask the user to approve an action they did not request. "
+                            + "If every requested goal is already satisfied, return done; otherwise choose the next requested grounded action.");
+                        SetState(
+                            runtime,
+                            BrowserTaskState.Planning,
+                            "Skipping an unrequested submit or send action");
+                        if (runtime.ConsecutiveRejectedStrategies >= 3)
+                        {
+                            Fail(
+                                runtime,
+                                BrowserAutomationOutcome.Partial,
+                                "Useful browser progress remains open, but the planner repeatedly proposed a final action that the user did not request.");
+                            return;
+                        }
+                        continue;
+                    }
+
+                    await WaitForUserInterventionAsync(
+                        runtime,
+                        BuildRequiredIntervention(actionSafety.Reason),
+                        "User resumed after the required safety step; page state was refreshed.",
+                        token);
+                    continue;
+                }
+
+                if (plannerGuidanceRevision != Volatile.Read(ref runtime.GuidanceRevision))
+                {
+                    runtime.History.Add(
+                        "Discarded a pending browser action because newer explicit task guidance superseded it.");
+                    continue;
+                }
+
+                SetState(
+                    runtime,
+                    BrowserTaskState.Executing,
+                    string.IsNullOrWhiteSpace(lastDecision.NextGoal)
+                        ? $"Executing {lastDecision.Action.Type}"
+                        : lastDecision.NextGoal);
+                if (RejectKnownNoProgressStrategy(runtime, lastDecision.Action, "planner"))
+                {
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains at the last useful state, but the planner could not produce a genuinely different strategy.");
+                        return;
+                    }
+                    continue;
+                }
+                if (!TryRegisterSemanticActionAttempt(
+                    runtime.SemanticActionAttempts,
+                    lastDecision.Action,
+                    lastDecision.NextGoal,
+                    maximumAttempts: 2,
+                    out var semanticAttempts))
+                {
+                    runtime.ConsecutiveRejectedStrategies++;
+                    runtime.History.Add(
+                        $"Cross-state strategy rejected before execution: {DescribeAction(lastDecision.Action)} "
+                        + $"was already attempted {semanticAttempts - 1} times for the same immediate goal across page rerenders. "
+                        + "Preserve verified subgoals and choose a genuinely different control or mechanism.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.Planning,
+                        "Choosing a different strategy after repeated behavior");
+                    if (runtime.ConsecutiveRejectedStrategies >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            "The browser remains at the last useful state, but the planner exhausted distinct strategies for the same immediate goal.");
+                        return;
+                    }
+                    continue;
+                }
+                if (!TryRegisterActionAttempt(
+                    runtime.ActionAttempts,
+                    lastDecision.Action,
+                    PageStateIdentity(runtime.Page),
+                    lastDecision.NextGoal,
+                    maximumAttempts: 3,
+                    out var repeatedAttempts))
+                {
+                    Fail(
+                        runtime,
+                        BrowserAutomationOutcome.Partial,
+                        $"The browser remains at the last useful state, but the planner repeated the same grounded action {repeatedAttempts} times without completing the task.");
+                    return;
+                }
+                runtime.ConsecutiveRejectedStrategies = 0;
+                BrowserActionReceipt receipt;
+                try
+                {
+                    receipt = await ExecutePlannerActionAsync(
+                        runtime,
+                        lastDecision.Action,
+                        token,
+                        lastDecision.NextGoal,
+                        plannerGuidanceRevision);
+                }
+                catch (OperationCanceledException)
+                    when (IsChildOperationCancellation(token.IsCancellationRequested))
+                {
+                    if (plannerGuidanceRevision
+                        != Volatile.Read(ref runtime.GuidanceRevision))
+                    {
+                        runtime.History.Add(
+                            "Ignored a stale in-flight browser action timeout after newer explicit task guidance.");
+                        if (!await ReconcileSupersededBrowserActionAsync(runtime, null, token))
+                        {
+                            Fail(runtime, BrowserAutomationOutcome.Partial,
+                                "The browser action may have changed the page, but its live state could not be verified after your correction. No further browser actions were taken.");
+                            return;
+                        }
+                        continue;
+                    }
+                    // The Helper gives each command its own bounded acknowledgement
+                    // window. A page action can successfully navigate while its old
+                    // content script disappears before returning that acknowledgement.
+                    // That child deadline is not the task's five-minute deadline. Read
+                    // the authoritative tab again and let the same task continue from
+                    // whatever state Chrome actually reached.
+                    runtime.History.Add(
+                        "A browser action acknowledgement expired before the task deadline. "
+                        + "Refreshing the authoritative live tab before deciding whether the action progressed.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.WaitingForPage,
+                        "Reconciling the live page after a lost action acknowledgement");
+                    if (!await TryReconcileChildOperationCancellationAsync(
+                            runtime,
+                            token))
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Failed,
+                            "A Chrome Helper action acknowledgement timed out, and the live tab could not be read back safely.");
+                        return;
+                    }
+                    continue;
+                }
+                catch (Exception ex)
+                    when (!token.IsCancellationRequested
+                        && plannerGuidanceRevision
+                            != Volatile.Read(ref runtime.GuidanceRevision))
+                {
+                    runtime.History.Add(
+                        $"Ignored a stale in-flight browser action failure after newer explicit task guidance: {Short(ex.Message, 180)}");
+                    if (!await ReconcileSupersededBrowserActionAsync(runtime, null, token))
+                    {
+                        Fail(runtime, BrowserAutomationOutcome.Partial,
+                            "The browser action may have changed the page, but its live state could not be verified after your correction. No further browser actions were taken.");
+                        return;
+                    }
+                    continue;
+                }
+                if (plannerGuidanceRevision
+                        != Volatile.Read(ref runtime.GuidanceRevision)
+                    || InFlightResultWasSuperseded(
+                        plannerCorrectionRevision,
+                        Volatile.Read(ref runtime.CorrectionRevision)))
+                {
+                    runtime.History.Add(
+                        "Ignored the in-flight browser action result because newer explicit task guidance is authoritative.");
+                    if (!await ReconcileSupersededBrowserActionAsync(runtime, receipt.TabId, token))
+                    {
+                        Fail(runtime, BrowserAutomationOutcome.Partial,
+                            "The browser action may have changed the page, but its live state could not be verified after your correction. No further browser actions were taken.");
+                        return;
+                    }
+                    continue;
+                }
+                runtime.Receipts.Add(receipt);
+                var actionVerification = _verifier.VerifyAction(lastDecision.Action, receipt);
+                runtime.History.Add(actionVerification.Verified
+                    ? $"Action verified: {actionVerification.Evidence}"
+                    : $"Action not verified: {actionVerification.Error}");
+                var hasStrongCheckpoint = actionVerification.Verified
+                    && HasStrongCheckpointEvidence(receipt);
+
+                if (!actionVerification.Verified)
+                {
+                    if (actionVerification.Partial)
+                    {
+                        runtime.RecoveryAttempts = 0;
+                        runtime.History.Add(
+                            $"Intermediate progress observed: {actionVerification.Evidence} "
+                            + "Refresh state and ground the next control; do not claim the field is complete yet.");
+                    }
+                    else if (CanExhaustStrategy(receipt))
+                    {
+                        RememberNoProgressStrategy(
+                            runtime.NoProgressActionStates,
+                            runtime.Page,
+                            lastDecision.Action);
+                        runtime.History.Add(
+                            $"No-progress ledger: {DescribeAction(lastDecision.Action)} is exhausted on this unchanged page state; the next attempt must change strategy.");
+                    }
+                    if (!actionVerification.Partial)
+                        runtime.RecoveryAttempts++;
+                    if (!actionVerification.Partial
+                        && runtime.RecoveryAttempts >= 3)
+                    {
+                        Fail(
+                            runtime,
+                            BrowserAutomationOutcome.Partial,
+                            $"The browser remains at the last useful state, but an action could not be verified: {actionVerification.Error}");
+                        return;
+                    }
+                }
+                else
+                {
+                    runtime.RecoveryAttempts = 0;
+                }
+
+                token.ThrowIfCancellationRequested();
+                SetState(runtime, BrowserTaskState.WaitingForPage, "Reading the updated page");
+                if (ShouldStabilizeFirstNavigation(
+                    runtime.FirstNavigationStabilized,
+                    lastDecision.Action.Type,
+                    receipt))
+                {
+                    runtime.FirstNavigationStabilized = true;
+                    SetState(
+                        runtime,
+                        BrowserTaskState.WaitingForPage,
+                        "Waiting for the new web page to become ready");
+                    await Task.Delay(TimeSpan.FromSeconds(2), token);
+                }
+                runtime.Page = await _bridge.ObserveAsync(
+                    runtime.TaskId,
+                    receipt.TabId ?? runtime.Page.TabId,
+                    token);
+                AddControlledTab(runtime, runtime.Page);
+                if (ShouldRestoreLateNavigationRegression(
+                        runtime.Request,
+                        receipt,
+                        runtime.Page))
+                {
+                    runtime.History.Add(
+                        "A delayed result from an earlier page action replaced the more specific verified page after its receipt. "
+                        + "Restoring that verified page before continuing the same task.");
+                    SetState(
+                        runtime,
+                        BrowserTaskState.WaitingForPage,
+                        "Restoring verified browser progress after a delayed stale navigation");
+                    runtime.Page = await RestoreVerifiedNavigationAsync(
+                        runtime,
+                        receipt,
+                        token);
+                    AddControlledTab(runtime, runtime.Page);
+                }
+                var persistedInFreshState = FreshStateConfirmsPersistedValue(
+                    runtime.Page,
+                    lastDecision.Action,
+                    receipt);
+                if (hasStrongCheckpoint && persistedInFreshState)
+                {
+                    RememberVerifiedCheckpoint(
+                        runtime.VerifiedCheckpoints,
+                        lastDecision.Action,
+                        lastDecision.NextGoal,
+                        receipt);
+                }
+                else if (actionVerification.Verified && !persistedInFreshState)
+                {
+                    runtime.RecoveryAttempts++;
+                    RememberNoProgressStrategy(
+                        runtime.NoProgressActionStates,
+                        runtime.Page,
+                        lastDecision.Action);
+                    runtime.History.Add(
+                        "Fresh-state verification rejected a transient field write: the page cleared or changed the requested value after the immediate action receipt. "
+                        + "Do not alternate between fields or repeat the same format; use a different supported input strategy or ask for the missing information.");
+                    continue;
+                }
+
+                // A request containing exactly one explicit control action is
+                // complete once that same grounded action produces verified
+                // fresh-page evidence. Do not ask the planner for an unrelated
+                // follow-up (for example, pressing Enter after a verified icon
+                // click) merely because the model omitted an explicit Done.
+                if (actionVerification.Verified
+                    && IsExplicitSingleControlActionRequest(runtime.Request))
+                {
+                    var terminal = _verifier.VerifyTerminal(
+                        runtime.Request,
+                        lastDecision,
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.OrderedSourceCollectionVerified);
+                    if (terminal.Verified)
+                    {
+                        Complete(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            string.IsNullOrWhiteSpace(lastDecision.ResultSummary)
+                                ? "The requested control action was completed."
+                                : lastDecision.ResultSummary,
+                            terminal.Evidence);
+                        return;
+                    }
+                }
+
+                // A verified transfer into the requested destination editor is
+                // terminal evidence. Do not wait for another planner turn that
+                // can overwrite the same editor or consume the step budget.
+                if (actionVerification.Verified
+                    && IsVerifiedEditorTransferAction(runtime.Request, receipt, runtime.Page))
+                {
+                    var terminal = _verifier.VerifyTerminal(
+                        runtime.Request,
+                        lastDecision,
+                        runtime.Page,
+                        runtime.Receipts,
+                        runtime.OrderedSourceCollectionVerified);
+                    if (terminal.Verified)
+                    {
+                        Complete(
+                            runtime,
+                            BrowserAutomationOutcome.Completed,
+                            string.IsNullOrWhiteSpace(lastDecision.ResultSummary)
+                                ? "The requested text was placed in the destination editor."
+                                : lastDecision.ResultSummary,
+                            terminal.Evidence);
+                        return;
+                    }
+                }
+            }
+
+            Fail(
+                runtime,
+                BrowserAutomationOutcome.Blocked,
+                "The task reached its bounded step limit without verified completion.");
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            Fail(
+                runtime,
+                BrowserAutomationOutcome.Failed,
+                "A bounded browser sub-operation was interrupted before its result could be confirmed. Chrome and its tabs were left open.");
+            AppLog.Warning(
+                $"Browser sub-operation was interrupted independently of the task deadline: task={runtime.TaskId} elapsedMs={(DateTime.UtcNow - runtime.StartedUtc).TotalMilliseconds:0}");
+        }
+        catch (OperationCanceledException)
+        {
+            if (string.IsNullOrWhiteSpace(runtime.CancellationReason))
+            {
+                Fail(
+                    runtime,
+                    BrowserAutomationOutcome.Failed,
+                    $"The browser task reached its {MaximumTaskRuntime.TotalMinutes:0}-minute safety timeout. Chrome and its tabs were left open.");
+                AppLog.Warning(
+                    $"Browser automation timed out: task={runtime.TaskId} elapsedMs={(DateTime.UtcNow - runtime.StartedUtc).TotalMilliseconds:0}");
+            }
+            else
+            {
+                SetTerminal(
+                    runtime,
+                    BrowserTaskState.Cancelled,
+                    BrowserAutomationOutcome.Cancelled,
+                    "Browser automation cancelled.",
+                    "");
+                AppLog.Info($"Browser automation final status cancelled: task={runtime.TaskId}");
+            }
+        }
+        catch (Exception ex) when (ShouldTreatLateFailureAsCancellation(
+            token.IsCancellationRequested,
+            runtime.CancellationReason))
+        {
+            SetTerminal(
+                runtime,
+                BrowserTaskState.Cancelled,
+                BrowserAutomationOutcome.Cancelled,
+                "Browser automation cancelled.",
+                "");
+            AppLog.Info(
+                $"Ignored a late in-flight browser failure after authoritative cancellation: task={runtime.TaskId} {AppLog.FormatException(ex)}");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, $"Browser automation failed: task={runtime.TaskId}");
+            Fail(runtime, BrowserAutomationOutcome.Failed, FriendlyError(ex));
+        }
+        finally
+        {
+            try { await _bridge.EndTaskAsync(runtime.TaskId, CancellationToken.None); } catch { }
+            runtime.VisionRecovery = false;
+            // Cancellation may publish its terminal UI state before this task
+            // has finished unwinding. Release mutable task content here, on
+            // the execution owner, rather than racing a concurrent clear
+            // against planner/executor code that is still observing the token.
+            if (IsTerminal(runtime.State))
+                ReleaseTaskContent(runtime);
+            Publish(runtime);
+        }
+    }
+
+    internal static bool TryBuildDirectCurrentPageAction(
+        string request,
+        BrowserPageSnapshot page,
+        out BrowserPlannerAction action)
+    {
+        action = null;
+        var match = Regex.Match(
+            request ?? "",
+            @"^\s*(?:(?:on|in)\s+(?:this|the)\s+(?:page|tab)\s*,?\s*)?(?:please\s+)?(?<verb>click|press|select|choose|check|uncheck)\s+(?:the\s+)?(?<target>.+?)\s*[.!?]?\s*$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+
+        var verb = match.Groups["verb"].Value.ToLowerInvariant();
+        var target = match.Groups["target"].Value;
+        target = Regex.Replace(
+            target,
+            @"^on\s+(?:the\s+)?",
+            "",
+            RegexOptions.IgnoreCase);
+        target = Regex.Replace(
+            target,
+            @"\s+and\s+(?:stop|leave|keep)\b.*$",
+            "",
+            RegexOptions.IgnoreCase);
+        target = Regex.Replace(
+            target,
+            @"\s+(?:on|in)\s+(?:this|the)\s+(?:page|tab)$",
+            "",
+            RegexOptions.IgnoreCase);
+        target = Regex.Replace(
+            target,
+            @"\s+(?:page\s+)?(?:button|tab|control|option|checkbox|radio)$",
+            "",
+            RegexOptions.IgnoreCase);
+        target = target.Trim().Trim('\'', '"', '.', '!', '?');
+        if (target.Length is 0 or > 100 || target.Contains(" and ", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var normalizedTarget = NormalizeControlText(target);
+        var exact = (page?.Controls ?? Array.Empty<BrowserControl>())
+            .Where(control => control.Visible && control.Enabled)
+            .Where(control => verb is not ("check" or "uncheck")
+                || control.Role.Equals("checkbox", StringComparison.OrdinalIgnoreCase)
+                || control.Role.Equals("radio", StringComparison.OrdinalIgnoreCase))
+            .Where(control => new[]
+            {
+                control.AccessibleName,
+                control.Text,
+                control.AriaLabel,
+                control.Title,
+                control.NearbyLabel,
+            }.Any(value => NormalizeControlText(value) == normalizedTarget))
+            .GroupBy(control => control.Id, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+        if (exact.Length != 1)
+            return false;
+
+        var selected = exact[0];
+        action = new BrowserPlannerAction
+        {
+            Type = verb switch
+            {
+                "check" => "check",
+                "uncheck" => "uncheck",
+                _ => "click",
+            },
+            TargetId = selected.Id,
+            TargetRole = selected.Role,
+            TargetName = string.IsNullOrWhiteSpace(selected.AccessibleName)
+                ? selected.Text
+                : selected.AccessibleName,
+            CaptureBeforeAction = true,
+        };
+        return true;
+    }
+
+    internal static bool TryBuildDirectActiveCursorPasteAction(
+        string request,
+        BrowserPageSnapshot page,
+        out BrowserPlannerAction action)
+    {
+        action = null;
+        if (page?.ActiveEditable != true
+            || string.IsNullOrWhiteSpace(page.ActiveEditorId)
+            || !Regex.IsMatch(
+                request ?? "",
+                @"\b(?:paste|insert|type|write|place|put)\b",
+                RegexOptions.IgnoreCase)
+            || !Regex.IsMatch(
+                request ?? "",
+                @"\b(?:current|active)\s+cursor\b|\b(?:this|the|current)\s+(?:document|doc|editor|text\s*box|field)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        var quoted = Regex.Matches(
+                request ?? "",
+                "[\"“](?<text>[^\"”]{1,8000})[\"”]")
+            .Cast<Match>()
+            .LastOrDefault();
+        var text = quoted?.Groups["text"].Value ?? "";
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        action = new BrowserPlannerAction
+        {
+            Type = "paste",
+            TargetId = page.ActiveEditorId,
+            TargetRole = page.ActiveEditorRole,
+            TargetName = page.ActiveEditorName,
+            Text = text,
+        };
+        return true;
+    }
+
+    internal static bool RequiresDestinationEditorTransfer(string request) =>
+        Regex.IsMatch(
+            request ?? "",
+            @"\b(?:paste|insert|type|write|place|put)\b",
+            RegexOptions.IgnoreCase)
+        && Regex.IsMatch(
+            request ?? "",
+            @"\b(?:google docs|document|docs|doc|editor|textbox|text area|current cursor|active cursor)\b",
+            RegexOptions.IgnoreCase);
+
+    internal static bool TryResolveTaskTabTarget(
+        BrowserPlannerAction action,
+        IReadOnlySet<int> controlledTabs,
+        out int tabId)
+    {
+        tabId = 0;
+        var match = Regex.Match(
+            action?.TargetId ?? "",
+            @"^\s*tab:(?<id>\d+)\s*$",
+            RegexOptions.IgnoreCase);
+        return match.Success
+            && int.TryParse(match.Groups["id"].Value, out tabId)
+            && controlledTabs?.Contains(tabId) == true;
+    }
+
+    private static string NormalizeControlText(string value) =>
+        Regex.Replace(value ?? "", @"\s+", " ").Trim().ToLowerInvariant();
+
+    internal static IReadOnlyList<string> BuildPlannerHistory(
+        IReadOnlyList<string> history,
+        IReadOnlyList<string> verifiedCheckpoints)
+    {
+        // The planner accepts eight 500-character entries. Joining all
+        // checkpoints into one entry discarded the newest progress when that
+        // entry was truncated. Share the SAME budget between recent events
+        // and individual verified checkpoints instead of enlarging the prompt.
+        var checkpoints = (verifiedCheckpoints ?? Array.Empty<string>()).TakeLast(4).ToArray();
+        var events = history ?? Array.Empty<string>();
+        // These prefixes are written only by the existing accepted-guidance
+        // owner. Ordinary page/planner events must not evict the user's latest
+        // guidance; no raw conversation or new memory store is introduced.
+        static bool IsGuidance(string item) => item.StartsWith("User guidance:", StringComparison.Ordinal)
+            || item.StartsWith("Latest explicit user correction:", StringComparison.Ordinal)
+            || item.StartsWith("Authoritative user skip guidance:", StringComparison.Ordinal);
+        var guidance = events.Where(IsGuidance).TakeLast(2).ToArray();
+        var result = events.Where(item => !IsGuidance(item)).TakeLast(8 - checkpoints.Length - guidance.Length)
+            .Select(item => BrowserAutomationText.Truncate(item, 500)).ToList();
+        result.AddRange(checkpoints.Select(item => BrowserAutomationText.Truncate(
+            "Verified checkpoint — preserve unless a newer explicit user correction or live evidence supersedes it: " + item, 500)));
+        result.AddRange(guidance.Select(item => BrowserAutomationText.Truncate(item, 500)));
+        return result;
+    }
+
+    internal static BrowserControl GroundActionIdentity(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action)
+    {
+        if (page == null || action == null)
+            return null;
+        if (action.Type is "navigate" or "open_tab" or "activate_tab"
+            or "scroll" or "vision" or "done" or "needs_user_action"
+            or "copy_clipboard")
+        {
+            return null;
+        }
+
+        var live = FindMatchingControl(page, action);
+        if (live == null)
+        {
+            var idControl = page.Controls.FirstOrDefault(control =>
+                string.Equals(control.Id, action.TargetId, StringComparison.Ordinal));
+            if (idControl != null
+                && Normalize(action.TargetName).Length > 0
+                && Normalize(ControlName(idControl)).Length > 0
+                && NameScore(
+                    Normalize(action.TargetName),
+                    Normalize(ControlName(idControl))) < 2)
+            {
+                action.TargetId = "";
+            }
+            return null;
+        }
+
+        action.TargetId = live.Id;
+        if (!string.IsNullOrWhiteSpace(live.Role))
+            action.TargetRole = live.Role;
+        var liveName = ControlName(live);
+        if (!string.IsNullOrWhiteSpace(liveName)
+            && (string.IsNullOrWhiteSpace(action.TargetName)
+                || liveName.Length >= action.TargetName.Trim().Length))
+        {
+            action.TargetName = liveName;
+        }
+        return live;
+    }
+
+    internal static bool TryGetExplicitConstraintConflict(
+        string request,
+        BrowserPlannerAction action,
+        BrowserControl control,
+        out string reason)
+    {
+        reason = "";
+        var task = NormalizeControlText(request);
+        var target = NormalizeControlText(string.Join(
+            " ",
+            action?.TargetName,
+            action?.Option,
+            control == null ? "" : ControlName(control),
+            control?.NearbyLabel));
+        if (task.Length == 0 || target.Length == 0)
+            return false;
+
+        var exclusivePairs = new[]
+        {
+            (Requested: @"\bround[- ]?trip\b", Contradictory: @"\bone[- ]?way\b"),
+            (Requested: @"\bone[- ]?way\b", Contradictory: @"\bround[- ]?trip\b"),
+            (Requested: @"\b(?:oldest|earliest)\b", Contradictory: @"\b(?:latest|newest|most recent)\b"),
+            (Requested: @"\b(?:latest|newest|most recent)\b", Contradictory: @"\b(?:oldest|earliest)\b"),
+            (Requested: @"\bascending\b", Contradictory: @"\bdescending\b"),
+            (Requested: @"\bdescending\b", Contradictory: @"\bascending\b"),
+        };
+        foreach (var pair in exclusivePairs)
+        {
+            if (!Regex.IsMatch(task, pair.Requested, RegexOptions.IgnoreCase)
+                || !Regex.IsMatch(target, pair.Contradictory, RegexOptions.IgnoreCase))
+            {
+                continue;
+            }
+
+            reason =
+                $"The live target '{BrowserAutomationText.Truncate(target, 140)}' contradicts an explicit task constraint.";
+            return true;
+        }
+
+        var months = new[]
+        {
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        };
+        var requestedMonths = months.Where(month =>
+            Regex.IsMatch(task, $@"\b{month}\b", RegexOptions.IgnoreCase)).ToArray();
+        var targetMonths = months.Where(month =>
+            Regex.IsMatch(target, $@"\b{month}\b", RegexOptions.IgnoreCase)).ToArray();
+        if (requestedMonths.Length > 0
+            && targetMonths.Length > 0
+            && !requestedMonths.Intersect(
+                targetMonths,
+                StringComparer.OrdinalIgnoreCase).Any())
+        {
+            reason =
+                $"The live target '{BrowserAutomationText.Truncate(target, 140)}' names a different month than the task.";
+            return true;
+        }
+
+        var requestedYears = Regex.Matches(task, @"\b20\d{2}\b")
+            .Select(match => match.Value)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var targetYears = Regex.Matches(target, @"\b20\d{2}\b")
+            .Select(match => match.Value)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (requestedYears.Length > 0
+            && targetYears.Length > 0
+            && !requestedYears.Intersect(targetYears, StringComparer.Ordinal).Any())
+        {
+            reason =
+                $"The live target '{BrowserAutomationText.Truncate(target, 140)}' names a different year than the task.";
+            return true;
+        }
+
+        return false;
+    }
+
+    internal static bool TryGetDeclaredGoalTargetConflict(
+        string immediateGoal,
+        BrowserPlannerAction action,
+        BrowserControl control,
+        out string reason)
+    {
+        reason = "";
+        if (action?.Type is not ("click" or "select_option" or "check" or "uncheck"))
+            return false;
+
+        var quotedTargets = Regex.Matches(
+                immediateGoal ?? "",
+                @"(?<quote>['""])(?<value>[^'""]{2,80})\k<quote>")
+            .Select(match => NormalizeControlText(match.Groups["value"].Value))
+            .Where(value => value.Length > 1)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (quotedTargets.Length == 0)
+            return false;
+
+        var liveTarget = NormalizeControlText(string.Join(
+            " ",
+            control == null ? action.TargetName : ControlName(control),
+            action.Type == "select_option" ? action.Option : "",
+            control?.NearbyLabel));
+        if (liveTarget.Length == 0
+            || quotedTargets.Any(target =>
+                liveTarget.Contains(target, StringComparison.Ordinal)
+                || target.Contains(liveTarget, StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        reason =
+            $"The live target '{BrowserAutomationText.Truncate(liveTarget, 140)}' does not match the planner's declared target '{BrowserAutomationText.Truncate(quotedTargets[0], 80)}'.";
+        return true;
+    }
+
+    internal static bool TryGetAmbiguousExplicitDateTarget(
+        string immediateGoal,
+        BrowserPlannerAction action,
+        BrowserControl control,
+        out string reason)
+    {
+        reason = "";
+        if (action?.Type != "click" || control == null)
+            return false;
+
+        var requested = NormalizeControlText(immediateGoal);
+        var target = NormalizeControlText(string.Join(
+            " ",
+            ControlName(control),
+            control.NearbyLabel,
+            control.Value));
+        var explicitDate = Regex.Match(
+            requested,
+            @"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+([0-3]?\d)(?:st|nd|rd|th)?(?:,|\s)+\s*(20\d{2})\b",
+            RegexOptions.IgnoreCase);
+        if (!explicitDate.Success
+            || !Regex.IsMatch(target, @"^\s*[0-3]?\d\s*$"))
+        {
+            return false;
+        }
+
+        reason =
+            $"The requested date is {explicitDate.Value}, but the live target is only the context-free number '{target}'.";
+        return true;
+    }
+
+    internal static bool TryGetMissingRequiredDate(
+        string userConstraintContext,
+        string immediateGoal,
+        BrowserPlannerAction action,
+        BrowserControl control,
+        out string reason)
+    {
+        reason = "";
+        if (action == null || HasUsableDateConstraint(userConstraintContext))
+            return false;
+
+        var target = NormalizeControlText(string.Join(
+            " ",
+            action.TargetRole,
+            action.TargetName,
+            control == null ? "" : ControlName(control),
+            control?.NearbyLabel,
+            control?.Placeholder));
+        var proposal = NormalizeControlText(string.Join(
+            " ",
+            immediateGoal,
+            action.Text,
+            action.Option,
+            action.Url));
+        var dateTarget = Regex.IsMatch(
+            $"{target} {proposal}",
+            @"\b(?:date|departure|depart|return|arrival|arrive|check[- ]?in|check[- ]?out|calendar|day|month)\b",
+            RegexOptions.IgnoreCase);
+        if (!dateTarget || !ContainsConcreteDateValue(proposal))
+            return false;
+
+        reason =
+            "This task requires a date that was not provided. Tell me the needed date or range (for example, “use August 1 to August 8”), and I’ll continue from this page.";
+        return true;
+    }
+
+    internal static bool HasUsableDateConstraint(string text)
+    {
+        var normalized = NormalizeControlText(text);
+        if (normalized.Length == 0)
+            return false;
+        return Regex.IsMatch(
+            normalized,
+            @"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b"
+            + @"|\b20\d{2}[-/][01]?\d[-/][0-3]?\d\b"
+            + @"|\b[0-3]?\d[-/][01]?\d(?:[-/](?:20)?\d{2})?\b"
+            + @"|\b(?:today|tomorrow|tonight|this weekend|next (?:day|week|weekend|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b"
+            + @"|\bin \d{1,3} (?:day|days|week|weeks|month|months)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static bool ContainsConcreteDateValue(string text) =>
+        Regex.IsMatch(
+            text ?? "",
+            @"\b20\d{2}[-/][01]?\d[-/][0-3]?\d\b"
+            + @"|\b[0-3]?\d[-/][01]?\d(?:[-/](?:20)?\d{2})?\b"
+            + @"|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+[0-3]?\d(?:st|nd|rd|th)?\b",
+            RegexOptions.IgnoreCase);
+
+    private static string BuildUserConstraintContext(Runtime runtime)
+    {
+        var guidance = runtime.History
+            .Where(item => item.StartsWith(
+                "User guidance:",
+                StringComparison.OrdinalIgnoreCase));
+        return string.Join("\n", new[] { runtime.Request }.Concat(guidance));
+    }
+
+    internal static bool HasStrongCheckpointEvidence(BrowserActionReceipt receipt) =>
+        receipt?.Ok == true
+        && !receipt.Stale
+        && !receipt.NoVisibleChange
+        && (receipt.ValueMatches
+            || receipt.SelectedChanged
+            || receipt.CheckedChanged
+            || receipt.Navigation);
+
+    internal static bool FreshStateConfirmsPersistedValue(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        BrowserActionReceipt receipt)
+    {
+        if (action == null
+            || receipt?.Ok != true
+            || !receipt.ValueMatches
+            || action.Type is not ("type" or "paste"))
+        {
+            return true;
+        }
+
+        var live = (page?.Controls ?? Array.Empty<BrowserControl>())
+            .FirstOrDefault(control =>
+                string.Equals(control.Id, receipt.TargetId, StringComparison.Ordinal))
+            ?? FindMatchingControl(page, action);
+        if (live != null)
+        {
+            return EquivalentInputValue(
+                live.Value,
+                string.IsNullOrWhiteSpace(receipt.ExpectedValue)
+                    ? action.Text
+                    : receipt.ExpectedValue,
+                allowContainedText: !action.Replace || action.Type == "paste");
+        }
+
+        // Canvas-backed editors can expose only a task-leased active cursor,
+        // not readable document text. A trusted native paste is accepted here
+        // only when its atomic copy/read-back receipt still belongs to that
+        // same live editor lease.
+        if (receipt.NativeInputUsed
+            && action.Type == "paste"
+            && page?.ActiveEditable == true
+            && !string.IsNullOrWhiteSpace(page.ActiveEditorId)
+            && string.Equals(
+                page.ActiveEditorId,
+                receipt.TargetId,
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Search submission and navigation commonly replace the input itself.
+        // That is a durable state transition, unlike a field that remains live
+        // but silently clears after an unsupported format.
+        return receipt.Navigation
+            || !string.Equals(
+                receipt.AfterUrl,
+                page?.Url,
+                StringComparison.Ordinal);
+    }
+
+    private static bool EquivalentInputValue(
+        string observed,
+        string expected,
+        bool allowContainedText)
+    {
+        var actual = NormalizeControlText(observed);
+        var wanted = NormalizeControlText(expected);
+        if (wanted.Length == 0)
+            return true;
+        if (actual.Equals(wanted, StringComparison.Ordinal)
+            || (allowContainedText
+                && actual.Contains(wanted, StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        return DateTime.TryParse(
+                observed,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var actualDate)
+            && DateTime.TryParse(
+                expected,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var wantedDate)
+            && actualDate.Date == wantedDate.Date;
+    }
+
+    internal static void RememberVerifiedCheckpoint(
+        IList<string> checkpoints,
+        BrowserPlannerAction action,
+        string immediateGoal,
+        BrowserActionReceipt receipt)
+    {
+        if (checkpoints == null || action == null || receipt == null)
+            return;
+        var identity = ImmediateGoalIdentity(immediateGoal);
+        var summary =
+            $"{identity}: {BrowserAutomationText.Truncate(immediateGoal, 180)} "
+            + $"via {NormalizeControlText(action.Type)} on "
+            + $"'{BrowserAutomationText.Truncate(receipt.TargetName, 100)}' "
+            + $"(value={receipt.ValueMatches}, selected={receipt.SelectedChanged}, checked={receipt.CheckedChanged}, navigation={receipt.Navigation})";
+        if (!string.IsNullOrWhiteSpace(identity))
+        {
+            for (var index = checkpoints.Count - 1; index >= 0; index--)
+            {
+                if (checkpoints[index].StartsWith(
+                    identity + ":",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    checkpoints.RemoveAt(index);
+                }
+            }
+        }
+        checkpoints.Add(summary);
+        while (checkpoints.Count > 12)
+            checkpoints.RemoveAt(0);
+    }
+
+    internal static bool DirectActionAlreadySatisfied(
+        BrowserPlannerAction action,
+        BrowserControl control)
+    {
+        if (action == null || control == null)
+            return false;
+        if (action.Type == "check")
+            return control.Checked;
+        if (action.Type == "uncheck")
+            return !control.Checked;
+        if (action.Type is "type" or "paste")
+            return !string.IsNullOrWhiteSpace(action.Text)
+                && NormalizeControlText(control.Value)
+                    .Equals(
+                        NormalizeControlText(action.Text),
+                        StringComparison.Ordinal);
+        if (action.Type == "select_option")
+        {
+            var requested = string.IsNullOrWhiteSpace(action.Option)
+                ? action.Text
+                : action.Option;
+            return !string.IsNullOrWhiteSpace(requested)
+                && NormalizeControlText(control.Value)
+                    .Equals(
+                        NormalizeControlText(requested),
+                        StringComparison.Ordinal);
+        }
+        return action.Type == "click"
+            && (control.Selected
+                || (control.Role.Equals("radio", StringComparison.OrdinalIgnoreCase)
+                    && control.Checked));
+    }
+
+    internal static bool ShouldNormalizeChoiceTyping(
+        BrowserPlannerAction action,
+        BrowserControl control) =>
+        action?.Type == "type"
+        && control != null
+        && !control.Editable
+        && !string.IsNullOrWhiteSpace(action.Text)
+        && (control.Role.Equals("combobox", StringComparison.OrdinalIgnoreCase)
+            || control.Role.Equals("listbox", StringComparison.OrdinalIgnoreCase));
+
+    internal static bool TryNormalizeNativeDateTyping(
+        BrowserPlannerAction action,
+        BrowserControl control,
+        out string normalized)
+    {
+        normalized = "";
+        if (action?.Type is not ("type" or "paste")
+            || control == null
+            || !control.InputType.Equals("date", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(action.Text))
+        {
+            return false;
+        }
+
+        var explicitDate = Regex.Replace(
+                action.Text.Trim().TrimEnd('.', ',', ';', ':'),
+                @"(?<=\d)(?:st|nd|rd|th)\b",
+                "",
+                RegexOptions.IgnoreCase)
+            .Trim();
+        var formats = new[]
+        {
+            "yyyy-MM-dd",
+            "MMMM d yyyy",
+            "MMMM d, yyyy",
+            "MMM d yyyy",
+            "MMM d, yyyy",
+            "d MMMM yyyy",
+            "d MMM yyyy",
+        };
+        if (!DateTime.TryParseExact(
+                explicitDate,
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var date))
+        {
+            return false;
+        }
+
+        normalized = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        return true;
+    }
+
+    private async Task<BrowserActionReceipt> ExecutePlannerActionAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        CancellationToken token,
+        string immediateGoal = "",
+        int? expectedGuidanceRevision = null)
+    {
+        if (expectedGuidanceRevision.HasValue)
+        {
+            await WaitForTaskReadyAsync(runtime, token);
+            if (expectedGuidanceRevision.Value
+                != Volatile.Read(ref runtime.GuidanceRevision))
+            {
+                throw new InvalidOperationException(
+                    "The pending browser action was superseded by newer explicit task guidance before execution.");
+            }
+        }
+        else
+        {
+            await runtime.PauseGate.WaitAsync(token);
+            token.ThrowIfCancellationRequested();
+        }
+
+        if (ShouldUseTrustedEditorPaste(runtime.Request, runtime.Page, action))
+        {
+            action.Type = "paste";
+            runtime.History.Add(
+                "Routed document-editor text entry through trusted native paste and destination read-back.");
+        }
+
+        // A native date field is a structured value control, not a clipboard
+        // destination. Normalize explicit human-readable dates before the
+        // generic trusted-paste path so retry strategy changes cannot turn a
+        // valid date into repeated Ctrl+V no-ops.
+        if (action.Type == "paste")
+        {
+            var pasteTarget = FindMatchingControl(runtime.Page, action);
+            if (TryNormalizeNativeDateTyping(action, pasteTarget, out var pastedDate))
+            {
+                action.Type = "type";
+                action.Text = pastedDate;
+                action.Replace = true;
+                action.SubmitAfter = false;
+                runtime.History.Add(
+                    "Normalized a date paste request to the native date control's ISO value action.");
+            }
+        }
+
+        if (action.Type == "paste")
+        {
+            if (string.IsNullOrWhiteSpace(action.Text)
+                && !string.IsNullOrWhiteSpace(runtime.PreparedDraft))
+            {
+                action.Text = runtime.PreparedDraft;
+                runtime.History.Add("Used the task-scoped prepared result for the destination paste.");
+            }
+            var pasteReceipt = await ExecuteTrustedPasteAsync(runtime, action, token);
+            AttachExpectedState(pasteReceipt, action);
+            LogActionReceipt(runtime.TaskId, pasteReceipt);
+            return pasteReceipt;
+        }
+
+        var liveTarget = action.Type == "activate_tab"
+            ? null
+            : FindMatchingControl(runtime.Page, action);
+        if (ShouldNormalizeChoiceTyping(action, liveTarget))
+        {
+            action.Type = "select_option";
+            action.Option = action.Text;
+            action.Text = "";
+            action.SubmitAfter = false;
+            runtime.History.Add(
+                "Normalized text entry on a non-editable choice control to semantic option selection.");
+        }
+        if (TryNormalizeNativeDateTyping(action, liveTarget, out var normalizedDate))
+        {
+            action.Text = normalizedDate;
+            action.Replace = true;
+            action.SubmitAfter = false;
+            runtime.History.Add(
+                "Normalized an explicit natural-language date to the native date control's ISO value format.");
+        }
+        // Text mutation mode is explicit in the validated planner action.
+        // Do not reinterpret insertion as replacement from words in the goal.
+        if (IsBroadNonEditorContainerAction(action, liveTarget))
+        {
+            return new BrowserActionReceipt
+            {
+                TaskId = runtime.TaskId,
+                Ok = false,
+                Stale = false,
+                Action = action.Type,
+                TargetId = liveTarget.Id,
+                TargetRole = liveTarget.Role,
+                TargetName = ControlName(liveTarget),
+                BeforeUrl = runtime.Page.Url,
+                AfterUrl = runtime.Page.Url,
+                BeforeFingerprint = runtime.Page.Fingerprint,
+                AfterFingerprint = runtime.Page.Fingerprint,
+                WindowId = runtime.Page.WindowId,
+                TabId = runtime.Page.TabId,
+                GraphVersion = runtime.Page.GraphVersion,
+                DomEpoch = runtime.Page.DomEpoch,
+                Error = "The selected target is a broad non-editable page container, not a grounded interactive control. Re-plan using a real editor or active cursor.",
+            };
+        }
+
+        var effectiveActionType = action.Type;
+        var requestedTabId = runtime.Page.TabId;
+        if (effectiveActionType == "activate_tab"
+            && !TryResolveTaskTabTarget(
+                action,
+                runtime.ControlledTabs,
+                out requestedTabId))
+        {
+            return new BrowserActionReceipt
+            {
+                TaskId = runtime.TaskId,
+                Ok = false,
+                Stale = true,
+                Action = action.Type,
+                TargetId = action.TargetId,
+                BeforeUrl = runtime.Page.Url,
+                AfterUrl = runtime.Page.Url,
+                BeforeFingerprint = runtime.Page.Fingerprint,
+                AfterFingerprint = runtime.Page.Fingerprint,
+                WindowId = runtime.Page.WindowId,
+                TabId = runtime.Page.TabId,
+                GraphVersion = runtime.Page.GraphVersion,
+                DomEpoch = runtime.Page.DomEpoch,
+                Error = "The requested destination is not one of this task's live owned tabs.",
+            };
+        }
+        if (ShouldOpenDestinationInNewTab(
+                runtime.CurrentPageIntent,
+                runtime.DestinationTabOpened,
+                runtime.InitialTabWasProtectedOrBlank,
+                runtime.InitialTabId,
+                runtime.Page.TabId,
+                action.Type,
+                runtime.Page.Url,
+                action.Url))
+        {
+            effectiveActionType = "open_tab";
+            runtime.History.Add("Opened the first requested website in one same-window task tab instead of replacing the user's starting tab.");
+        }
+
+        if (effectiveActionType is "navigate" or "open_tab")
+        {
+            if (!Uri.TryCreate(action.Url, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                throw new InvalidOperationException("The planner did not provide a safe absolute URL.");
+            }
+        }
+
+        var request = new BrowserActionRequest
+        {
+            TaskId = runtime.TaskId,
+            Type = effectiveActionType,
+            WindowId = runtime.Page.WindowId,
+            TabId = requestedTabId,
+            GraphVersion = runtime.Page.GraphVersion,
+            DomEpoch = runtime.Page.DomEpoch,
+            ControlId = liveTarget?.Id ?? action.TargetId,
+            TargetRole = action.TargetRole,
+            TargetName = action.TargetName,
+            TargetFieldId = action.TargetFieldId,
+            Text = action.Text,
+            Url = action.Url,
+            Key = action.Key,
+            Option = action.Option,
+            Replace = action.Replace,
+            CaptureBeforeAction = action.CaptureBeforeAction
+                && SupportsSafeActionCapture(_bridge.Status.ServiceWorkerVersion),
+        };
+        var receipt = await _bridge.ExecuteAsync(request, token);
+        if (!receipt.Ok
+            && ShouldRecoverMissingTaskTab(
+                effectiveActionType,
+                receipt.Error,
+                runtime.MissingTabRecoveryAttempted))
+        {
+            runtime.MissingTabRecoveryAttempted = true;
+            runtime.History.Add(
+                "The controlled tab disappeared. Re-leasing the current Chrome window once and opening the requested destination without replacing its active page.");
+            SetState(runtime, BrowserTaskState.ReadingPage, "Recovering the closed browser task tab");
+
+            var recoveryAnchor = await _bridge.BeginTaskAsync(
+                runtime.TaskId,
+                useCurrentTab: true,
+                token);
+            runtime.Page = recoveryAnchor;
+            AddControlledTab(runtime, recoveryAnchor);
+            effectiveActionType = "open_tab";
+            request = new BrowserActionRequest
+            {
+                TaskId = runtime.TaskId,
+                Type = effectiveActionType,
+                WindowId = recoveryAnchor.WindowId,
+                TabId = recoveryAnchor.TabId,
+                GraphVersion = recoveryAnchor.GraphVersion,
+                DomEpoch = recoveryAnchor.DomEpoch,
+                Url = action.Url,
+            };
+            receipt = await _bridge.ExecuteAsync(request, token);
+        }
+        if (ShouldReconcileUsableTimedOutNavigation(effectiveActionType, receipt))
+        {
+            try
+            {
+                var fresh = await _bridge.ObserveAsync(
+                    runtime.TaskId,
+                    requestedTabId,
+                    token);
+                if (TryReconcileUsableTimedOutNavigation(
+                        runtime.Page,
+                        action.Url,
+                        requestedTabId,
+                        fresh,
+                        receipt))
+                {
+                    runtime.History.Add(
+                        "Reconciled a navigation load timeout from the exact owned tab after its live document became readable at the requested URL.");
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                runtime.History.Add(
+                    $"The timed-out navigation could not be read back safely: {Short(ex.Message, 180)}");
+            }
+        }
+        if (ShouldAwaitDelayedLinkNavigation(effectiveActionType, receipt))
+        {
+            SetState(
+                runtime,
+                BrowserTaskState.WaitingForPage,
+                "Waiting for the selected link to finish opening");
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(8);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                if (TryReconcileDelayedLinkNavigation(
+                        runtime.Page.TabId,
+                        receipt,
+                        _bridge.Status))
+                {
+                    runtime.History.Add(
+                        "Reconciled a link click whose same-tab navigation began after the immediate page receipt.");
+                    break;
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+            }
+        }
+        LogActionReceipt(runtime.TaskId, receipt);
+        if (effectiveActionType == "open_tab"
+            && receipt.Ok
+            && receipt.TabId is int openedTab
+            && openedTab != runtime.InitialTabId)
+        {
+            runtime.DestinationTabOpened = true;
+        }
+
+        var targetSuggestsSearch = (action.TargetName ?? "").Contains(
+                "search",
+                StringComparison.OrdinalIgnoreCase)
+            || (action.TargetRole ?? "").Equals("searchbox", StringComparison.OrdinalIgnoreCase);
+        if (action.Type == "type"
+            && action.SubmitAfter
+            && targetSuggestsSearch
+            && receipt.Ok
+            && receipt.ValueMatches)
+        {
+            var fresh = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                receipt.TabId ?? runtime.Page.TabId,
+                token);
+            var matching = fresh.Controls.FirstOrDefault(control =>
+                string.Equals(control.Role, action.TargetRole, StringComparison.OrdinalIgnoreCase)
+                && (string.Equals(
+                        control.AccessibleName,
+                        action.TargetName,
+                        StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(
+                        control.Placeholder,
+                        action.TargetName,
+                        StringComparison.OrdinalIgnoreCase)));
+            if (matching != null)
+            {
+                var enterReceipt = await _bridge.ExecuteAsync(
+                    new BrowserActionRequest
+                    {
+                        TaskId = runtime.TaskId,
+                        Type = "press_key",
+                        WindowId = fresh.WindowId,
+                        TabId = fresh.TabId,
+                        GraphVersion = fresh.GraphVersion,
+                        DomEpoch = fresh.DomEpoch,
+                        ControlId = matching.Id,
+                        TargetRole = matching.Role,
+                        TargetName = matching.AccessibleName,
+                        Key = "Enter",
+                    },
+                    token);
+                runtime.Receipts.Add(enterReceipt);
+                if (enterReceipt.Ok && enterReceipt.NoVisibleChange)
+                {
+                    enterReceipt = await ExecuteTrustedEnterAsync(
+                        runtime,
+                        action,
+                        fresh,
+                        matching,
+                        token);
+                    runtime.Receipts.Add(enterReceipt);
+                }
+                runtime.History.Add(enterReceipt.Ok
+                    ? "Submitted the verified search field with Enter without another model call."
+                    : $"Search submission was not acknowledged: {enterReceipt.Error}");
+            }
+        }
+
+        if (action.Type == "press_key"
+            && string.Equals(action.Key, "Enter", StringComparison.OrdinalIgnoreCase)
+            && receipt.Ok
+            && receipt.NoVisibleChange)
+        {
+            var fresh = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                receipt.TabId ?? runtime.Page.TabId,
+                token);
+            var matching = FindMatchingControl(fresh, action);
+            if (matching != null)
+                receipt = await ExecuteTrustedEnterAsync(runtime, action, fresh, matching, token);
+        }
+
+        if (ShouldUseListboxKeyboardFallback(action, receipt))
+        {
+            var fresh = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                receipt.TabId ?? runtime.Page.TabId,
+                token);
+            var matching = FindMatchingControl(fresh, action)
+                ?? FindMatchingControl(
+                    fresh,
+                    new BrowserPlannerAction
+                    {
+                        TargetId = receipt.TargetId,
+                        TargetRole = receipt.TargetRole,
+                        TargetName = receipt.TargetName,
+                    });
+            if (matching != null)
+            {
+                var keyboardReceipt = await ExecuteTrustedEnterAsync(
+                    runtime,
+                    action,
+                    fresh,
+                    matching,
+                    token);
+                if (keyboardReceipt.Ok && keyboardReceipt.NoVisibleChange)
+                {
+                    var afterEnter = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        keyboardReceipt.TabId ?? fresh.TabId,
+                        token);
+                    var afterEnterControl = FindMatchingControl(afterEnter, action)
+                        ?? FindMatchingControl(
+                            afterEnter,
+                            new BrowserPlannerAction
+                            {
+                                TargetId = keyboardReceipt.TargetId,
+                                TargetRole = keyboardReceipt.TargetRole,
+                                TargetName = keyboardReceipt.TargetName,
+                            });
+                    if (afterEnterControl != null)
+                    {
+                        keyboardReceipt = await ExecuteTrustedSpaceAsync(
+                            runtime,
+                            action,
+                            afterEnter,
+                            afterEnterControl,
+                            token);
+                    }
+                }
+                if (keyboardReceipt.Ok && keyboardReceipt.NoVisibleChange)
+                {
+                    var afterSpace = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        keyboardReceipt.TabId ?? fresh.TabId,
+                        token);
+                    var afterSpaceControl = FindMatchingControl(afterSpace, action)
+                        ?? FindMatchingControl(
+                            afterSpace,
+                            new BrowserPlannerAction
+                            {
+                                TargetId = keyboardReceipt.TargetId,
+                                TargetRole = keyboardReceipt.TargetRole,
+                                TargetName = keyboardReceipt.TargetName,
+                            });
+                    if (afterSpaceControl != null)
+                    {
+                        keyboardReceipt = await ExecuteTrustedAltArrowDownAsync(
+                            runtime,
+                            action,
+                            afterSpace,
+                            afterSpaceControl,
+                            token);
+                    }
+                }
+                if (keyboardReceipt.Ok)
+                {
+                    var requestedOption = ResolveRequestedCustomOption(
+                        action,
+                        runtime.CurrentAction,
+                        runtime.Request);
+                    if (!string.IsNullOrWhiteSpace(requestedOption))
+                    {
+                        var opened = await _bridge.ObserveAsync(
+                            runtime.TaskId,
+                            keyboardReceipt.TabId ?? fresh.TabId,
+                            token);
+                        var openedControl = FindMatchingControl(opened, action)
+                            ?? FindMatchingControl(
+                                opened,
+                                new BrowserPlannerAction
+                                {
+                                    TargetId = keyboardReceipt.TargetId,
+                                    TargetRole = keyboardReceipt.TargetRole,
+                                    TargetName = keyboardReceipt.TargetName,
+                                });
+                        if (openedControl != null)
+                        {
+                            keyboardReceipt = await ExecuteTrustedListboxSelectionAsync(
+                                runtime,
+                                action,
+                                opened,
+                                openedControl,
+                                requestedOption,
+                                token);
+                        }
+                    }
+                }
+                runtime.History.Add(keyboardReceipt.Ok && !keyboardReceipt.NoVisibleChange
+                    ? "The custom listbox used a bounded alternative input strategy and produced a verified live state change."
+                    : "The custom listbox exhausted distinct DOM click, Enter, Space, Alt+Down, and explicit type-ahead strategies without a verified state change.");
+                AppLog.Info(
+                    $"Browser listbox keyboard fallback: task={runtime.TaskId} ok={keyboardReceipt.Ok} "
+                    + $"noVisibleChange={keyboardReceipt.NoVisibleChange} targetCharacters={keyboardReceipt.TargetName?.Length ?? 0}");
+                receipt = keyboardReceipt;
+            }
+            else
+            {
+                AppLog.Info(
+                    $"Browser listbox keyboard fallback skipped: task={runtime.TaskId} "
+                    + "the live semantic control could not be re-resolved.");
+            }
+        }
+
+        if (ShouldResolveCustomOption(action, receipt))
+        {
+            var fresh = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                receipt.TabId ?? runtime.Page.TabId,
+                token);
+            var option = FindCustomOptionControl(
+                fresh,
+                action,
+                runtime.CurrentAction);
+            if (option != null)
+            {
+                receipt = await _bridge.ExecuteAsync(
+                    new BrowserActionRequest
+                    {
+                        TaskId = runtime.TaskId,
+                        Type = "click",
+                        WindowId = fresh.WindowId,
+                        TabId = fresh.TabId,
+                        GraphVersion = fresh.GraphVersion,
+                        DomEpoch = fresh.DomEpoch,
+                ControlId = option.Id,
+                        TargetRole = option.Role,
+                        TargetName = ControlName(option),
+                        CaptureBeforeAction = action.CaptureBeforeAction
+                            && SupportsSafeActionCapture(_bridge.Status.ServiceWorkerVersion),
+                    },
+                    token);
+                runtime.History.Add(receipt.Ok
+                    ? "Resolved the requested custom-listbox option to its live accessibility option control."
+                    : $"The live custom-listbox option could not be activated: {receipt.Error}");
+                AppLog.Info(
+                    $"Browser custom option receipt: task={runtime.TaskId} ok={receipt.Ok} "
+                    + $"targetCharacters={receipt.TargetName?.Length ?? 0} errorCharacters={receipt.Error?.Length ?? 0}");
+            }
+            else
+            {
+                var requestedOption = ResolveRequestedCustomOption(
+                    action,
+                    runtime.CurrentAction,
+                    runtime.Request);
+                var container = FindMatchingControl(fresh, action)
+                    ?? (fresh.Controls ?? Array.Empty<BrowserControl>())
+                        .Where(control =>
+                            control.Visible
+                            && control.Enabled
+                            && IsCustomOptionContainerRole(control.Role))
+                        .OrderBy(control =>
+                            control.Bounds.Width * control.Bounds.Height)
+                        .FirstOrDefault();
+                if (container != null && !string.IsNullOrWhiteSpace(requestedOption))
+                {
+                    var activation = await ExecuteTrustedAltArrowDownAsync(
+                        runtime,
+                        action,
+                        fresh,
+                        container,
+                        token);
+                    var selectionPage = await _bridge.ObserveAsync(
+                        runtime.TaskId,
+                        activation.TabId ?? fresh.TabId,
+                        token);
+                    var liveContainer = FindMatchingControl(selectionPage, action)
+                        ?? FindMatchingControl(
+                            selectionPage,
+                            new BrowserPlannerAction
+                            {
+                                TargetRole = container.Role,
+                                TargetName = ControlName(container),
+                            });
+                    receipt = liveContainer == null
+                        ? new BrowserActionReceipt
+                        {
+                            TaskId = runtime.TaskId,
+                            Ok = false,
+                            Stale = true,
+                            Action = "select_option",
+                            TargetRole = container.Role,
+                            TargetName = requestedOption,
+                            BeforeUrl = fresh.Url,
+                            AfterUrl = selectionPage.Url,
+                            BeforeFingerprint = fresh.Fingerprint,
+                            AfterFingerprint = selectionPage.Fingerprint,
+                            WindowId = selectionPage.WindowId,
+                            TabId = selectionPage.TabId,
+                            GraphVersion = selectionPage.GraphVersion,
+                            DomEpoch = selectionPage.DomEpoch,
+                            Error = "The custom listbox changed before its requested option could be re-resolved.",
+                        }
+                        : await ExecuteTrustedListboxSelectionAsync(
+                            runtime,
+                            action,
+                            selectionPage,
+                            liveContainer,
+                            requestedOption,
+                            token);
+                    runtime.History.Add(receipt.Ok
+                        ? "The non-native option was selected with bounded trusted keyboard type-ahead and verified from fresh state."
+                        : "The non-native option was not exposed in the accessibility graph and bounded trusted keyboard selection did not verify it.");
+                }
+            }
+        }
+
+        if (receipt.Ok
+            && (action.Type == "select_option"
+                || string.Equals(
+                    receipt.TargetRole,
+                    "option",
+                    StringComparison.OrdinalIgnoreCase)))
+        {
+            var fresh = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                receipt.TabId ?? runtime.Page.TabId,
+                token);
+            if (FreshStateConfirmsOption(fresh, action, receipt))
+            {
+                receipt.SelectedChanged = true;
+                receipt.NoVisibleChange = false;
+            }
+        }
+
+        receipt = await PreserveProgressAfterUnexpectedNavigationAsync(
+            runtime,
+            action,
+            receipt,
+            token);
+        AttachExpectedState(receipt, action);
+        return receipt;
+    }
+
+    internal static bool IsChildOperationCancellation(
+        bool authoritativeTaskCancellationRequested) =>
+        !authoritativeTaskCancellationRequested;
+
+    internal static bool PlannerPageWasSupersededDuringPlanning(
+        BrowserPageSnapshot plannedPage,
+        BrowserHelperStatus helperStatus) =>
+        plannedPage != null
+        && helperStatus?.CommandChannelReady == true
+        && helperStatus.ActiveTabFresh
+        && helperStatus.TabId == plannedPage.TabId
+        && !string.IsNullOrWhiteSpace(helperStatus.ActiveUrl)
+        && !SameLivePage(plannedPage.Url, helperStatus.ActiveUrl);
+
+    internal static BrowserActionReceipt CreateObservedNavigationReceipt(
+        string taskId,
+        BrowserPageSnapshot before,
+        BrowserPageSnapshot after)
+    {
+        if (before == null
+            || after == null
+            || before.TabId != after.TabId
+            || SameLivePage(before.Url, after.Url)
+            || BrowserAutomationVerifier.IsLikelyNavigationRegression(
+                before.Url,
+                after.Url))
+        {
+            return null;
+        }
+
+        return new BrowserActionReceipt
+        {
+            TaskId = taskId ?? "",
+            Ok = true,
+            NoVisibleChange = false,
+            Action = "navigate",
+            TargetId = after.Url,
+            TargetRole = "document",
+            TargetName = after.Title,
+            BeforeUrl = before.Url,
+            AfterUrl = after.Url,
+            BeforeFingerprint = before.Fingerprint,
+            AfterFingerprint = after.Fingerprint,
+            Navigation = true,
+            WindowId = after.WindowId,
+            TabId = after.TabId,
+            GraphVersion = after.GraphVersion,
+            DomEpoch = after.DomEpoch,
+        };
+    }
+
+    internal static bool ShouldRestoreLateNavigationRegression(
+        string request,
+        BrowserActionReceipt receipt,
+        BrowserPageSnapshot freshPage) =>
+        receipt?.Ok == true
+        && receipt.Navigation
+        && !string.IsNullOrWhiteSpace(receipt.AfterUrl)
+        && freshPage != null
+        && BrowserAutomationVerifier.IsLikelyNavigationRegression(
+            receipt.AfterUrl,
+            freshPage.Url)
+        && !BrowserAutomationVerifier.RequestAllowsNavigationRegression(request);
+
+    private async Task<BrowserPageSnapshot> RestoreVerifiedNavigationAsync(
+        Runtime runtime,
+        BrowserActionReceipt verifiedReceipt,
+        CancellationToken token)
+    {
+        var regressed = runtime.Page;
+        var restore = await _bridge.ExecuteAsync(
+            new BrowserActionRequest
+            {
+                TaskId = runtime.TaskId,
+                Type = "navigate",
+                WindowId = regressed.WindowId,
+                TabId = regressed.TabId,
+                GraphVersion = regressed.GraphVersion,
+                DomEpoch = regressed.DomEpoch,
+                Url = verifiedReceipt.AfterUrl,
+            },
+            token);
+        LogActionReceipt(runtime.TaskId, restore);
+        runtime.Receipts.Add(restore);
+        if (!restore.Ok)
+        {
+            runtime.History.Add(
+                "The delayed stale navigation was detected, but Chrome did not acknowledge the bounded progress restore.");
+            return regressed;
+        }
+
+        var restored = await _bridge.ObserveAsync(
+            runtime.TaskId,
+            restore.TabId ?? regressed.TabId,
+            token);
+        runtime.History.Add(
+            SameLivePage(verifiedReceipt.AfterUrl, restored.Url)
+                ? "The more specific verified page was restored successfully."
+                : "Chrome acknowledged the progress restore, but the fresh page did not match the verified destination.");
+        return restored;
+    }
+
+    private async Task<bool> TryReconcileChildOperationCancellationAsync(
+        Runtime runtime,
+        CancellationToken taskToken)
+    {
+        try
+        {
+            taskToken.ThrowIfCancellationRequested();
+            var refreshed = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                runtime.Page.TabId,
+                taskToken);
+            var previousUrl = runtime.Page.Url;
+            var previousFingerprint = runtime.Page.Fingerprint;
+            runtime.Page = refreshed;
+            AddControlledTab(runtime, refreshed);
+            runtime.History.Add(
+                !SameLivePage(previousUrl, refreshed.Url)
+                || !string.Equals(
+                    previousFingerprint,
+                    refreshed.Fingerprint,
+                    StringComparison.Ordinal)
+                    ? $"The live read-back recovered browser progress at {refreshed.Url}."
+                    : "The live read-back found the same page; the planner may choose a different bounded strategy.");
+            return true;
+        }
+        catch (OperationCanceledException)
+            when (IsChildOperationCancellation(taskToken.IsCancellationRequested))
+        {
+            return false;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    // A correction can arrive after Chrome has accepted an action but before its
+    // receipt returns. Discard that stale receipt without discarding the real page
+    // change: the next planner step must start from a fresh, authoritative read.
+    private async Task<bool> ReconcileSupersededBrowserActionAsync(
+        Runtime runtime,
+        int? receiptTabId,
+        CancellationToken token)
+    {
+        try
+        {
+            await runtime.PauseGate.WaitAsync(token);
+            token.ThrowIfCancellationRequested();
+            var adoptedUserTab = await ApplyPendingActiveTabHandoffAsync(runtime, token);
+            token.ThrowIfCancellationRequested();
+            SetState(runtime, BrowserTaskState.WaitingForPage,
+                "Reading the live page after your correction");
+            if (!adoptedUserTab)
+            {
+                runtime.Page = await _bridge.ObserveAsync(
+                    runtime.TaskId,
+                    receiptTabId ?? runtime.Page.TabId,
+                    token);
+                AddControlledTab(runtime, runtime.Page);
+            }
+            runtime.History.Add(
+                "The superseded action was not replayed; fresh browser state is authoritative after the correction.");
+            return true;
+        }
+        catch (OperationCanceledException)
+            when (IsChildOperationCancellation(token.IsCancellationRequested))
+        {
+            return false;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<BrowserActionReceipt> PreserveProgressAfterUnexpectedNavigationAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserActionReceipt receipt,
+        CancellationToken token)
+    {
+        if (receipt?.Ok != true
+            || !receipt.Navigation
+            || !BrowserAutomationVerifier.IsLikelyNavigationRegression(
+                receipt.BeforeUrl,
+                receipt.AfterUrl)
+            || BrowserAutomationVerifier.RequestAllowsNavigationRegression(runtime.Request))
+        {
+            return receipt;
+        }
+
+        var progressedUrl = receipt.BeforeUrl;
+        var regressed = await _bridge.ObserveAsync(
+            runtime.TaskId,
+            receipt.TabId ?? runtime.Page.TabId,
+            token);
+        AddControlledTab(runtime, regressed);
+        if (!BrowserAutomationVerifier.IsLikelyNavigationRegression(
+                progressedUrl,
+                regressed.Url))
+        {
+            // The action continued asynchronously to a different useful state;
+            // do not overwrite newer live progress based on an intermediate
+            // receipt URL.
+            runtime.Page = regressed;
+            return receipt;
+        }
+
+        runtime.History.Add(
+            "A stale browser action navigated to a less specific same-site state. "
+            + "Restoring the last verified page before allowing another plan.");
+        var restore = await _bridge.ExecuteAsync(
+            new BrowserActionRequest
+            {
+                TaskId = runtime.TaskId,
+                Type = "navigate",
+                WindowId = regressed.WindowId,
+                TabId = regressed.TabId,
+                GraphVersion = regressed.GraphVersion,
+                DomEpoch = regressed.DomEpoch,
+                Url = progressedUrl,
+            },
+            token);
+        LogActionReceipt(runtime.TaskId, restore);
+        var restored = await _bridge.ObserveAsync(
+            runtime.TaskId,
+            restore.TabId ?? regressed.TabId,
+            token);
+        AddControlledTab(runtime, restored);
+        runtime.Page = restored;
+
+        receipt.Ok = false;
+        receipt.Stale = true;
+        receipt.Navigation = false;
+        receipt.NoVisibleChange = true;
+        receipt.AfterUrl = restored.Url;
+        receipt.AfterFingerprint = restored.Fingerprint;
+        receipt.GraphVersion = restored.GraphVersion;
+        receipt.DomEpoch = restored.DomEpoch;
+        receipt.Error = restore.Ok
+            ? "The action tried to discard a more specific verified page and was safely rolled back."
+            : "The action discarded a more specific verified page, and the previous page could not be restored automatically.";
+        return receipt;
+    }
+
+    private async Task<bool> EstablishAuthoritativeDestinationAsync(
+        Runtime runtime,
+        string label,
+        string url,
+        string source,
+        CancellationToken token)
+    {
+        if (SameHost(runtime.Page?.Url, url))
+        {
+            runtime.History.Add(
+                $"Verified {source}: the live page is already on {label} ({BrowserAutomationText.RedactUrlForProvider(url)}).");
+            return true;
+        }
+
+        var action = new BrowserPlannerAction
+        {
+            Type = "navigate",
+            Url = url,
+            TargetName = label,
+        };
+        var safety = _safety.EvaluateAction(runtime.Request, action);
+        if (!safety.MayStart)
+        {
+            runtime.History.Add(
+                $"Could not establish {source} safely: {safety.Reason}");
+            return false;
+        }
+
+        SetState(runtime, BrowserTaskState.Executing, $"Opening the requested {label} destination");
+        var correctionRevision = Volatile.Read(ref runtime.CorrectionRevision);
+        var receipt = await ExecutePlannerActionAsync(runtime, action, token);
+        if (InFlightResultWasSuperseded(
+                correctionRevision,
+                Volatile.Read(ref runtime.CorrectionRevision)))
+        {
+            runtime.History.Add(
+                $"Ignored the in-flight {source} result because a newer explicit correction is authoritative.");
+            return false;
+        }
+        runtime.Receipts.Add(receipt);
+        if (ShouldStabilizeFirstNavigation(
+                runtime.FirstNavigationStabilized,
+                action.Type,
+                receipt))
+        {
+            runtime.FirstNavigationStabilized = true;
+            SetState(runtime, BrowserTaskState.WaitingForPage, "Waiting for the requested website to become ready");
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
+        }
+
+        runtime.Page = await _bridge.ObserveAsync(
+            runtime.TaskId,
+            receipt.TabId ?? runtime.Page.TabId,
+            token);
+        AddControlledTab(runtime, runtime.Page);
+        // A verified navigation may legitimately end on the destination's
+        // sign-in or canonical redirect host. What matters here is that the
+        // exact requested URL—not a fuzzy planner substitute—caused the live
+        // navigation. The planner still receives the fresh redirected page.
+        var established = receipt.Ok
+            && receipt.Navigation
+            && !IsProtectedOrBlankUrl(runtime.Page.Url);
+        if (established)
+        {
+            runtime.History.Add(
+                $"Established {source}: navigation to the exact {label} URL was verified. The live page is {BrowserAutomationText.RedactUrlForProvider(runtime.Page.Url)}; continue there and do not substitute a similar service.");
+        }
+        else
+        {
+            runtime.History.Add(
+                $"Failed to establish {source} ({label}): {Short(receipt.Error, 180)}");
+        }
+        return established;
+    }
+
+    private static void DrainPendingGuidance(Runtime runtime)
+    {
+        while (runtime.PendingGuidance.TryDequeue(out var guidance))
+            runtime.History.Add(guidance);
+    }
+
+    private static void RecordOrderedSourceCollectionEvidence(Runtime runtime)
+    {
+        if (runtime.OrderedSourceCollectionVerified
+            || string.IsNullOrWhiteSpace(runtime.OrderedSourceIdentity)
+            || !BrowserAutomationVerifier.IsVerifiedOrderedSourceCollectionPage(
+                runtime.Page,
+                runtime.OrderedSourceIdentity))
+        {
+            return;
+        }
+
+        runtime.OrderedSourceCollectionVerified = true;
+        runtime.History.Add(
+            $"Verified requested source collection before choosing the ordered item: {runtime.OrderedSourceIdentity}.");
+        AppLog.Info(
+            $"Browser ordered-source checkpoint verified: task={runtime.TaskId} sourceIdentityCharacters={runtime.OrderedSourceIdentity?.Length ?? 0}");
+    }
+
+    private async Task WaitForUserInterventionAsync(
+        Runtime runtime,
+        BrowserUserIntervention intervention,
+        string resumedHistory,
+        CancellationToken token)
+    {
+        intervention = ReconcileInterventionWithPageMetadata(
+            intervention,
+            runtime.Page);
+        if (ShouldSkipIntervention(
+                runtime.SkipUnavailableOptionalInputs,
+                runtime.SkippedInterventions,
+                intervention))
+        {
+            runtime.SkippedInterventions.Add(InterventionFingerprint(intervention));
+            CaptureAuthorizedOptionalSkip(runtime, intervention);
+            runtime.History.Add(BuildSkippedInterventionGuidance(
+                intervention,
+                "The user authorized unavailable optional information to be skipped."));
+            AppLog.Info(
+                $"Browser optional intervention skipped by task policy: task={runtime.TaskId} missingCharacters={intervention.Missing?.Length ?? 0}");
+            return;
+        }
+
+        // Arm the gate before publishing NeedsUserAction. A response can arrive
+        // as soon as that state is visible; publishing first could otherwise
+        // resume the old completed gate and then pause forever on a new one.
+        runtime.Intervention = intervention;
+        var resumeTask = ArmPauseBeforePublishingAsync(
+            runtime.PauseGate,
+            () => SetState(
+                runtime,
+                BrowserTaskState.NeedsUserAction,
+                intervention.Missing),
+            token);
+        _notifications.WarningTransient(
+            "Browser automation needs you",
+            BuildInterventionDisplay(intervention));
+        await resumeTask;
+        token.ThrowIfCancellationRequested();
+        runtime.Intervention = null;
+        var adoptedFreshActiveTab = await ApplyPendingActiveTabHandoffAsync(
+            runtime,
+            token);
+        if (!adoptedFreshActiveTab)
+        {
+            runtime.Page = await _bridge.ObserveAsync(
+                runtime.TaskId,
+                runtime.Page.TabId,
+                token);
+        }
+        runtime.History.Add(resumedHistory);
+    }
+
+    private async Task WaitForTaskReadyAsync(
+        Runtime runtime,
+        CancellationToken token)
+    {
+        await runtime.PauseGate.WaitAsync(token);
+        token.ThrowIfCancellationRequested();
+        await ApplyPendingActiveTabHandoffAsync(runtime, token);
+        token.ThrowIfCancellationRequested();
+    }
+
+    private async Task<bool> ApplyPendingActiveTabHandoffAsync(
+        Runtime runtime,
+        CancellationToken token)
+    {
+        lock (_sync)
+        {
+            if (!runtime.AdoptFreshActiveTabOnResume)
+                return false;
+            runtime.AdoptFreshActiveTabOnResume = false;
+        }
+
+        var previousTabId = runtime.Page?.TabId ?? 0;
+        runtime.Page = await _bridge.BeginTaskAsync(
+            runtime.TaskId,
+            useCurrentTab: true,
+            token);
+        AddControlledTab(runtime, runtime.Page);
+        runtime.History.Add(
+            $"User-authorized page handoff: the same task moved from tab:{previousTabId} to the fresh active tab:{runtime.Page.TabId} before continuing.");
+        AppLog.Info(
+            $"Browser task adopted user-authorized active tab: task={runtime.TaskId} fromTab={previousTabId} toTab={runtime.Page.TabId}");
+        return true;
+    }
+
+    internal static bool CanAcceptAuthorizedPageHandoff(
+        BrowserTaskState state) =>
+        state is BrowserTaskState.Planning
+            or BrowserTaskState.ReadingPage
+            or BrowserTaskState.WaitingForPage
+            or BrowserTaskState.AnalyzingImage
+            or BrowserTaskState.Executing
+            or BrowserTaskState.Verifying
+            or BrowserTaskState.Paused
+            or BrowserTaskState.NeedsUserAction;
+
+    internal static bool ShouldAdoptFreshActiveTabForGuidance(
+        BrowserUserIntervention intervention,
+        string guidance,
+        BrowserPageSnapshot currentPage,
+        BrowserHelperStatus helperStatus)
+    {
+        if (currentPage == null
+            || helperStatus?.ActiveTabFresh != true
+            || !helperStatus.TabId.HasValue)
+        {
+            return false;
+        }
+
+        // The user may satisfy a requested manual-navigation step either by
+        // switching tabs or by navigating the leased tab itself. In both
+        // cases the Helper's fresh active-page state is authoritative once
+        // the user explicitly confirms the handoff. An unchanged task page
+        // remains ineligible, so merely foregrounding it cannot resume or
+        // redirect the task.
+        var activeTabChanged = helperStatus.TabId.Value != currentPage.TabId;
+        var leasedTabNavigated = !activeTabChanged
+            && !string.IsNullOrWhiteSpace(helperStatus.ActiveUrl)
+            && !SameLivePage(currentPage.Url, helperStatus.ActiveUrl);
+        if (!activeTabChanged && !leasedTabNavigated)
+            return false;
+
+        var answer = NormalizeControlText(guidance);
+        if (IsExplicitPageHandoffGuidance(answer))
+            return true;
+
+        if (helperStatus.WindowId.HasValue
+            && currentPage.WindowId > 0
+            && helperStatus.WindowId.Value != currentPage.WindowId)
+        {
+            return false;
+        }
+
+        var requestedStep = NormalizeControlText(string.Join(
+            " ",
+            intervention?.Missing,
+            intervention?.Explanation));
+        var interventionAskedForNavigation = Regex.IsMatch(
+            requestedStep,
+            @"\b(?:navigate|switch|open|visit|go\s+to|move\s+to|sign\s+in)\b.{0,100}\b(?:page|tab|site|website|form|account)\b",
+            RegexOptions.IgnoreCase);
+        var confirmsCompletion = Regex.IsMatch(
+            answer,
+            @"^\s*(?:i(?:'m|\s+am)\s+)?(?:there|ready|done|on\s+it)|^(?:continue|resume|proceed)(?:\s+now)?[.!?]*$",
+            RegexOptions.IgnoreCase);
+        return interventionAskedForNavigation && confirmsCompletion;
+    }
+
+    internal static bool IsExplicitPageHandoffGuidance(string guidance) =>
+        Regex.IsMatch(
+            NormalizeControlText(guidance),
+            @"\b(?:current|active|correct|intended|right|new|other)\s+(?:page|tab|site|website|form)\b"
+            + @"|\b(?:continue|resume|work|use|start)\b.{0,50}\b(?:here|this\s+(?:page|tab|site|form)|current\s+(?:page|tab|site|form))\b",
+            RegexOptions.IgnoreCase);
+
+    internal static BrowserUserIntervention BuildPlannerIntervention(
+        BrowserPlannerDecision decision,
+        string fallbackMissing = "Waiting for a required manual step")
+    {
+        var missing = string.IsNullOrWhiteSpace(decision?.UserAction)
+            ? fallbackMissing
+            : decision.UserAction.Trim();
+        var explanation = string.IsNullOrWhiteSpace(decision?.UserActionReason)
+            ? (decision?.Evaluation ?? "").Trim()
+            : decision.UserActionReason.Trim();
+        var required = decision?.UserActionRequired == true;
+        var protectedKind = IsProtectedIntervention(missing, explanation);
+        var canSkip = decision?.UserActionSkippable == true
+            && !required
+            && !protectedKind;
+        return new BrowserUserIntervention
+        {
+            Kind = ClassifyIntervention($"{missing} {explanation}"),
+            Missing = missing,
+            Explanation = explanation,
+            Required = required || protectedKind,
+            CanSkip = canSkip,
+        };
+    }
+
+    internal static bool IsInterventionForKnownOptionalPageField(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page) =>
+        FindInterventionPageField(intervention, page)?.FieldRequired == false;
+
+    internal static BrowserControl FindInterventionPageField(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page)
+    {
+        if (intervention == null
+            || page?.Controls == null
+            || IsProtectedIntervention(intervention.Missing, intervention.Explanation))
+        {
+            return null;
+        }
+
+        var request = NormalizeControlText(string.Join(
+            " ",
+            intervention.Missing,
+            intervention.Explanation));
+        if (request.Length == 0)
+            return null;
+
+        var fields = page.Controls
+            .Where(control => control is
+            {
+                Visible: true,
+                Enabled: true,
+            }
+                && !string.IsNullOrWhiteSpace(control.FieldId)
+                && !string.IsNullOrWhiteSpace(control.FieldLabel)
+                && control.FieldRequired.HasValue)
+            .GroupBy(control => control.FieldId, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+        var matchedFields = fields
+            .Where(control => FieldIdentityAppearsInIntervention(
+                request,
+                control.FieldLabel))
+            .ToArray();
+        if (matchedFields.Length == 1)
+            return matchedFields[0];
+        if (matchedFields.Length > 1)
+            return null;
+
+        var requestTerms = MeaningfulControlTerms(request);
+        var ranked = fields
+            .Select(control => new
+            {
+                Control = control,
+                Score = MeaningfulControlTerms(control.FieldLabel)
+                    .Count(requestTerms.Contains),
+            })
+            .OrderByDescending(candidate => candidate.Score)
+            .ToArray();
+        return ranked.Length > 0
+            && ranked[0].Score >= 3
+            && (ranked.Length == 1 || ranked[0].Score >= ranked[1].Score + 2)
+                ? ranked[0].Control
+                : null;
+    }
+
+    private static void CaptureAuthorizedOptionalSkip(
+        Runtime runtime,
+        BrowserUserIntervention intervention)
+    {
+        var field = FindInterventionPageField(intervention, runtime.Page);
+        if (field?.FieldRequired != false)
+            return;
+
+        var key = SkippedFieldCheckpointKey(runtime.Page.TabId, field.FieldId);
+        runtime.AuthorizedSkippedFieldStates[key] = SkippedFieldState(
+            runtime.Page,
+            field.FieldId);
+    }
+
+    internal static BrowserVerificationResult VerifyAuthorizedNoMutationCompletion(
+        string request,
+        BrowserPlannerDecision decision,
+        BrowserPageSnapshot page,
+        IReadOnlyList<BrowserActionReceipt> receipts,
+        IReadOnlyDictionary<string, string> skippedFieldStates,
+        BrowserVerificationResult fallback)
+    {
+        if (decision == null
+            || (!decision.Done && decision.Action?.Type != "done")
+            || page == null
+            || (receipts?.Count ?? 0) != 0
+            || skippedFieldStates?.Count is not > 0
+            || !IsSingleFieldSkipCompletionRequest(
+                request,
+                page,
+                skippedFieldStates.Keys))
+        {
+            return fallback;
+        }
+
+        var stillUnchanged = skippedFieldStates.All(checkpoint =>
+        {
+            var prefix = $"{page.TabId}:";
+            if (!checkpoint.Key.StartsWith(prefix, StringComparison.Ordinal))
+                return false;
+            var fieldId = checkpoint.Key[prefix.Length..];
+            return fieldId.Length > 0
+                && string.Equals(
+                    checkpoint.Value,
+                    SkippedFieldState(page, fieldId),
+                    StringComparison.Ordinal);
+        });
+        return stillUnchanged
+            ? new BrowserVerificationResult
+            {
+                Verified = true,
+                Evidence = "The user-authorized optional field remained unchanged on the same live page, and no browser mutation was executed.",
+            }
+            : fallback;
+    }
+
+    internal static string SkippedFieldCheckpointKey(int tabId, string fieldId) =>
+        $"{tabId}:{fieldId?.Trim()}";
+
+    internal static bool IsSingleFieldSkipCompletionRequest(
+        string request,
+        BrowserPageSnapshot page,
+        IEnumerable<string> checkpointKeys)
+    {
+        var text = NormalizeControlText(request);
+        if (page == null
+            || checkpointKeys == null
+            || BrowserAutomationVerifier.CountRequestedMutationSteps(text) > 1
+            || BrowserAutomationVerifier.RequestsWholeFormMutation(text))
+        {
+            return false;
+        }
+
+        var prefix = $"{page.TabId}:";
+        var fieldIds = checkpointKeys
+            .Where(key => key?.StartsWith(prefix, StringComparison.Ordinal) == true)
+            .Select(key => key[prefix.Length..])
+            .Where(fieldId => fieldId.Length > 0)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (fieldIds.Length != 1)
+            return false;
+
+        var fieldLabel = (page.Controls ?? Array.Empty<BrowserControl>())
+            .FirstOrDefault(control => string.Equals(
+                control.FieldId,
+                fieldIds[0],
+                StringComparison.Ordinal))
+            ?.FieldLabel;
+        if (string.IsNullOrWhiteSpace(fieldLabel))
+            return false;
+        if (FieldIdentityAppearsInIntervention(text, fieldLabel))
+            return true;
+
+        var fieldTerms = MeaningfulControlTerms(fieldLabel);
+        var requestTerms = MeaningfulControlTerms(text);
+        var sharedTerms = fieldTerms.Count(requestTerms.Contains);
+        return fieldTerms.Count >= 3
+            && sharedTerms >= 3
+            && sharedTerms * 4 >= fieldTerms.Count * 3;
+    }
+
+    internal static string SkippedFieldState(
+        BrowserPageSnapshot page,
+        string fieldId)
+    {
+        if (page == null || string.IsNullOrWhiteSpace(fieldId))
+            return "";
+
+        var controls = (page.Controls ?? Array.Empty<BrowserControl>())
+            .Where(control => string.Equals(
+                control.FieldId,
+                fieldId,
+                StringComparison.Ordinal))
+            .OrderBy(control => control.Role, StringComparer.Ordinal)
+            .ThenBy(control => control.AccessibleName, StringComparer.Ordinal)
+            .ThenBy(control => control.Text, StringComparer.Ordinal)
+            .Select(control => string.Join(
+                "|",
+                control.Role,
+                control.AccessibleName,
+                control.Text,
+                control.Value,
+                control.Selected,
+                control.Checked,
+                control.FieldAnswered));
+        return $"{NormalizeControlText(page.Url)}\n{string.Join("\n", controls)}";
+    }
+
+    internal static BrowserUserIntervention ReconcileInterventionWithPageMetadata(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page) =>
+        IsInterventionForKnownOptionalPageField(intervention, page)
+            ? MakeInterventionSkippable(intervention)
+            : intervention;
+
+    private static bool FieldIdentityAppearsInIntervention(
+        string normalizedIntervention,
+        string fieldLabel)
+    {
+        // Printed label punctuation is not part of a user's field reference.
+        // Keep the full words and the existing unique-field requirement.
+        var label = NormalizeControlText(Regex.Replace(fieldLabel ?? "", @"[\p{P}\s]+$", ""));
+        if (label.Length < 3)
+            return false;
+        if (normalizedIntervention.Contains(label, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var sentenceEnd = label.IndexOfAny(['?', '!', '.']);
+        var leadingClause = sentenceEnd >= 0
+            ? label[..(sentenceEnd + 1)].Trim()
+            : label;
+        return leadingClause.Length >= 8
+            && normalizedIntervention.Contains(
+                leadingClause,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static BrowserUserIntervention MakeInterventionSkippable(
+        BrowserUserIntervention intervention) =>
+        new()
+        {
+            Kind = intervention?.Kind ?? "manual_step",
+            Missing = intervention?.Missing ?? "",
+            Explanation = intervention?.Explanation ?? "",
+            Required = false,
+            CanSkip = true,
+        };
+
+    internal static BrowserUserIntervention BuildRequiredIntervention(
+        string missing,
+        string explanation = "This step is required to continue the requested task safely.")
+    {
+        var prompt = string.IsNullOrWhiteSpace(missing)
+            ? "Complete the required step in Chrome."
+            : missing.Trim();
+        return new BrowserUserIntervention
+        {
+            Kind = ClassifyIntervention($"{prompt} {explanation}"),
+            Missing = prompt,
+            Explanation = explanation?.Trim() ?? "",
+            Required = true,
+            CanSkip = false,
+        };
+    }
+
+    internal static bool AllowsSkippingUnavailableOptionalInputs(string text) =>
+        Regex.IsMatch(
+            NormalizeControlText(text),
+            @"\b(?:skip|omit|leave)\b.{0,80}\b(?:optional|unavailable|unknown|missing|blank|not\s+(?:known|available|provided))\b|\b(?:optional|unavailable|unknown|missing)\b.{0,80}\b(?:skip|omit|leave\s+blank)\b",
+            RegexOptions.IgnoreCase);
+
+    internal static bool IsSkipInterventionGuidance(string guidance) =>
+        Regex.IsMatch(
+            NormalizeControlText(guidance),
+            @"^(?:please\s+)?(?:skip|omit)\b|^(?:please\s+)?(?:leave|keep)\b.{0,80}\bblank\b|^(?:please\s+)?continue\b.{0,80}\bwithout\b",
+            RegexOptions.IgnoreCase);
+
+    internal static bool ShouldSkipIntervention(
+        bool skipUnavailableOptionalInputs,
+        IReadOnlySet<string> skippedInterventions,
+        BrowserUserIntervention intervention)
+    {
+        if (intervention?.CanSkip != true || intervention.Required)
+            return false;
+        var fingerprint = InterventionFingerprint(intervention);
+        return skipUnavailableOptionalInputs
+            || (skippedInterventions?.Contains(fingerprint) ?? false);
+    }
+
+    internal static bool IsRequestedInterventionAlreadySatisfied(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page,
+        IReadOnlyList<BrowserPlannerAction> expectedFields = null)
+    {
+        var request = NormalizeControlText(string.Join(
+            " ",
+            intervention?.Missing,
+            intervention?.Explanation));
+        if (request.Length == 0
+            || page?.Controls == null
+            || expectedFields is not { Count: > 0 and <= 80 }
+            || IsProtectedIntervention(
+                intervention?.Missing ?? "",
+                intervention?.Explanation ?? "")
+            || !Regex.IsMatch(
+                request,
+                @"\b(?:provide|enter|type|fill|specify|choose|select|answer|value|field|rating)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        var requestTerms = MeaningfulControlTerms(request);
+        var fieldLabels = page.Controls
+            .Where(control => control is { Visible: true, Enabled: true }
+                && !string.IsNullOrWhiteSpace(control.FieldId)
+                && !string.IsNullOrWhiteSpace(control.FieldLabel))
+            .GroupBy(control => control.FieldId, StringComparer.Ordinal)
+            .Select(group => NormalizeControlText(group.First().FieldLabel))
+            .Where(label => label.Length > 0)
+            .ToArray();
+        var termFrequency = fieldLabels
+            .SelectMany(label => MeaningfulControlTerms(label).Distinct())
+            .GroupBy(term => term, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Count(),
+                StringComparer.OrdinalIgnoreCase);
+
+        return page.Controls
+            .Where(control => control is { Visible: true, Enabled: true, FieldAnswered: true }
+                && !string.IsNullOrWhiteSpace(control.FieldId)
+                && !string.IsNullOrWhiteSpace(control.FieldLabel))
+            .GroupBy(control => control.FieldId, StringComparer.Ordinal)
+            // Nonempty/default/pre-existing content is not the user's answer.
+            // Only the current plan's explicit expected state can prove that
+            // this question is redundant, using the same live-state verifier
+            // as terminal completion (not a second value/receipt owner).
+            .Where(group => expectedFields.Any(check =>
+                check != null && check.TargetFieldId == group.Key
+                && BrowserAutomationVerifier.FinalPageSatisfiesFieldCheck(page, check)))
+            .Select(group => group.First().FieldLabel)
+            .Any(label =>
+            {
+                var normalizedLabel = NormalizeControlText(label);
+                if (request.Contains(normalizedLabel, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                var labelTerms = MeaningfulControlTerms(normalizedLabel);
+                // This check may suppress a real NeedsUserAction request, so
+                // uncertainty must keep the task paused. A broad source/editor
+                // label can contain the text of nested controls (and therefore
+                // one target-field word) without being that field. Require the
+                // complete field identity, with at least one page-unique term,
+                // instead of accepting any overlapping word.
+                return labelTerms.Count > 0
+                    && labelTerms.IsSubsetOf(requestTerms)
+                    && labelTerms.Any(term =>
+                        termFrequency.TryGetValue(term, out var count)
+                        && count == 1);
+            });
+    }
+
+    internal static string BuildSkippedInterventionGuidance(
+        BrowserUserIntervention intervention,
+        string guidance)
+    {
+        var missing = intervention?.Missing ?? "the current optional item";
+        return
+            $"Authoritative user skip guidance: {guidance?.Trim()} "
+            + $"The planner marked '{Short(missing, 220)}' as safely optional, so leave it unchanged/blank and do not ask for it again. "
+            + "This authorization does not apply to mandatory values, irreversible actions, or safety-sensitive confirmation.";
+    }
+
+    internal static string BuildRequiredInterventionResponse(
+        BrowserUserIntervention intervention)
+    {
+        var missing = intervention?.Missing;
+        var explanation = intervention?.Explanation;
+        if (string.IsNullOrWhiteSpace(missing))
+            return "That step is not known to be safely optional, so the browser task remains paused.";
+        return string.IsNullOrWhiteSpace(explanation)
+            ? $"The browser task remains paused because this is required: {missing}"
+            : $"The browser task remains paused because this is required: {missing} Why: {explanation}";
+    }
+
+    internal static string InterventionFingerprint(BrowserUserIntervention intervention) =>
+        NormalizeControlText($"{intervention?.Kind} {intervention?.Missing}");
+
+    private static bool IsProtectedIntervention(string missing, string explanation)
+    {
+        var text = $"{missing} {explanation}";
+        var kind = ClassifyIntervention(text);
+        return kind is "captcha_required"
+            or "login_required"
+            or "confirmation_required"
+            or "permission_required"
+            || Regex.IsMatch(
+                text,
+                @"\b(?:password|passcode|otp|one[- ]time|two[- ]factor|2fa|security|payment|checkout|bank(?:ing)?|credit\s+card|debit\s+card|cvv|place\s+(?:the\s+)?order)\b",
+                RegexOptions.IgnoreCase);
+    }
+
+    internal static Task ArmPauseBeforePublishingAsync(
+        AsyncPauseGate gate,
+        Action publish,
+        CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(gate);
+        ArgumentNullException.ThrowIfNull(publish);
+        gate.Pause();
+        publish();
+        return gate.WaitAsync(token);
+    }
+
+    private bool TryTakePendingDestinationCorrection(
+        Runtime runtime,
+        out string label,
+        out string url)
+    {
+        lock (_sync)
+        {
+            label = runtime.PendingDestinationCorrectionLabel;
+            url = runtime.PendingDestinationCorrectionUrl;
+            runtime.PendingDestinationCorrectionLabel = "";
+            runtime.PendingDestinationCorrectionUrl = "";
+            return !string.IsNullOrWhiteSpace(url);
+        }
+    }
+
+    internal static bool IsProtectedOrBlankUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return true;
+        return !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps);
+    }
+
+    internal static bool ShouldStabilizeFirstNavigation(
+        bool alreadyStabilized,
+        string actionType,
+        BrowserActionReceipt receipt) =>
+        !alreadyStabilized
+        && string.Equals(actionType, "navigate", StringComparison.Ordinal)
+        && receipt?.Ok == true
+        && receipt.Navigation;
+
+    internal static bool ShouldAwaitDelayedLinkNavigation(
+        string actionType,
+        BrowserActionReceipt receipt) =>
+        string.Equals(actionType, "click", StringComparison.Ordinal)
+        && receipt?.Ok == true
+        && !receipt.Stale
+        && receipt.NoVisibleChange
+        && string.Equals(receipt.TargetRole, "link", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(receipt.BeforeUrl)
+        && SameLivePage(receipt.BeforeUrl, receipt.AfterUrl);
+
+    internal static bool ShouldReconcileUsableTimedOutNavigation(
+        string actionType,
+        BrowserActionReceipt receipt) =>
+        string.Equals(actionType, "navigate", StringComparison.Ordinal)
+        && receipt != null
+        && !receipt.Ok
+        && !receipt.Cancelled
+        && !receipt.Stale
+        && (receipt.Error ?? "").Contains(
+            "page did not finish loading in time",
+            StringComparison.OrdinalIgnoreCase);
+
+    internal static bool TryReconcileUsableTimedOutNavigation(
+        BrowserPageSnapshot before,
+        string requestedUrl,
+        int expectedTabId,
+        BrowserPageSnapshot fresh,
+        BrowserActionReceipt receipt)
+    {
+        if (!ShouldReconcileUsableTimedOutNavigation("navigate", receipt)
+            || before == null
+            || fresh == null
+            || before.TabId != expectedTabId
+            || fresh.TabId != expectedTabId
+            || !Uri.TryCreate(requestedUrl, UriKind.Absolute, out var requested)
+            || (requested.Scheme != Uri.UriSchemeHttp
+                && requested.Scheme != Uri.UriSchemeHttps)
+            || !SameLivePage(requestedUrl, fresh.Url)
+            || (string.IsNullOrWhiteSpace(fresh.Title)
+                && string.IsNullOrWhiteSpace(fresh.PageText)
+                && (fresh.Controls?.Length ?? 0) == 0))
+        {
+            return false;
+        }
+
+        receipt.Ok = true;
+        receipt.Error = "";
+        receipt.Action = "navigate";
+        receipt.TargetId = fresh.Url;
+        receipt.TargetRole = "document";
+        receipt.TargetName = fresh.Title;
+        receipt.BeforeUrl = before.Url;
+        receipt.AfterUrl = fresh.Url;
+        receipt.BeforeFingerprint = before.Fingerprint;
+        receipt.AfterFingerprint = fresh.Fingerprint;
+        receipt.Navigation = !SameLivePage(before.Url, fresh.Url);
+        receipt.NoVisibleChange = !receipt.Navigation;
+        receipt.WindowId = fresh.WindowId;
+        receipt.TabId = fresh.TabId;
+        receipt.GraphVersion = fresh.GraphVersion;
+        receipt.DomEpoch = fresh.DomEpoch;
+        return true;
+    }
+
+    internal static bool TryReconcileDelayedLinkNavigation(
+        int expectedTabId,
+        BrowserActionReceipt receipt,
+        BrowserHelperStatus status)
+    {
+        if (!ShouldAwaitDelayedLinkNavigation("click", receipt)
+            || status?.TabId != expectedTabId
+            || string.IsNullOrWhiteSpace(status.ActiveUrl)
+            || SameLivePage(receipt.BeforeUrl, status.ActiveUrl))
+        {
+            return false;
+        }
+
+        receipt.AfterUrl = status.ActiveUrl;
+        receipt.Navigation = true;
+        receipt.NoVisibleChange = false;
+        receipt.TabId = expectedTabId;
+        receipt.WindowId = status.WindowId;
+        return true;
+    }
+
+    internal static bool ShouldOpenDestinationInNewTab(
+        bool currentPageIntent,
+        bool destinationTabOpened,
+        bool initialTabWasProtectedOrBlank,
+        int initialTabId,
+        int currentTabId,
+        string actionType,
+        string currentUrl,
+        string destinationUrl) =>
+        !currentPageIntent
+        && !destinationTabOpened
+        && actionType == "navigate"
+        && !(initialTabWasProtectedOrBlank && currentTabId == initialTabId)
+        && !SameHost(currentUrl, destinationUrl);
+
+    internal static void AttachExpectedState(
+        BrowserActionReceipt receipt,
+        BrowserPlannerAction action)
+    {
+        if (receipt == null || action == null)
+            return;
+
+        if (string.IsNullOrWhiteSpace(receipt.TargetFieldId))
+            receipt.TargetFieldId = action.TargetFieldId;
+
+        receipt.ExpectedValue = action.Type switch
+        {
+            "type" or "paste" => action.Text ?? "",
+            "select_option" => string.IsNullOrWhiteSpace(action.Option)
+                ? action.Text ?? ""
+                : action.Option,
+            _ when receipt.SelectedChanged
+                && string.Equals(
+                    receipt.TargetRole,
+                    "option",
+                    StringComparison.OrdinalIgnoreCase) =>
+                receipt.TargetName ?? "",
+            _ => receipt.ExpectedValue ?? "",
+        };
+    }
+
+    internal static bool ShouldUseTrustedEditorPaste(
+        string request,
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action)
+    {
+        if (action?.Type != "type"
+            || page?.ActiveEditable != true
+            || !RequiresDestinationEditorTransfer(request))
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(action.TargetId))
+            return true;
+        if (string.Equals(action.TargetId, page.ActiveEditorId, StringComparison.Ordinal))
+            return true;
+
+        var target = FindMatchingControl(page, action);
+        if (target == null || !target.Editable)
+            return false;
+        var identity = NormalizeControlText(string.Join(
+            " ",
+            target.Role,
+            target.AccessibleName,
+            target.AriaLabel,
+            target.NearbyLabel,
+            page.ActiveEditorName));
+        return Regex.IsMatch(
+            identity,
+            @"\b(document|doc|editor|document content|editing area)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static void LogActionReceipt(string taskId, BrowserActionReceipt receipt)
+    {
+        receipt ??= new BrowserActionReceipt { Error = "No action receipt was returned." };
+        AppLog.Info(
+            $"Browser action receipt: task={taskId} action={receipt.Action} ok={receipt.Ok} stale={receipt.Stale} "
+            + $"targetRole={Short(receipt.TargetRole, 40)} targetNameCharacters={receipt.TargetName?.Length ?? 0} "
+            + $"navigation={receipt.Navigation} noVisibleChange={receipt.NoVisibleChange} "
+            + $"selectedChanged={receipt.SelectedChanged} checkedChanged={receipt.CheckedChanged} "
+            + $"valueMatches={receipt.ValueMatches} screenshot={(!string.IsNullOrWhiteSpace(receipt.ScreenshotDataUrl))} "
+            + $"errorPresent={!string.IsNullOrWhiteSpace(receipt.Error)} errorCharacters={receipt.Error?.Length ?? 0}");
+    }
+
+    internal static bool ShouldUseListboxKeyboardFallback(
+        BrowserPlannerAction action,
+        BrowserActionReceipt receipt) =>
+        action?.Type == "click"
+        && receipt?.Ok == true
+        && receipt.NoVisibleChange
+        && (string.Equals(
+                receipt.TargetRole,
+                "listbox",
+                StringComparison.OrdinalIgnoreCase)
+            || string.Equals(
+                receipt.TargetRole,
+                "combobox",
+                StringComparison.OrdinalIgnoreCase)
+            || string.Equals(
+                action.TargetRole,
+                "listbox",
+                StringComparison.OrdinalIgnoreCase)
+            || string.Equals(
+                action.TargetRole,
+                "combobox",
+                StringComparison.OrdinalIgnoreCase));
+
+    internal static bool ShouldResolveCustomOption(
+        BrowserPlannerAction action,
+        BrowserActionReceipt receipt) =>
+        action?.Type == "select_option"
+        && receipt?.Ok == false
+        && receipt.Error.Contains(
+            "not a native select",
+            StringComparison.OrdinalIgnoreCase);
+
+    internal static BrowserControl FindCustomOptionControl(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        string immediateGoal = "")
+    {
+        var requestedText = !string.IsNullOrWhiteSpace(action?.Option)
+            ? action.Option
+            : action?.Text;
+        if (string.IsNullOrWhiteSpace(requestedText))
+        {
+            var quoted = Regex.Match(
+                immediateGoal ?? "",
+                @"['""](?<value>[^'""]{1,100})['""]");
+            if (quoted.Success)
+                requestedText = quoted.Groups["value"].Value;
+        }
+        var requested = NormalizeControlText(requestedText);
+        if (requested.Length == 0)
+            return null;
+
+        return (page?.Controls ?? Array.Empty<BrowserControl>())
+            .Where(control =>
+                control.Visible
+                && control.Enabled
+                && !IsCustomOptionContainerRole(control.Role)
+                && (IsCustomOptionRole(control.Role)
+                    || control.SafeActions.Contains(
+                        "click",
+                        StringComparer.OrdinalIgnoreCase)))
+            .Select(control => new
+            {
+                Control = control,
+                Names = new[]
+                {
+                    control.AccessibleName,
+                    control.Text,
+                    control.AriaLabel,
+                    control.Title,
+                    control.NearbyLabel,
+                    control.Value,
+                }.Select(NormalizeControlText).Where(value => value.Length > 0).ToArray(),
+            })
+            .Where(candidate => candidate.Names.Any(name => name == requested))
+            .Select(candidate => candidate.Control)
+            .OrderBy(control => control.Bounds.Width * control.Bounds.Height)
+            .FirstOrDefault();
+    }
+
+    internal static string ResolveRequestedCustomOption(
+        BrowserPlannerAction action,
+        string immediateGoal,
+        string request)
+    {
+        var value = !string.IsNullOrWhiteSpace(action?.Option)
+            ? action.Option
+            : action?.Text;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            var quoted = Regex.Match(
+                immediateGoal ?? "",
+                @"['""](?<value>[^'""]{1,100})['""]");
+            if (quoted.Success)
+                value = quoted.Groups["value"].Value;
+        }
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            var explicitChoice = Regex.Match(
+                request ?? "",
+                @"\b(?:choose|select)\s+(?:the\s+)?(?<value>[^,.;]{1,100}?)\s+(?:for|from|in|on)\b",
+                RegexOptions.IgnoreCase);
+            if (explicitChoice.Success)
+                value = explicitChoice.Groups["value"].Value;
+        }
+
+        value = Regex.Replace(
+            value ?? "",
+            @"^(?:option|answer|value)\s+",
+            "",
+            RegexOptions.IgnoreCase).Trim().Trim('\'', '"');
+        return value.Length <= 100 ? value : "";
+    }
+
+    private static bool IsCustomOptionRole(string role) =>
+        role.Equals("option", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("menuitem", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("menuitemradio", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("menuitemcheckbox", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("radio", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsCustomOptionContainerRole(string role) =>
+        role.Equals("listbox", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("combobox", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("group", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("radiogroup", StringComparison.OrdinalIgnoreCase)
+        || role.Equals("form", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool TryRegisterActionAttempt(
+        IDictionary<string, int> attempts,
+        BrowserPlannerAction action,
+        int maximumAttempts,
+        out int count) =>
+        TryRegisterActionAttempt(
+            attempts,
+            action,
+            "",
+            maximumAttempts,
+            out count);
+
+    internal static bool TryRegisterActionAttempt(
+        IDictionary<string, int> attempts,
+        BrowserPlannerAction action,
+        string pageState,
+        int maximumAttempts,
+        out int count)
+        => TryRegisterActionAttempt(
+            attempts,
+            action,
+            pageState,
+            immediateGoal: "",
+            maximumAttempts,
+            out count);
+
+    internal static bool TryRegisterActionAttempt(
+        IDictionary<string, int> attempts,
+        BrowserPlannerAction action,
+        string pageState,
+        string immediateGoal,
+        int maximumAttempts,
+        out int count)
+    {
+        var key = string.Join(
+            "|",
+            NormalizeControlText(pageState),
+            ActionSignature(action),
+            ImmediateGoalIdentity(immediateGoal));
+        attempts.TryGetValue(key, out count);
+        count += 1;
+        attempts[key] = count;
+        return count <= Math.Max(1, maximumAttempts);
+    }
+
+    internal static bool TryRegisterSemanticActionAttempt(
+        IDictionary<string, int> attempts,
+        BrowserPlannerAction action,
+        string immediateGoal,
+        int maximumAttempts,
+        out int count)
+    {
+        var key = string.Join(
+            "|",
+            ActionSignature(action),
+            ImmediateGoalIdentity(immediateGoal));
+        attempts.TryGetValue(key, out count);
+        count += 1;
+        attempts[key] = count;
+        return count <= Math.Max(1, maximumAttempts);
+    }
+
+    internal static string ActionStateKey(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action) =>
+        string.Join("|", PageStateIdentity(page), ActionSignature(action));
+
+    internal static bool IsKnownNoProgressStrategy(
+        ISet<string> noProgressActionStates,
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action) =>
+        noProgressActionStates?.Contains(ActionStateKey(page, action)) == true;
+
+    internal static void RememberNoProgressStrategy(
+        ISet<string> noProgressActionStates,
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action)
+    {
+        noProgressActionStates?.Add(ActionStateKey(page, action));
+    }
+
+    internal static bool CanExhaustStrategy(BrowserActionReceipt receipt) =>
+        receipt != null
+        && !receipt.Cancelled
+        && !receipt.Stale
+        && (receipt.Ok
+            || !string.IsNullOrWhiteSpace(receipt.BeforeFingerprint));
+
+    private static string PageStateIdentity(BrowserPageSnapshot page)
+    {
+        if (page == null)
+            return "";
+        var fingerprint = string.IsNullOrWhiteSpace(page.Fingerprint)
+            ? string.Join(
+                "|",
+                NormalizeControlText(page.Url),
+                NormalizeControlText(page.Title),
+                NormalizeControlText(page.DomEpoch))
+            : page.Fingerprint;
+        return $"{page.TabId}|{fingerprint}";
+    }
+
+    private static string ActionSignature(BrowserPlannerAction action)
+    {
+        var carriesMeaningfulText = action?.Type is "type" or "paste" or "copy_clipboard";
+        var textHash = !carriesMeaningfulText || string.IsNullOrEmpty(action?.Text)
+            ? 0
+            : action.Text.GetHashCode(StringComparison.Ordinal);
+        var semanticTarget = string.IsNullOrWhiteSpace(action?.TargetName)
+            ? action?.TargetId
+            : action.TargetName;
+        return string.Join(
+            "|",
+            NormalizeControlText(action?.Type),
+            NormalizeControlText(action?.TargetRole),
+            NormalizeControlText(semanticTarget),
+            NormalizeControlText(action?.Option),
+            NavigationTargetIdentity(action),
+            NormalizeControlText(action?.Key),
+            textHash);
+    }
+
+    private static string ImmediateGoalIdentity(string value)
+    {
+        var normalized = NormalizeControlText(value);
+        if (normalized.Length == 0)
+            return "";
+
+        // A date-range interaction may legitimately reuse one live control for
+        // a different semantic phase. Require date/range context so ordinary
+        // language such as "return to the page" or "start a search" is not
+        // misclassified as the end/start date phase.
+        var hasDateContext = Regex.IsMatch(
+            normalized,
+            @"\b(?:date|calendar|day|range|inbound|outbound|depart(?:ure)?)\b");
+        if (hasDateContext
+            && Regex.IsMatch(normalized, @"\b(?:return|inbound|end\s+date|second)\b"))
+        {
+            return "range-end";
+        }
+        if (hasDateContext
+            && Regex.IsMatch(normalized, @"\b(?:depart(?:ure)?|outbound|start\s+date|first)\b"))
+        {
+            return "range-start";
+        }
+        if (Regex.IsMatch(
+            normalized,
+            @"\b(?:navigate|open|go|return|restart|start)\b.{0,100}\b(?:page|site|interface|home|search|results?)\b"))
+        {
+            return "site-navigation";
+        }
+        if (Regex.IsMatch(
+            normalized,
+            @"\b(?:trigger|initiate|perform|submit|start)\b.{0,100}\b(?:search|results?)\b"))
+        {
+            return "search-submit";
+        }
+        return BrowserAutomationText.Truncate(normalized, 160);
+    }
+
+    private static string NavigationTargetIdentity(BrowserPlannerAction action)
+    {
+        if (action?.Type is not ("navigate" or "open_tab")
+            || !Uri.TryCreate(action.Url, UriKind.Absolute, out var uri))
+        {
+            return NormalizeControlText(action?.Url);
+        }
+
+        return NormalizeControlText($"{uri.Host}/{uri.AbsolutePath.Trim('/')}");
+    }
+
+    internal static bool TryGetNavigationRegression(
+        string request,
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        out string reason)
+    {
+        reason = "";
+        if (action?.Type != "navigate"
+            || !BrowserAutomationVerifier.IsLikelyNavigationRegression(
+                page?.Url,
+                action.Url)
+            || BrowserAutomationVerifier.RequestAllowsNavigationRegression(request))
+        {
+            return false;
+        }
+
+        reason =
+            "The proposed same-site navigation removes path/query state from the current page.";
+        return true;
+    }
+
+    internal static bool TryGetSatisfiedSearchPrerequisite(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        string immediateGoal,
+        IReadOnlyList<BrowserActionReceipt> receipts,
+        out string reason)
+    {
+        reason = "";
+        if (page == null
+            || action == null
+            || !TargetsSearchControl(action)
+            || receipts == null
+            || receipts.Count == 0)
+        {
+            return false;
+        }
+
+        var priorSearchIndex = -1;
+        BrowserActionReceipt priorSearch = null;
+        for (var index = receipts.Count - 1; index >= 0; index--)
+        {
+            var candidate = receipts[index];
+            if (candidate?.Ok == true
+                && !candidate.Stale
+                && candidate.Action is "type" or "paste"
+                && TargetsSearchControl(candidate)
+                && !string.IsNullOrWhiteSpace(candidate.ExpectedValue))
+            {
+                priorSearchIndex = index;
+                priorSearch = candidate;
+                break;
+            }
+        }
+
+        if (priorSearch == null)
+            return false;
+
+        var reachedRequestedResult = false;
+        for (var index = priorSearchIndex + 1; index < receipts.Count; index++)
+        {
+            var candidate = receipts[index];
+            if (candidate?.Ok != true
+                || candidate.Stale
+                || !candidate.Navigation
+                || !SameLivePage(candidate.AfterUrl, page.Url))
+            {
+                continue;
+            }
+
+            var finalPageNamesRequestedResult = BrowserAutomationVerifier.ContainsMeaningfulTokens(
+                page.Title,
+                priorSearch.ExpectedValue,
+                minimumMatches: 2);
+            var navigationActuallyChangedPage = !SameLivePage(
+                candidate.BeforeUrl,
+                candidate.AfterUrl);
+            reachedRequestedResult = finalPageNamesRequestedResult
+                || (navigationActuallyChangedPage
+                    && BrowserAutomationVerifier.ContainsMeaningfulTokens(
+                        candidate.TargetName,
+                        priorSearch.ExpectedValue,
+                        minimumMatches: 2));
+            if (reachedRequestedResult)
+                break;
+        }
+
+        if (!reachedRequestedResult)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(action.Text)
+            && !BrowserAutomationVerifier.ContainsMeaningfulTokens(
+                string.Join(" ", action.Text, immediateGoal),
+                priorSearch.ExpectedValue,
+                minimumMatches: 2))
+        {
+            // A new query is a new requested browser action, not the stale
+            // prerequisite that led to the current verified result page.
+            return false;
+        }
+
+        reason =
+            "the same search already led to the current verified target page; submitting it again would discard useful progress.";
+        return true;
+    }
+
+    private static bool TargetsSearchControl(BrowserPlannerAction action) =>
+        action != null
+        && action.Type is "type" or "paste" or "press_key" or "click"
+        && (string.Equals(
+                action.TargetRole,
+                "searchbox",
+                StringComparison.OrdinalIgnoreCase)
+            || (action.TargetName ?? "").Contains(
+                "search",
+                StringComparison.OrdinalIgnoreCase));
+
+    private static bool TargetsSearchControl(BrowserActionReceipt receipt) =>
+        receipt != null
+        && (string.Equals(
+                receipt.TargetRole,
+                "searchbox",
+                StringComparison.OrdinalIgnoreCase)
+            || (receipt.TargetName ?? "").Contains(
+                "search",
+                StringComparison.OrdinalIgnoreCase));
+
+    private static bool SameLivePage(string firstUrl, string secondUrl)
+    {
+        if (!Uri.TryCreate(firstUrl, UriKind.Absolute, out var first)
+            || !Uri.TryCreate(secondUrl, UriKind.Absolute, out var second))
+        {
+            return false;
+        }
+
+        return first.Host.Equals(second.Host, StringComparison.OrdinalIgnoreCase)
+            && first.AbsolutePath.TrimEnd('/').Equals(
+                second.AbsolutePath.TrimEnd('/'),
+                StringComparison.OrdinalIgnoreCase)
+            && first.Query.Equals(second.Query, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsClearlyTaskRelevantGuidance(string guidance)
+    {
+        var text = NormalizeControlText(guidance);
+        if (text.Length == 0)
+            return false;
+
+        // A normal Chrome/Jarvis command must never become input for a live
+        // webpage just because a browser task happens to be running.
+        if (Regex.IsMatch(text, @"\b(?:ctrl|control)\s*\+?\s*\d\b")
+            || Regex.IsMatch(text, @"\b(?:switch|go|change)\b.{0,40}\b(?:chrome )?(?:first|second|third|fourth|fifth|last|second[- ]to[- ]last|second last|\d+(?:st|nd|rd|th)?)\s+tab\b")
+            || Regex.IsMatch(text, @"\b(?:new|close|next|previous|reopen)\s+tab\b"))
+        {
+            return false;
+        }
+
+        if (IsExplicitTaskCorrection(text))
+            return true;
+
+        return Regex.IsMatch(
+            text,
+            @"^(?:please )?(?:continue|resume|pause|cancel|stop|wait|do(?: not|n't) submit|i (?:have )?(?:completed|finished|signed in|logged in)|use (?:the )?(?:first|second|third|other|different) (?:result|option)|click (?:the )?(?:first|second|third|other|different) (?:result|option)|try (?:the )?(?:other|different)|keep .{0,120} open|stop before .{0,120})\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    internal static bool IsExplicitTaskDirectedGuidance(string guidance)
+    {
+        var text = NormalizeControlText(guidance);
+        if (text.Length == 0
+            || Regex.IsMatch(
+                text,
+                @"^(?:what|why|when|where|who|how|is|are|was|were|did|does|can|could|would|should)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        const string taskOwner =
+            @"(?:browser\s+automation|browser\s+task|automation\s+task|active\s+task|current\s+task|that\s+task)";
+        return Regex.IsMatch(
+                text,
+                $@"\b(?:tell|ask|instruct|inform|notify|guide|update|correct|pass|send|give)\s+(?:jarvis\s+)?(?:the\s+)?{taskOwner}\b",
+                RegexOptions.IgnoreCase)
+            || Regex.IsMatch(
+                text,
+                $@"^(?:jarvis\s*[,;:]?\s*)?(?:for|to)\s+(?:the\s+)?{taskOwner}\s*[,;:]",
+                RegexOptions.IgnoreCase)
+            || Regex.IsMatch(
+                text,
+                $@"^(?:jarvis\s*[,;:]?\s*)?(?:the\s+)?{taskOwner}\s*[,;:]\s*\S",
+                RegexOptions.IgnoreCase);
+    }
+
+    private static bool HasTaskCorrectionSignal(string guidance)
+    {
+        var text = NormalizeControlText(guidance);
+        return Regex.IsMatch(
+            text,
+            @"^(?:no\b|actually\b|wrong\b|not\s+(?:that|this)\b|i\s+meant\b)|\b(?:instead|rather\s+than|incorrect|mistaken|outdated)\b|^(?:do\s+not|don't)\b|\b(?:change|correct|update|replace|revise)\b.{0,100}\b(?:to|with)\b|\b(?:should|must|needs?\s+to)\s+be\b|\b(?:is|are|was|were)\s+actually\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    internal static bool IsCorrectionGroundedInActiveTask(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page,
+        string guidance)
+    {
+        if (!HasTaskCorrectionSignal(guidance))
+            return false;
+        if (IsExplicitTaskDirectedGuidance(guidance)
+            || IsExplicitTaskCorrection(guidance))
+        {
+            return true;
+        }
+
+        var taskTargets = new List<string>
+        {
+            intervention?.Missing ?? "",
+            intervention?.Explanation ?? "",
+        };
+        if (page?.Controls != null)
+        {
+            taskTargets.AddRange(page.Controls
+                .Where(control => control is { Visible: true, Enabled: true })
+                .SelectMany(control => new[]
+                {
+                    control.FieldLabel,
+                    control.NearbyLabel,
+                    control.AccessibleName,
+                    control.AriaLabel,
+                    control.Placeholder,
+                }));
+        }
+
+        // The live control/intervention identity is authoritative. The broad
+        // page text is deliberately excluded so an unrelated conversation
+        // that happens to reuse a page word cannot mutate the task.
+        return taskTargets.Any(target =>
+            !string.IsNullOrWhiteSpace(target)
+            && TextSharesMeaning(guidance, target));
+    }
+
+    internal static bool IsValueGuidanceGroundedInActiveTask(
+        BrowserUserIntervention intervention,
+        BrowserPageSnapshot page,
+        string guidance)
+    {
+        var text = NormalizeControlText(guidance);
+        if (text.Length == 0
+            || text.Contains('?')
+            || GeminiLiveConversationService.ShouldAutoEnd(guidance)
+            || CommandRegistry.IsExplicitBrowserTaskStopOrPause(guidance)
+            || Regex.IsMatch(
+                text,
+                @"^(?:open|launch|start|close|quit|exit|search|find|show|play)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        if (IsExplicitTaskDirectedGuidance(guidance))
+            return true;
+
+        var hasValueShape = Regex.IsMatch(
+            text,
+            @"\b[\p{L}\p{N}][\p{L}\p{N} _./()-]{1,80}?\s*(?:is|are|:|=)\s*\S|\b(?:use|enter|type|set|change|update|replace|choose|select)\b.{1,180}\b(?:for|in|on|to|with)\b",
+            RegexOptions.IgnoreCase);
+        if (!hasValueShape)
+            return false;
+
+        var targets = new List<string>
+        {
+            intervention?.Missing ?? "",
+            intervention?.Explanation ?? "",
+        };
+        if (page?.Controls != null)
+        {
+            targets.AddRange(page.Controls
+                .Where(control => control is { Visible: true, Enabled: true })
+                .SelectMany(control => new[]
+                {
+                    control.FieldLabel,
+                    control.NearbyLabel,
+                    control.AccessibleName,
+                    control.AriaLabel,
+                    control.Placeholder,
+                }));
+        }
+        return targets.Any(target =>
+            !string.IsNullOrWhiteSpace(target)
+            && TextSharesMeaning(guidance, target));
+    }
+
+    internal static bool TryResolveExplicitDestination(
+        string request,
+        out string label,
+        out string url)
+    {
+        label = "";
+        url = "";
+        var text = request ?? "";
+        if (text.Length == 0)
+            return false;
+
+        // Ground only the destination syntactically attached to an explicit
+        // navigation verb. This intentionally avoids fuzzy service matching:
+        // an unrelated current page or a similar product name is not evidence
+        // for substituting a different destination.
+        var matches = Regex.Matches(
+            text,
+            @"\b(?:go\s+to|navigate\s+to|visit|open)\s+(?:the\s+)?(?<destination>[^,;!?]{1,100}?)(?=\s+(?:and|then)\s+(?:search|find|look\s+for|locate|click|press|choose|select|fill|read|inspect|open)\b|[,;!?]|\.\s|$)",
+            RegexOptions.IgnoreCase);
+        foreach (Match match in matches.Cast<Match>().Reverse())
+        {
+            if (JarvisAutomationService.TryResolveKnownWebDestination(
+                    match.Groups["destination"].Value,
+                    out label,
+                    out url))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool IsExplicitTaskCorrection(string guidance)
+    {
+        var text = NormalizeControlText(guidance);
+        if (text.Length == 0)
+            return false;
+
+        var correctionSignal = HasTaskCorrectionSignal(text);
+        if (!correctionSignal)
+            return false;
+
+        if (IsExplicitTaskDirectedGuidance(text))
+            return true;
+
+        var taskReference = Regex.IsMatch(
+            text,
+            @"\b(?:website|site|page|tab|result|destination|search|find|click|open|navigate|go\s+to|use|back|that|this)\b",
+            RegexOptions.IgnoreCase);
+        return taskReference
+            || JarvisAutomationService.TryResolveKnownWebDestinationMention(
+                guidance,
+                out _,
+                out _);
+    }
+
+    internal static bool TryResolveTaskCorrectionDestination(
+        string guidance,
+        out string label,
+        out string url)
+    {
+        label = "";
+        url = "";
+        if (!IsExplicitTaskCorrection(guidance))
+            return false;
+
+        // Prefer the positive replacement clause over a negated old target,
+        // e.g. "not that site; use X instead". The resolver itself accepts
+        // only exact known services or explicit domains.
+        var replacements = Regex.Matches(
+            guidance ?? "",
+            @"\b(?:i\s+meant|use|open|go\s+to|navigate\s+to|on)\s+(?:the\s+)?(?<destination>[^,;!?]{1,100}?)(?:\s+instead)?(?=[,;!?]|\.\s|$)",
+            RegexOptions.IgnoreCase);
+        foreach (Match replacement in replacements.Cast<Match>().Reverse())
+        {
+            var candidate = Regex.Replace(
+                replacement.Groups["destination"].Value,
+                @"\s+instead\s*$",
+                "",
+                RegexOptions.IgnoreCase).Trim();
+            if (JarvisAutomationService.TryResolveKnownWebDestinationMention(
+                    candidate,
+                    out label,
+                    out url))
+            {
+                return true;
+            }
+        }
+
+        return JarvisAutomationService.TryResolveKnownWebDestinationMention(
+            guidance,
+            out label,
+            out url);
+    }
+
+    internal static string BuildCorrectedTaskRequest(
+        string existingRequest,
+        string correction)
+    {
+        const string earlierPrefix =
+            "Earlier task objective (retain only details compatible with the correction): ";
+        const string correctionPrefix = "\nLatest explicit user correction (authoritative): ";
+        var correctedDestination = TryResolveTaskCorrectionDestination(
+            correction,
+            out _,
+            out var destinationUrl)
+            ? $"\nEstablish the corrected destination first: navigate to {destinationUrl}."
+            : "";
+        var latest = correctionPrefix
+            + BrowserAutomationText.Truncate((correction ?? "").Trim(), 1200)
+            + correctedDestination;
+        var earlier = (existingRequest ?? "").Trim();
+        if (earlier.StartsWith(earlierPrefix, StringComparison.Ordinal))
+            earlier = earlier[earlierPrefix.Length..].TrimStart();
+
+        // The original task can contain up to 8k of ephemeral user context.
+        // Keep its supported values through a correction while reserving the
+        // last part of the same 10k planner budget for the latest correction.
+        var earlierBudget = Math.Max(
+            0,
+            MaximumPlannerRequestLength - earlierPrefix.Length - latest.Length);
+        earlier = FitEarlierTaskRequest(earlier, earlierBudget);
+        return earlierPrefix + earlier + latest;
+    }
+
+    private static string FitEarlierTaskRequest(string request, int budget)
+    {
+        if (StringInfo.ParseCombiningCharacters(request).Length <= budget)
+            return request;
+
+        var markerIndex = request.IndexOf(CapturedContextMarker, StringComparison.Ordinal);
+        if (markerIndex < 0)
+            return BrowserAutomationText.Truncate(request, budget);
+
+        var objective = request[..markerIndex];
+        var appendix = request[markerIndex..];
+        var appendixLength = StringInfo.ParseCombiningCharacters(appendix).Length;
+        if (appendixLength <= budget)
+            return BrowserAutomationText.Truncate(objective, budget - appendixLength)
+                + appendix;
+
+        // An unusually long series of corrections may exceed even the
+        // planner's normal request ceiling. Preserve the newest source tail,
+        // signal that earlier context was omitted, and never silently drop
+        // the latest correction at the end of the request.
+        var lead = BrowserAutomationText.Truncate(objective, Math.Min(300, budget / 5));
+        const string partialHeader =
+            "\n\nAUTHORITATIVE USER-PROVIDED CONTEXT (partially retained; earlier details omitted):\n";
+        var tailBudget = Math.Max(0, budget - lead.Length - partialHeader.Length);
+        return lead + partialHeader + LastTextElements(appendix, tailBudget);
+    }
+
+    private static string LastTextElements(string value, int count)
+    {
+        if (count <= 0)
+            return "";
+        var indexes = StringInfo.ParseCombiningCharacters(value);
+        return indexes.Length <= count ? value : value[indexes[indexes.Length - count]..];
+    }
+
+    internal static string RequestWithoutCapturedContext(string request)
+    {
+        var text = request ?? "";
+        var markerIndex = text.IndexOf(CapturedContextMarker, StringComparison.Ordinal);
+        return (markerIndex < 0 ? text : text[..markerIndex]).Trim();
+    }
+
+    internal static bool IsNavigationToSupersededDestination(
+        BrowserPlannerAction action,
+        string correctedDestinationUrl,
+        string supersededDestinationUrl) =>
+        action?.Type is "navigate" or "open_tab"
+        && !string.IsNullOrWhiteSpace(correctedDestinationUrl)
+        && !string.IsNullOrWhiteSpace(supersededDestinationUrl)
+        && SameHost(action.Url, supersededDestinationUrl)
+        && !SameHost(action.Url, correctedDestinationUrl);
+
+    internal static bool InFlightResultWasSuperseded(
+        int capturedCorrectionRevision,
+        int currentCorrectionRevision) =>
+        currentCorrectionRevision > capturedCorrectionRevision;
+
+    internal static bool IsRelevantManualAnswer(
+        string requestedUserAction,
+        string guidance) =>
+        IsRelevantManualAnswer(
+            new BrowserUserIntervention { Missing = requestedUserAction ?? "" },
+            guidance,
+            null);
+
+    internal static bool IsRelevantManualAnswer(
+        BrowserUserIntervention intervention,
+        string guidance) =>
+        IsRelevantManualAnswer(intervention, guidance, null);
+
+    internal static bool IsRelevantManualAnswer(
+        BrowserUserIntervention intervention,
+        string guidance,
+        BrowserPageSnapshot page)
+    {
+        var request = NormalizeControlText(string.Join(
+            " ",
+            intervention?.Missing,
+            intervention?.Explanation));
+        var answer = NormalizeControlText(guidance);
+        if (request.Length == 0 || answer.Length == 0)
+            return false;
+        if (GeminiLiveConversationService.ShouldAutoEnd(guidance)
+            || CommandRegistry.IsExplicitBrowserTaskStopOrPause(guidance))
+        {
+            return false;
+        }
+
+        if (IsSkipInterventionGuidance(answer))
+            return intervention?.CanSkip == true;
+
+        if (Regex.IsMatch(answer, @"\b(?:ctrl|control)\s*\+?\s*\d\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(
+                answer,
+                @"\b(?:switch|go|change)\b.{0,60}\b(?:tab|window)\b|\b(?:new|close|next|previous|reopen)\s+(?:browser\s+)?(?:tab|window)\b",
+                RegexOptions.IgnoreCase)
+            || Regex.IsMatch(
+                answer,
+                @"^(?:open|launch|start|close|quit|exit|search|find|show)\b",
+                RegexOptions.IgnoreCase)
+            || answer.Contains('?')
+            || Regex.IsMatch(
+                answer,
+                @"^(?:what|why|when|where|who|how|could|would|should|can|do|does|did|tell|explain|summarize|brainstorm)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        if (Regex.IsMatch(
+                request,
+                @"\b(?:date|departure|depart|return|arrival|arrive|check[- ]?in|check[- ]?out|calendar)\b",
+                RegexOptions.IgnoreCase)
+            && HasUsableDateConstraint(answer))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(
+                request,
+                @"\b(?:url|uri|link|website|domain|repository|repo)\b",
+                RegexOptions.IgnoreCase)
+            && Regex.IsMatch(
+                guidance ?? "",
+                @"(?:https?://|www\.)\S+|\b(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+[a-z]{2,}(?:/\S*)?",
+                RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(request, @"\bemail(?:\s+address)?\b", RegexOptions.IgnoreCase)
+            && Regex.IsMatch(
+                guidance ?? "",
+                @"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        // A paused task may ask for a missing non-sensitive field value. A
+        // direct value or "use/enter/choose X" answer is task guidance, not a
+        // new browser command. Keep this bounded to an explicit request for
+        // input and a concise answer shape.
+        if (!Regex.IsMatch(
+                request,
+                @"\b(?:provide|enter|type|fill|specify|choose|select|supply|need|required|missing)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        if (Regex.IsMatch(
+                answer,
+                @"^(?:please\s+)?(?:use|enter|type|choose|select)\s+\S.{0,240}$",
+                RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(
+                guidance ?? "",
+                @"\b(?:name|value|url|link|email|phone|date|answer|option)\b\s*(?:is|are|:|=)\s*\S",
+                RegexOptions.IgnoreCase))
+        {
+            return true;
+        }
+
+        // Accept a direct "field label is value" answer when that label was
+        // actually named by the active intervention. This keeps arbitrary
+        // browser commands out of a paused task while allowing natural
+        // answers for domain-specific fields that are not covered by the
+        // small set of common labels above.
+        var labeledAnswer = Regex.Match(
+            answer,
+            @"^(?:the\s+)?(?:missing\s+)?(?<label>[\p{L}\p{N}][\p{L}\p{N} _./()-]{1,80}?)\s*(?:is|are|:|=)\s*\S",
+            RegexOptions.IgnoreCase);
+        if (labeledAnswer.Success)
+        {
+            var label = NormalizeControlText(labeledAnswer.Groups["label"].Value);
+            if (label.Length >= 3
+                && request.Contains(label, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        // The Helper's live field/group metadata is a stronger relevance
+        // signal than the grammatical shape of a reply. This lets a natural
+        // declarative answer resume the task when it names values belonging
+        // to the exact fields the intervention requested, while an unrelated
+        // sentence that merely begins with "I" remains ordinary conversation.
+        if (PageContainsRequestedAnswer(request, answer, page))
+            return true;
+
+        var words = Regex.Matches(answer, @"[\p{L}\p{N}@._+:/-]+").Count;
+        return words is >= 1 and <= 8
+            && !Regex.IsMatch(
+                answer,
+                @"^(?:i|we|it|that|this|there|maybe|perhaps|also|please)\b",
+                RegexOptions.IgnoreCase);
+    }
+
+    private static bool PageContainsRequestedAnswer(
+        string request,
+        string answer,
+        BrowserPageSnapshot page)
+    {
+        if (page?.Controls == null)
+            return false;
+
+        var relevantControls = page.Controls
+            .Where(control => control is { Visible: true, Enabled: true }
+                && !string.IsNullOrWhiteSpace(control.FieldLabel)
+                && TextSharesMeaning(request, control.FieldLabel))
+            .ToArray();
+        if (relevantControls.Length == 0)
+            return false;
+
+        foreach (var control in relevantControls)
+        {
+            foreach (var candidate in new[]
+                     {
+                         control.AccessibleName,
+                         control.Text,
+                         control.AriaLabel,
+                         control.Title,
+                         control.Value,
+                     })
+            {
+                var normalizedCandidate = NormalizeControlText(candidate);
+                if (normalizedCandidate.Length == 0
+                    || string.Equals(
+                        normalizedCandidate,
+                        NormalizeControlText(control.FieldLabel),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (normalizedCandidate.Length == 1)
+                {
+                    // A one-character choice (for example, a rating) is safe
+                    // evidence only when the answer also refers to the field
+                    // that the active intervention requested. Match it as a
+                    // complete token so option "1" cannot match "10".
+                    if (char.IsLetterOrDigit(normalizedCandidate[0])
+                        && TextSharesMeaning(request, answer)
+                        && Regex.IsMatch(
+                            answer,
+                            $@"(?<![\p{{L}}\p{{N}}]){Regex.Escape(normalizedCandidate)}(?![\p{{L}}\p{{N}}])",
+                            RegexOptions.IgnoreCase))
+                    {
+                        return true;
+                    }
+                    continue;
+                }
+                if (answer.Contains(
+                        normalizedCandidate,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TextSharesMeaning(string left, string right)
+    {
+        var leftText = NormalizeControlText(left);
+        var rightText = NormalizeControlText(right);
+        if (leftText.Length == 0 || rightText.Length == 0)
+            return false;
+        if (leftText.Contains(rightText, StringComparison.OrdinalIgnoreCase)
+            || rightText.Contains(leftText, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var leftTerms = MeaningfulControlTerms(leftText);
+        var rightTerms = MeaningfulControlTerms(rightText);
+        return leftTerms.Overlaps(rightTerms);
+    }
+
+    private static HashSet<string> MeaningfulControlTerms(string text)
+    {
+        var ignored = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "the", "and", "for", "with", "from", "please", "provide",
+            "enter", "type", "fill", "specify", "choose", "select",
+            "supply", "need", "required", "missing", "information",
+            "value", "field",
+        };
+        return Regex.Matches(text ?? "", @"[\p{L}\p{N}]+")
+            .Select(match => match.Value.ToLowerInvariant())
+            .Where(term => term.Length >= 3 && !ignored.Contains(term))
+            .Select(term => term.Length > 4 && term.EndsWith('s')
+                ? term[..^1]
+                : term)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsExplicitSingleControlActionRequest(string request)
+    {
+        var text = NormalizeControlText(request);
+        if (!Regex.IsMatch(
+                text,
+                @"^(?:please\s+)?(?:click|press|choose|select|check|uncheck|open)\b",
+                RegexOptions.IgnoreCase)
+            || Regex.IsMatch(
+                text,
+                @"[,;]|\b(?:and|then|after|before|followed by|also)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        return Regex.Matches(
+            text,
+            @"\b(?:click|press|choose|select|check|uncheck|open|type|fill|search|navigate|copy|paste|play|add)\b",
+            RegexOptions.IgnoreCase).Count == 1;
+    }
+
+    internal static bool IsUnrequestedFinalActionRejection(
+        BrowserAutomationSafetyDecision decision) =>
+        decision?.MayStart == false
+        && decision.PauseBeforeSensitiveStep
+        && (decision.Reason.Contains(
+                "not explicitly requested",
+                StringComparison.OrdinalIgnoreCase)
+            || decision.Reason.Contains(
+                "did not explicitly request",
+                StringComparison.OrdinalIgnoreCase));
+
+    private static void CapturePreparedDraft(Runtime runtime, BrowserPlannerDecision decision)
+    {
+        if (string.IsNullOrWhiteSpace(decision?.CompletionValue)
+            || string.IsNullOrWhiteSpace(runtime?.Request)
+            || !Regex.IsMatch(
+                runtime.Request,
+                @"\b(?:summari[sz]e|extract|research|read)\b[\s\S]{0,800}\b(?:paste|insert|document|docs|editor)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return;
+        }
+
+        var draft = BrowserAutomationText.Truncate(decision.CompletionValue.Trim(), 8000);
+        if (draft.Length == 0 || string.Equals(draft, runtime.PreparedDraft, StringComparison.Ordinal))
+            return;
+
+        runtime.PreparedDraft = draft;
+        runtime.History.Add($"Prepared an ephemeral source result for the destination editor (length {draft.Length}).");
+    }
+
+    private bool RejectKnownNoProgressStrategy(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        string source)
+    {
+        if (!IsKnownNoProgressStrategy(
+            runtime.NoProgressActionStates,
+            runtime.Page,
+            action))
+        {
+            return false;
+        }
+
+        runtime.ConsecutiveRejectedStrategies++;
+        runtime.History.Add(
+            $"Strategy rejected before execution ({source}): {DescribeAction(action)} already made no progress on this unchanged page. Choose a different control, navigation path, input mechanism, or bounded visual recovery.");
+        SetState(
+            runtime,
+            BrowserTaskState.Planning,
+            "Reconsidering after an unchanged action");
+        return true;
+    }
+
+    private static string DescribeAction(BrowserPlannerAction action)
+    {
+        var target = string.IsNullOrWhiteSpace(action?.TargetName)
+            ? action?.TargetRole
+            : action.TargetName;
+        return string.IsNullOrWhiteSpace(target)
+            ? action?.Type ?? "action"
+            : $"{action?.Type} on {Short(target, 80)}";
+    }
+
+    internal static bool TryGroundSearchEnter(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        string immediateGoal)
+    {
+        if (action?.Type != "press_key"
+            || !string.Equals(action.Key, "Enter", StringComparison.OrdinalIgnoreCase)
+            || !Regex.IsMatch(
+                immediateGoal ?? "",
+                @"\b(search|find|look\s*up|lookup|query)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        var candidates = (page?.Controls ?? Array.Empty<BrowserControl>())
+            .Where(control => control.Visible && control.Enabled)
+            .Where(control =>
+                control.Role.Equals("searchbox", StringComparison.OrdinalIgnoreCase)
+                || Regex.IsMatch(
+                    string.Join(
+                        " ",
+                        control.AccessibleName,
+                        control.AriaLabel,
+                        control.Placeholder,
+                        control.NearbyLabel),
+                    @"\b(search|find|query)\b",
+                    RegexOptions.IgnoreCase))
+            .GroupBy(control => control.Id, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+        if (candidates.Length != 1)
+            return false;
+
+        var search = candidates[0];
+        action.TargetId = search.Id;
+        action.TargetRole = search.Role;
+        action.TargetName = ControlName(search);
+        return true;
+    }
+
+    internal static bool FreshStateConfirmsOption(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action,
+        BrowserActionReceipt receipt)
+    {
+        var wanted = Normalize(
+            !string.IsNullOrWhiteSpace(action?.Option)
+                ? action.Option
+                : !string.IsNullOrWhiteSpace(receipt?.TargetName)
+                    ? receipt.TargetName
+                    : action?.TargetName);
+        if (wanted.Length == 0
+            || wanted is "choose" or "select" or "select an option")
+        {
+            return false;
+        }
+
+        return (page?.Controls ?? Array.Empty<BrowserControl>())
+            .Where(control => string.IsNullOrWhiteSpace(action?.TargetFieldId)
+                || string.Equals(control.FieldId, action.TargetFieldId, StringComparison.Ordinal))
+            .Any(control =>
+        {
+            var names = new[]
+            {
+                control.AccessibleName,
+                control.Text,
+                control.Value,
+            }.Select(Normalize).Where(value => value.Length > 0).ToArray();
+            var exact = names.Any(value => value == wanted);
+            if (!exact)
+                return false;
+            return control.Selected
+                || control.Checked
+                || control.Role.Equals("combobox", StringComparison.OrdinalIgnoreCase)
+                || control.Role.Equals("listbox", StringComparison.OrdinalIgnoreCase)
+                || (action?.Type == "select_option" && control.Value.Length > 0);
+        });
+    }
+
+    internal static bool IsVerifiedEditorTransferAction(
+        string request,
+        BrowserActionReceipt receipt,
+        BrowserPageSnapshot page)
+    {
+        if (receipt == null
+            || !receipt.Ok
+            || !receipt.ValueMatches
+            || receipt.Action is not ("paste" or "type")
+            || !Regex.IsMatch(request ?? "", @"\b(paste|insert|type|write|place|put)\b")
+            || !Regex.IsMatch(request ?? "", @"\b(google docs|document|docs|doc|editor|textbox|text area)\b", RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        // Paste uses the trusted active-editor contract. For direct typing, do
+        // not mistake a source-page searchbox for the destination editor.
+        if (receipt.Action.Equals("paste", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var target = (page?.Controls ?? Array.Empty<BrowserControl>()).FirstOrDefault(control =>
+            string.Equals(control.Id, receipt.TargetId, StringComparison.Ordinal));
+        var name = string.Join(
+            " ",
+            receipt.TargetName,
+            target?.AccessibleName,
+            target?.AriaLabel,
+            target?.NearbyLabel);
+        if (Regex.IsMatch(name, @"\b(editor|document|docs|doc)\b", RegexOptions.IgnoreCase))
+            return true;
+
+        return target != null
+            && target.Editable
+            && !target.Role.Equals("searchbox", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(target.Id, page.ActiveEditorId, StringComparison.Ordinal);
+    }
+
+    private static bool SameHost(string left, string right) =>
+        Uri.TryCreate(left, UriKind.Absolute, out var leftUri)
+        && Uri.TryCreate(right, UriKind.Absolute, out var rightUri)
+        && string.Equals(leftUri.Host, rightUri.Host, StringComparison.OrdinalIgnoreCase);
+
+    internal static bool SupportsSafeActionCapture(string helperVersion) =>
+        Version.TryParse(helperVersion, out var parsed)
+        && parsed >= new Version(2, 1, 1);
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedPasteAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(action.Text))
+            throw new InvalidOperationException("The planner provided no text to paste.");
+
+        var before = runtime.Page;
+        var control = FindMatchingControl(before, action);
+        BrowserActionReceipt focus;
+        if (IsSafePasteTarget(control))
+        {
+            focus = await FocusControlAsync(runtime.TaskId, before, control, token);
+        }
+        else if (before.ActiveEditable)
+        {
+            // Do not click a panel/container to "find" a document. When the
+            // user already has a real insertion point, preserve that cursor.
+            focus = await FocusActiveCursorAsync(runtime.TaskId, before, token);
+            control ??= FindActiveEditorControl(before);
+        }
+        else
+        {
+            return new BrowserActionReceipt
+            {
+                TaskId = runtime.TaskId,
+                Ok = false,
+                Action = "paste",
+                TargetId = action.TargetId,
+                TargetRole = action.TargetRole,
+                TargetName = action.TargetName,
+                BeforeUrl = before.Url,
+                AfterUrl = before.Url,
+                BeforeFingerprint = before.Fingerprint,
+                AfterFingerprint = before.Fingerprint,
+                WindowId = before.WindowId,
+                TabId = before.TabId,
+                GraphVersion = before.GraphVersion,
+                DomEpoch = before.DomEpoch,
+                Error = "No verified editable destination is focused. Place the cursor in the destination editor, then ask me to continue.",
+            };
+        }
+        if (!focus.Ok)
+            return focus;
+
+        token.ThrowIfCancellationRequested();
+        var clipboardSnapshot = ClipboardHelper.Capture();
+        var clipboardText = ClipboardHelper.GetText();
+        var useAtomicEditorReceipt = before.ActiveEditable
+            && RequiresDestinationEditorTransfer(runtime.Request);
+        var editorReceiptToken = Guid.NewGuid().ToString("N")[..12];
+        var editorReceiptMarker = useAtomicEditorReceipt
+            ? $"[[kwtf:{editorReceiptToken}]]"
+            : "";
+        var clipboardPayload = action.Text + editorReceiptMarker;
+        try
+        {
+            if (!ClipboardHelper.SetText(clipboardPayload)
+                || !string.Equals(ClipboardHelper.GetText(), clipboardPayload, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("The clipboard could not be prepared for the requested paste.");
+            }
+
+            await Task.Delay(90, token);
+            token.ThrowIfCancellationRequested();
+            BrowserTrustedInput.Paste(before.Title, token);
+            await Task.Delay(550, token);
+            token.ThrowIfCancellationRequested();
+            var after = await _bridge.ObserveAsync(runtime.TaskId, before.TabId, token);
+            var live = FindMatchingControl(after, action)
+                ?? FindActiveEditorControl(after);
+            var verified = await _bridge.ExecuteAsync(
+                new BrowserActionRequest
+                {
+                    TaskId = runtime.TaskId,
+                    Type = "verify_active_text",
+                    WindowId = after.WindowId,
+                    TabId = after.TabId,
+                    GraphVersion = after.GraphVersion,
+                    DomEpoch = after.DomEpoch,
+                    ControlId = live?.Id ?? after.ActiveEditorId,
+                    Text = action.Text,
+                },
+                token);
+            var valueMatches = verified.Ok && verified.ValueMatches
+                || ContainsRequestedText(live?.Value, action.Text)
+                || ContainsRequestedText(after.PageText, action.Text);
+            if (useAtomicEditorReceipt
+                && !string.IsNullOrWhiteSpace(after.ActiveEditorId))
+            {
+                var refocus = await FocusActiveCursorAsync(
+                    runtime.TaskId,
+                    after,
+                    token);
+                if (refocus.Ok)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var unchangedCanary = $"kwtf-copy-canary-{Guid.NewGuid():N}";
+                    if (ClipboardHelper.SetText(unchangedCanary))
+                    {
+                        var markerElementCount = StringInfo.ParseCombiningCharacters(editorReceiptMarker).Length;
+                        if (markerElementCount <= 256)
+                        {
+                            BrowserTrustedInput.SelectPreviousText(
+                                markerElementCount,
+                                after.Title, token);
+                            await Task.Delay(140, token);
+                            BrowserTrustedInput.CopySelection(after.Title, token);
+                            await Task.Delay(280, token);
+                            var copiedText = ClipboardHelper.GetText();
+                            valueMatches = string.Equals(
+                                copiedText,
+                                editorReceiptMarker,
+                                StringComparison.Ordinal);
+                            if (valueMatches)
+                            {
+                                BrowserTrustedInput.DeleteSelection(after.Title, token);
+                                await Task.Delay(180, token);
+                                after = await _bridge.ObserveAsync(
+                                    runtime.TaskId,
+                                    after.TabId,
+                                    token);
+                                live = FindMatchingControl(after, action)
+                                    ?? FindActiveEditorControl(after);
+                            }
+                            else
+                            {
+                                // Never delete an unverified selection: if the
+                                // paste did not land, that could remove content
+                                // that was already in the user's document.
+                                BrowserTrustedInput.CollapseSelectionToEnd(after.Title, token);
+                            }
+                            AppLog.Info(
+                                $"Browser editor read-back: task={runtime.TaskId} expectedLength={action.Text.Length} "
+                                + $"receiptLength={editorReceiptMarker.Length} copiedLength={copiedText.Length} "
+                                + $"clipboardChanged={!string.Equals(copiedText, unchangedCanary, StringComparison.Ordinal)} "
+                                + $"valueMatches={valueMatches}");
+                            runtime.History.Add(valueMatches
+                                ? $"Atomic native editor paste was verified (content length {action.Text.Length})."
+                                : "The atomic native editor paste receipt could not be verified.");
+                        }
+                    }
+                }
+            }
+            var finalControl = live ?? control;
+            var finalTargetId = finalControl?.Id;
+            if (string.IsNullOrWhiteSpace(finalTargetId))
+                finalTargetId = string.IsNullOrWhiteSpace(after.ActiveEditorId)
+                    ? before.ActiveEditorId
+                    : after.ActiveEditorId;
+            var finalTargetRole = finalControl?.Role;
+            if (string.IsNullOrWhiteSpace(finalTargetRole))
+                finalTargetRole = string.IsNullOrWhiteSpace(after.ActiveEditorRole)
+                    ? before.ActiveEditorRole
+                    : after.ActiveEditorRole;
+            var finalTargetName = ControlName(finalControl);
+            if (string.IsNullOrWhiteSpace(finalTargetName))
+                finalTargetName = string.IsNullOrWhiteSpace(after.ActiveEditorName)
+                    ? before.ActiveEditorName
+                    : after.ActiveEditorName;
+            return new BrowserActionReceipt
+            {
+                CommandId = verified.CommandId.Length > 0 ? verified.CommandId : focus.CommandId,
+                TaskId = runtime.TaskId,
+                Ok = true,
+                Action = "paste",
+                TargetId = finalTargetId ?? "",
+                TargetRole = finalTargetRole ?? "",
+                TargetName = finalTargetName ?? "",
+                BeforeUrl = before.Url,
+                AfterUrl = after.Url,
+                BeforeFingerprint = before.Fingerprint,
+                AfterFingerprint = after.Fingerprint,
+                ValueMatches = valueMatches,
+                Navigation = !string.Equals(before.Url, after.Url, StringComparison.Ordinal),
+                NoVisibleChange = string.Equals(before.Fingerprint, after.Fingerprint, StringComparison.Ordinal)
+                    && !valueMatches,
+                NativeInputUsed = true,
+                WindowId = after.WindowId,
+                TabId = after.TabId,
+                GraphVersion = after.GraphVersion,
+                DomEpoch = after.DomEpoch,
+                TargetBounds = verified.TargetBounds.Width > 0
+                    ? verified.TargetBounds
+                    : focus.TargetBounds,
+            };
+        }
+        finally
+        {
+            if (!ClipboardHelper.Restore(clipboardSnapshot))
+                _ = ClipboardHelper.SetText(clipboardText);
+        }
+    }
+
+    private static bool IsSafePasteTarget(BrowserControl control) =>
+        control != null
+        && control.Visible
+        && control.Enabled
+        && control.Editable
+        && control.SafeActions.Contains("type", StringComparer.OrdinalIgnoreCase);
+
+    internal static bool IsBroadNonEditorContainerAction(
+        BrowserPlannerAction action,
+        BrowserControl control)
+    {
+        if (action == null
+            || control == null
+            || action.Type is not ("click" or "type" or "press_key")
+            || control.Editable)
+        {
+            return false;
+        }
+
+        var role = NormalizeControlText(control.Role);
+        var area = Math.Max(0, control.Bounds.Width) * Math.Max(0, control.Bounds.Height);
+        return area >= 45_000
+            && role is "div" or "document" or "region" or "main" or "group" or "tabpanel";
+    }
+
+    private static BrowserControl FindActiveEditorControl(BrowserPageSnapshot page) =>
+        (page?.Controls ?? Array.Empty<BrowserControl>()).FirstOrDefault(control =>
+            string.Equals(control.Id, page.ActiveEditorId, StringComparison.Ordinal));
+
+    private async Task<BrowserActionReceipt> FocusActiveCursorAsync(
+        string taskId,
+        BrowserPageSnapshot page,
+        CancellationToken token) =>
+        await _bridge.ExecuteAsync(
+            new BrowserActionRequest
+            {
+                TaskId = taskId,
+                Type = "focus_active_cursor",
+                WindowId = page.WindowId,
+                TabId = page.TabId,
+                GraphVersion = page.GraphVersion,
+                DomEpoch = page.DomEpoch,
+                ControlId = page.ActiveEditorId,
+                TargetRole = page.ActiveEditorRole,
+                TargetName = page.ActiveEditorName,
+            },
+            token);
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedEnterAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserPageSnapshot before,
+        BrowserControl control,
+        CancellationToken token) =>
+        await ExecuteTrustedKeyAsync(
+            runtime,
+            action,
+            before,
+            control,
+            () => BrowserTrustedInput.PressEnter(before.Title, token),
+            token);
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedSpaceAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserPageSnapshot before,
+        BrowserControl control,
+        CancellationToken token) =>
+        await ExecuteTrustedKeyAsync(
+            runtime,
+            action,
+            before,
+            control,
+            () => BrowserTrustedInput.PressSpace(before.Title, token),
+            token);
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedAltArrowDownAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserPageSnapshot before,
+        BrowserControl control,
+        CancellationToken token) =>
+        await ExecuteTrustedKeyAsync(
+            runtime,
+            action,
+            before,
+            control,
+            () => BrowserTrustedInput.PressAltArrowDown(before.Title, token),
+            token);
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedListboxSelectionAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserPageSnapshot before,
+        BrowserControl control,
+        string requestedOption,
+        CancellationToken token)
+    {
+        var focus = await FocusControlAsync(runtime.TaskId, before, control, token);
+        if (!focus.Ok)
+            return focus;
+
+        token.ThrowIfCancellationRequested();
+        await Task.Delay(75, token);
+        BrowserTrustedInput.TypeTextAndPressEnter(requestedOption, before.Title, token);
+        await Task.Delay(650, token);
+        token.ThrowIfCancellationRequested();
+        var after = await _bridge.ObserveAsync(runtime.TaskId, before.TabId, token);
+        var live = FindMatchingControl(after, action)
+            ?? FindMatchingControl(
+                after,
+                new BrowserPlannerAction
+                {
+                    TargetRole = control.Role,
+                    TargetName = ControlName(control),
+                });
+        var wanted = NormalizeControlText(requestedOption);
+        var valueMatches = new[]
+        {
+            live?.Value,
+            live?.Text,
+            live?.AccessibleName,
+        }.Any(value => NormalizeControlText(value) == wanted);
+        var changed = !string.Equals(
+            before.Fingerprint,
+            after.Fingerprint,
+            StringComparison.Ordinal);
+        return new BrowserActionReceipt
+        {
+            CommandId = focus.CommandId,
+            TaskId = runtime.TaskId,
+            Ok = changed && valueMatches,
+            Error = changed && valueMatches
+                ? ""
+                : "The custom listbox did not display the requested option after native type-ahead.",
+            Action = "select_option",
+            TargetId = live?.Id ?? control.Id,
+            TargetRole = live?.Role ?? control.Role,
+            TargetName = requestedOption,
+            BeforeUrl = before.Url,
+            AfterUrl = after.Url,
+            BeforeFingerprint = before.Fingerprint,
+            AfterFingerprint = after.Fingerprint,
+            ValueMatches = valueMatches,
+            SelectedChanged = changed && valueMatches,
+            Navigation = !string.Equals(before.Url, after.Url, StringComparison.Ordinal),
+            NoVisibleChange = !changed,
+            NativeInputUsed = true,
+            WindowId = after.WindowId,
+            TabId = after.TabId,
+            GraphVersion = after.GraphVersion,
+            DomEpoch = after.DomEpoch,
+            TargetBounds = focus.TargetBounds,
+        };
+    }
+
+    private async Task<BrowserActionReceipt> ExecuteTrustedKeyAsync(
+        Runtime runtime,
+        BrowserPlannerAction action,
+        BrowserPageSnapshot before,
+        BrowserControl control,
+        Action sendKey,
+        CancellationToken token)
+    {
+        var focus = await FocusControlAsync(runtime.TaskId, before, control, token);
+        if (!focus.Ok)
+            return focus;
+
+        token.ThrowIfCancellationRequested();
+        await Task.Delay(75, token);
+        sendKey();
+        await Task.Delay(550, token);
+        token.ThrowIfCancellationRequested();
+        var after = await _bridge.ObserveAsync(runtime.TaskId, before.TabId, token);
+        return new BrowserActionReceipt
+        {
+            CommandId = focus.CommandId,
+            TaskId = runtime.TaskId,
+            Ok = true,
+            Action = "press_key",
+            TargetId = control.Id,
+            TargetRole = control.Role,
+            TargetName = ControlName(control),
+            BeforeUrl = before.Url,
+            AfterUrl = after.Url,
+            BeforeFingerprint = before.Fingerprint,
+            AfterFingerprint = after.Fingerprint,
+            Navigation = !string.Equals(before.Url, after.Url, StringComparison.Ordinal),
+            NoVisibleChange = string.Equals(before.Fingerprint, after.Fingerprint, StringComparison.Ordinal),
+            NativeInputUsed = true,
+            WindowId = after.WindowId,
+            TabId = after.TabId,
+            GraphVersion = after.GraphVersion,
+            DomEpoch = after.DomEpoch,
+            TargetBounds = focus.TargetBounds,
+        };
+    }
+
+    private async Task<BrowserActionReceipt> FocusControlAsync(
+        string taskId,
+        BrowserPageSnapshot page,
+        BrowserControl control,
+        CancellationToken token) =>
+        await _bridge.ExecuteAsync(
+            new BrowserActionRequest
+            {
+                TaskId = taskId,
+                Type = "focus",
+                WindowId = page.WindowId,
+                TabId = page.TabId,
+                GraphVersion = page.GraphVersion,
+                DomEpoch = page.DomEpoch,
+                ControlId = control.Id,
+                TargetRole = control.Role,
+                TargetName = ControlName(control),
+            },
+            token);
+
+    internal static BrowserControl FindMatchingControl(
+        BrowserPageSnapshot page,
+        BrowserPlannerAction action)
+    {
+        var byId = page.Controls.FirstOrDefault(control =>
+            string.Equals(control.Id, action.TargetId, StringComparison.Ordinal));
+        if (byId != null)
+        {
+            if (!string.IsNullOrWhiteSpace(action.TargetFieldId)
+                && !string.Equals(byId.FieldId, action.TargetFieldId, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            var declaredName = Normalize(action.TargetName);
+            var liveName = Normalize(ControlName(byId));
+            if (declaredName.Length == 0
+                || liveName.Length == 0
+                || NameScore(declaredName, liveName) >= 2)
+            {
+                return byId;
+            }
+
+            // Renderer ids are volatile. A recycled id cannot override the
+            // planner's declared semantic target with another live control.
+            // Fall through to the existing unique name/role grounding.
+        }
+
+        var wanted = Normalize(action.TargetName);
+        var candidates = page.Controls
+            .Where(control => string.IsNullOrWhiteSpace(action.TargetFieldId)
+                || string.Equals(control.FieldId, action.TargetFieldId, StringComparison.Ordinal))
+            .Where(control =>
+                string.IsNullOrWhiteSpace(action.TargetRole)
+                || string.Equals(control.Role, action.TargetRole, StringComparison.OrdinalIgnoreCase))
+            .Select(control => new
+            {
+                Control = control,
+                Score = NameScore(wanted, Normalize(ControlName(control))),
+            })
+            .OrderByDescending(candidate => candidate.Score)
+            .Where(candidate => candidate.Score >= 2)
+            .ToArray();
+        return candidates.Length == 0
+            || (candidates.Length > 1 && candidates[0].Score == candidates[1].Score)
+                ? null : candidates[0].Control;
+    }
+
+    private static int NameScore(string wanted, string actual)
+    {
+        if (wanted.Length == 0 || actual.Length == 0)
+            return 0;
+        if (wanted == actual)
+            return 4;
+        if (actual.StartsWith(wanted, StringComparison.Ordinal)
+            || wanted.StartsWith(actual, StringComparison.Ordinal))
+            return 3;
+        return actual.Contains(wanted, StringComparison.Ordinal)
+            || wanted.Contains(actual, StringComparison.Ordinal)
+                ? 2
+                : 0;
+    }
+
+    private static string ControlName(BrowserControl control) =>
+        new[]
+        {
+            control?.AccessibleName,
+            control?.AriaLabel,
+            control?.Placeholder,
+            control?.Text,
+            control?.NearbyLabel,
+        }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+
+    private static string Normalize(string value) =>
+        string.Join(
+            " ",
+            (value ?? "").Split(
+                (char[])null,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        .ToLowerInvariant();
+
+    private static bool ContainsRequestedText(string observed, string expected)
+    {
+        if (string.IsNullOrWhiteSpace(observed) || string.IsNullOrWhiteSpace(expected))
+            return false;
+        var normalizedObserved = string.Join(
+            " ",
+            observed.Split(
+                (char[])null,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        var normalizedExpected = string.Join(
+            " ",
+            expected.Split(
+                (char[])null,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        var marker = BrowserAutomationText.Truncate(normalizedExpected, 120);
+        return normalizedObserved.Contains(marker, StringComparison.Ordinal);
+    }
+
+    // Completion and accepted user guidance share this linearization point.
+    // A correction accepted first must reach the next plan, not terminal cleanup.
+    private bool TryCompleteWithGuidanceRevision(Runtime runtime, BrowserAutomationOutcome outcome,
+        string summary, string evidence, int expectedGuidanceRevision)
+    {
+        lock (_sync)
+        {
+            if (runtime.GuidanceRevision != expectedGuidanceRevision
+                || !ReferenceEquals(_active, runtime) || IsTerminal(runtime.State)
+                || runtime.Cancellation.IsCancellationRequested)
+                return false;
+            Complete(runtime, outcome, summary, evidence);
+            return true;
+        }
+    }
+
+    private void Complete(
+        Runtime runtime,
+        BrowserAutomationOutcome outcome,
+        string summary,
+        string evidence)
+    {
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_active, runtime) || IsTerminal(runtime.State)
+                || runtime.Cancellation.IsCancellationRequested)
+                return;
+            var finalSummary = string.IsNullOrWhiteSpace(summary)
+                ? "The browser task completed."
+                : summary.Trim();
+            runtime.History.Add($"Terminal verification: {evidence}");
+            SetTerminal(
+                runtime,
+                outcome == BrowserAutomationOutcome.CompletedWithNote
+                    ? BrowserTaskState.CompletedWithNote
+                    : BrowserTaskState.Completed,
+                outcome,
+                "Completed",
+                finalSummary);
+            _notifications.AttentionTransient("Browser automation", finalSummary);
+        }
+    }
+
+    private void Fail(Runtime runtime, BrowserAutomationOutcome outcome, string message)
+    {
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_active, runtime) || IsTerminal(runtime.State)
+                || runtime.Cancellation.IsCancellationRequested)
+                return;
+            var state = outcome switch
+            {
+                BrowserAutomationOutcome.Partial => BrowserTaskState.Partial,
+                BrowserAutomationOutcome.Blocked => BrowserTaskState.Blocked,
+                BrowserAutomationOutcome.NeedsUserAction => BrowserTaskState.NeedsUserAction,
+                _ => BrowserTaskState.Failed,
+            };
+            SetTerminal(runtime, state, outcome, message, "");
+            _notifications.WarningTransient("Browser automation", message);
+        }
+    }
+
+    private void SetTerminal(
+        Runtime runtime,
+        BrowserTaskState state,
+        BrowserAutomationOutcome outcome,
+        string action,
+        string result)
+    {
+        if (runtime.Cancellation.IsCancellationRequested
+            && !string.IsNullOrWhiteSpace(runtime.CancellationReason)
+            && state != BrowserTaskState.Cancelled)
+        {
+            state = BrowserTaskState.Cancelled;
+            outcome = BrowserAutomationOutcome.Cancelled;
+            action = "Browser automation cancelled.";
+            result = "";
+        }
+        runtime.UserPaused = false;
+        runtime.Intervention = null;
+        runtime.PauseGate.Resume();
+        runtime.State = state;
+        runtime.Outcome = outcome;
+        runtime.CurrentAction = action;
+        runtime.ResultSummary = result;
+        runtime.LastError = outcome is BrowserAutomationOutcome.Failed
+            or BrowserAutomationOutcome.Blocked
+            or BrowserAutomationOutcome.Partial
+                ? action
+                : "";
+        Publish(runtime);
+        AnnounceOutcome(runtime, state);
+        // An explicit cancel becomes visible immediately, but its execution
+        // task can still be unwinding. Do not clear collections concurrently
+        // with that owner; ExecuteAsync releases them in its finally block.
+        if (state != BrowserTaskState.Cancelled
+            || runtime.Execution?.IsCompleted != false)
+        {
+            ReleaseTaskContent(runtime);
+        }
+    }
+
+    private static void ReleaseTaskContent(Runtime runtime)
+    {
+        runtime.Request = "";
+        runtime.PreparedDraft = "";
+        runtime.History.Clear();
+        runtime.VerifiedCheckpoints.Clear();
+        runtime.ActionAttempts.Clear();
+        runtime.SemanticActionAttempts.Clear();
+        runtime.NoProgressActionStates.Clear();
+        runtime.SkippedInterventions.Clear();
+        runtime.AuthorizedSkippedFieldStates.Clear();
+        while (runtime.PendingGuidance.TryDequeue(out _)) { }
+        runtime.Receipts.Clear();
+        if (runtime.Page != null)
+        {
+            runtime.Page.PageText = "";
+            runtime.Page.SelectedText = "";
+            runtime.Page.Controls = Array.Empty<BrowserControl>();
+        }
+    }
+
+    private void AnnounceOutcome(Runtime runtime, BrowserTaskState state)
+    {
+        if (runtime.LastAnnouncedState == state)
+            return;
+        if (!ShouldAnnounceOutcome(state, runtime.SuppressCancellationAnnouncement))
+        {
+            runtime.LastAnnouncedState = state;
+            return;
+        }
+
+        var spoken = state switch
+        {
+            BrowserTaskState.Completed or BrowserTaskState.CompletedWithNote =>
+                "Okay, the browser task is complete. The result should now be visible in Chrome.",
+            BrowserTaskState.NeedsUserAction => BuildInterventionSpeech(runtime.Intervention),
+            BrowserTaskState.Partial =>
+                "I completed part of the browser task, but stopped before the full result. Chrome is left at the useful stopping point.",
+            BrowserTaskState.Blocked =>
+                "The browser task is blocked. I left Chrome at the useful stopping point.",
+            BrowserTaskState.Cancelled =>
+                "Browser automation cancelled.",
+            BrowserTaskState.Failed =>
+                "The browser task stopped because it could not complete safely.",
+            _ => "",
+        };
+        if (string.IsNullOrWhiteSpace(spoken))
+            return;
+
+        runtime.LastAnnouncedState = state;
+        var detail = state switch
+        {
+            BrowserTaskState.Completed or BrowserTaskState.CompletedWithNote => runtime.ResultSummary,
+            BrowserTaskState.NeedsUserAction => BuildInterventionDisplay(runtime.Intervention),
+            _ => runtime.LastError,
+        };
+        var intervention = runtime.Intervention;
+        var announcement = new JarvisLifecycleAnnouncement
+        {
+            IsCurrent = () =>
+            {
+                lock (_sync)
+                    return ReferenceEquals(_active, runtime)
+                        && runtime.State == state
+                        && (state != BrowserTaskState.NeedsUserAction
+                            || ReferenceEquals(runtime.Intervention, intervention));
+            },
+            Source = "browser_automation",
+            State = state.ToString(),
+            Detail = state == BrowserTaskState.Partial && !string.IsNullOrWhiteSpace(detail)
+                ? $"{spoken} {detail}"
+                : string.IsNullOrWhiteSpace(detail) ? spoken : detail,
+            // Browser task speech belongs only to the current Jarvis session.
+            // Background completion/failure still has its existing UI/notice.
+            InterventionKind = state == BrowserTaskState.NeedsUserAction
+                ? runtime.Intervention?.Kind ?? "manual_step"
+                : "",
+            MissingInformation = state == BrowserTaskState.NeedsUserAction
+                ? runtime.Intervention?.Missing ?? runtime.CurrentAction
+                : "",
+            InterventionExplanation = state == BrowserTaskState.NeedsUserAction
+                ? runtime.Intervention?.Explanation ?? ""
+                : "",
+            InterventionRequired = state == BrowserTaskState.NeedsUserAction
+                && runtime.Intervention?.Required == true,
+            InterventionCanSkip = state == BrowserTaskState.NeedsUserAction
+                && runtime.Intervention?.CanSkip == true,
+        };
+        var handler = AnnouncementRequested;
+        if (handler == null)
+            return;
+
+        try
+        {
+            handler(announcement);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, "Browser lifecycle announcement handler failed");
+        }
+    }
+
+    private void SetState(Runtime runtime, BrowserTaskState state, string action)
+    {
+        if (runtime.Cancellation.IsCancellationRequested
+            && !string.IsNullOrWhiteSpace(runtime.CancellationReason)
+            && state is not BrowserTaskState.Cancelling and not BrowserTaskState.Cancelled)
+        {
+            AppLog.Info(
+                $"Ignored stale browser state after cancellation: task={runtime.TaskId} state={state}");
+            return;
+        }
+        if (runtime.UserPaused
+            && state is not BrowserTaskState.Cancelling
+            and not BrowserTaskState.Cancelled
+            and not BrowserTaskState.Completed
+            and not BrowserTaskState.CompletedWithNote
+            and not BrowserTaskState.Partial
+            and not BrowserTaskState.Blocked
+            and not BrowserTaskState.Failed)
+        {
+            runtime.State = BrowserTaskState.Paused;
+            runtime.CurrentAction = "Paused by user";
+            Publish(runtime);
+            AppLog.Info(
+                $"Browser task state: task={runtime.TaskId} state=Paused action=Paused by user");
+            return;
+        }
+
+        runtime.State = state;
+        runtime.CurrentAction = action;
+        Publish(runtime);
+        if (state == BrowserTaskState.NeedsUserAction)
+            AnnounceOutcome(runtime, state);
+        AppLog.Info(
+            $"Browser task state: task={runtime.TaskId} state={state} actionCharacters={action?.Length ?? 0}");
+    }
+
+    private void AddControlledTab(Runtime runtime, BrowserPageSnapshot page)
+    {
+        if (runtime.ControlledTabs.Add(page.TabId))
+        {
+            var domain = Uri.TryCreate(page.Url, UriKind.Absolute, out var uri)
+                ? uri.Host
+                : "";
+            runtime.History.Add(
+                $"Task-owned tab registered: tab:{page.TabId}; title={Short(page.Title, 100)}; domain={Short(domain, 80)}. Use activate_tab with this exact targetId to return to it.");
+        }
+        Publish(runtime);
+    }
+
+    private void Publish(Runtime runtime)
+    {
+        var snapshot = BuildSnapshot(runtime);
+        if (snapshot == null)
+            return;
+        lock (_sync)
+        {
+            // A cancelled runtime can finish after the user has started a new
+            // task. It no longer owns global status or the progress surface.
+            if (!ReferenceEquals(_active, runtime))
+            {
+                AppLog.Info($"Ignored stale browser publish: task={runtime.TaskId}");
+                return;
+            }
+            _last = snapshot;
+            if (IsTerminal(snapshot.State))
+            {
+                _recentTerminalOutcomes.RemoveAll(
+                    outcome => string.Equals(
+                        outcome.TaskId,
+                        snapshot.TaskId,
+                        StringComparison.Ordinal));
+                _recentTerminalOutcomes.Insert(0, BuildTerminalDiagnostic(snapshot));
+                if (_recentTerminalOutcomes.Count > MaximumRecentTerminalOutcomes)
+                {
+                    _recentTerminalOutcomes.RemoveRange(
+                        MaximumRecentTerminalOutcomes,
+                        _recentTerminalOutcomes.Count - MaximumRecentTerminalOutcomes);
+                }
+            }
+            // Keep status ordering atomic with _active replacement. The only
+            // UI subscriber marshals asynchronously, so this does not block on
+            // rendering and a newer runtime is always enqueued afterward.
+            StatusChanged?.Invoke(snapshot);
+        }
+    }
+
+    private static BrowserAutomationSnapshot BuildSnapshot(Runtime runtime)
+    {
+        if (runtime == null)
+            return null;
+        var intervention = runtime.State == BrowserTaskState.NeedsUserAction
+            ? CopyIntervention(runtime.Intervention)
+            : null;
+        return new BrowserAutomationSnapshot
+        {
+            TaskId = runtime.TaskId,
+            Request = string.IsNullOrWhiteSpace(runtime.SnapshotRequest)
+                ? RequestWithoutCapturedContext(runtime.Request)
+                : runtime.SnapshotRequest,
+            State = runtime.State,
+            CurrentAction = runtime.CurrentAction,
+            CurrentDomain = SafeDomain(runtime.Page?.Url),
+            CurrentTabTitle = Short(runtime.Page?.Title, 160),
+            WindowId = runtime.Page?.WindowId,
+            TabId = runtime.Page?.TabId,
+            ControlledTabIds = runtime.ControlledTabs.OrderBy(id => id).ToArray(),
+            StartedUtc = runtime.StartedUtc,
+            UpdatedUtc = DateTime.UtcNow,
+            CanPause = !IsTerminal(runtime.State)
+                && !runtime.UserPaused
+                && runtime.State != BrowserTaskState.NeedsUserAction,
+            CanResume = runtime.UserPaused
+                || runtime.State == BrowserTaskState.NeedsUserAction,
+            CanCancel = !IsTerminal(runtime.State)
+                || runtime.State == BrowserTaskState.Partial,
+            VisionRecovery = runtime.VisionRecovery,
+            Intervention = intervention,
+            InterventionKind = intervention?.Kind ?? "",
+            InterventionReason = intervention?.Missing ?? "",
+            LastError = runtime.LastError,
+            Outcome = runtime.Outcome,
+            ResultSummary = runtime.ResultSummary,
+        };
+    }
+
+    private static BrowserAutomationSnapshot BuildTerminalDiagnostic(
+        BrowserAutomationSnapshot snapshot) => new()
+    {
+        TaskId = snapshot.TaskId,
+        Request = BrowserAutomationText.Truncate(snapshot.Request, 500),
+        State = snapshot.State,
+        StartedUtc = snapshot.StartedUtc,
+        UpdatedUtc = snapshot.UpdatedUtc,
+        LastError = BrowserAutomationText.Truncate(snapshot.LastError, 700),
+        Outcome = snapshot.Outcome,
+        ResultSummary = BrowserAutomationText.Truncate(snapshot.ResultSummary, 700),
+    };
+
+    private static bool IsTerminal(BrowserTaskState state) =>
+        state is BrowserTaskState.Completed
+            or BrowserTaskState.CompletedWithNote
+            or BrowserTaskState.Partial
+            or BrowserTaskState.Blocked
+            or BrowserTaskState.Cancelled
+            or BrowserTaskState.Failed;
+
+    internal static bool ShouldTreatLateFailureAsCancellation(
+        bool cancellationRequested,
+        string cancellationReason) =>
+        cancellationRequested && !string.IsNullOrWhiteSpace(cancellationReason);
+
+    internal static bool ShouldAnnounceOutcome(
+        BrowserTaskState state,
+        bool suppressCancellationAnnouncement) =>
+        state != BrowserTaskState.Cancelled || !suppressCancellationAnnouncement;
+
+    internal static bool IsMissingTaskTabError(string error) =>
+        !string.IsNullOrWhiteSpace(error)
+        && (error.Contains("No tab with id", StringComparison.OrdinalIgnoreCase)
+            || error.Contains(
+                "tab is not owned by this browser task",
+                StringComparison.OrdinalIgnoreCase));
+
+    internal static bool ShouldRecoverMissingTaskTab(
+        string actionType,
+        string error,
+        bool recoveryAlreadyAttempted) =>
+        !recoveryAlreadyAttempted
+        && actionType is "navigate" or "open_tab"
+        && IsMissingTaskTabError(error);
+
+    internal static string ClassifyIntervention(string reason)
+    {
+        var value = reason ?? "";
+        if (Regex.IsMatch(value, @"\b(?:captcha|verification challenge)\b", RegexOptions.IgnoreCase))
+            return "captcha_required";
+        if (Regex.IsMatch(value, @"\b(?:sign[- ]?in|log[- ]?in|login|authenticated?)\b", RegexOptions.IgnoreCase))
+            return "login_required";
+        if (Regex.IsMatch(value, @"\b(?:confirm|confirmation|approve|approval)\b", RegexOptions.IgnoreCase))
+            return "confirmation_required";
+        if (Regex.IsMatch(value, @"\b(?:permission|allow access|grant access)\b", RegexOptions.IgnoreCase))
+            return "permission_required";
+        if (Regex.IsMatch(value, @"\b(?:which|choose|ambiguous|specify|provide the (?:url|target))\b", RegexOptions.IgnoreCase))
+            return "ambiguous_target";
+        if (Regex.IsMatch(value, @"\b(?:unsupported|not supported|cannot automate)\b", RegexOptions.IgnoreCase))
+            return "unsupported_interaction";
+        return "manual_step";
+    }
+
+    internal static string BuildInterventionSpeech(string reason)
+    {
+        return BuildInterventionSpeech(BuildRequiredIntervention(reason));
+    }
+
+    internal static string BuildInterventionSpeech(BrowserUserIntervention intervention)
+    {
+        var detail = BuildInterventionDisplay(intervention);
+        var next = intervention?.CanSkip == true
+            ? "You can provide it, say skip to leave this optional item, or cancel browser automation. The same task will continue."
+            : "Complete or provide it, then say continue to resume the same task, or say cancel browser automation.";
+        return $"Browser automation is paused. {detail} {next}";
+    }
+
+    internal static string BuildInterventionDisplay(BrowserUserIntervention intervention)
+    {
+        var missing = string.IsNullOrWhiteSpace(intervention?.Missing)
+            ? "Complete the required step in Chrome."
+            : Short(intervention.Missing.Trim(), 320);
+        var explanation = string.IsNullOrWhiteSpace(intervention?.Explanation)
+            ? ""
+            : $" Why: {Short(intervention.Explanation.Trim(), 260)}";
+        var requirement = intervention?.CanSkip == true
+            ? " This item is optional and may be skipped."
+            : intervention?.Required == true
+                ? " This item is required to continue safely."
+                : "";
+        return $"{missing}{explanation}{requirement}";
+    }
+
+    private static BrowserUserIntervention CopyIntervention(
+        BrowserUserIntervention intervention) =>
+        intervention == null
+            ? null
+            : new BrowserUserIntervention
+            {
+                Kind = intervention.Kind,
+                Missing = intervention.Missing,
+                Explanation = intervention.Explanation,
+                Required = intervention.Required,
+                CanSkip = intervention.CanSkip,
+            };
+
+    internal static bool ShouldForceVisualRecovery(
+        string request,
+        BrowserPageSnapshot page,
+        BrowserPlannerDecision decision,
+        bool visionRecoveryAlreadyUsed)
+    {
+        if (visionRecoveryAlreadyUsed
+            || page?.Controls?.Length != 0
+            || decision == null
+            || !BrowserAutomationTaskClassifier.RequiresPageMutation(request))
+        {
+            return false;
+        }
+
+        var proposedTerminalOrBlocker = decision.Done
+            || decision.NeedsUserAction
+            || decision.Action?.Type is "done" or "needs_user_action";
+        if (!proposedTerminalOrBlocker)
+            return false;
+
+        var blocker = $"{decision.UserAction} {decision.Evaluation}";
+        return !Regex.IsMatch(
+            blocker,
+            @"\b(?:captcha|password|passcode|otp|two[- ]factor|2fa|sign[- ]?in|log[- ]?in|payment|card|bank|security challenge)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static string SafeDomain(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : "";
+
+    internal static string FriendlyError(Exception ex) => ex switch
+    {
+        PaidApiException { StatusCode: System.Net.HttpStatusCode.PaymentRequired } =>
+            "Browser Automation could not reserve enough usable credits. Check available and reserved credits in Account & Billing. Chrome and its tabs were left open.",
+        PaidApiException { StatusCode: System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden } =>
+            "Browser Automation could not authorize the paid request. Refresh Account & Billing to check your session and plan. Chrome and its tabs were left open.",
+        TimeoutException => "The browser task timed out. Chrome and its tabs were left open.",
+        HttpRequestException => "The browser planner is temporarily unavailable. Chrome and its tabs were left open.",
+        InvalidOperationException => Short(ex.Message, 240),
+        _ => "The browser task stopped safely because an unexpected error occurred.",
+    };
+
+    private static string Short(string value, int length) =>
+        string.IsNullOrWhiteSpace(value) || value.Length <= length
+            ? value ?? ""
+            : value[..length];
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+        try { CancelAsync("Jarvis is closing").GetAwaiter().GetResult(); } catch { }
+        _planner.Dispose();
+        _bridge.Dispose();
+    }
+
+    internal sealed class AsyncPauseGate
+    {
+        private readonly object _lock = new();
+        private TaskCompletionSource _resume = Completed();
+
+        public void Pause()
+        {
+            lock (_lock)
+            {
+                if (_resume.Task.IsCompleted)
+                    _resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+        }
+
+        public void Resume()
+        {
+            lock (_lock)
+                _resume.TrySetResult();
+        }
+
+        public Task WaitAsync(CancellationToken token)
+        {
+            Task task;
+            lock (_lock)
+                task = _resume.Task;
+            return task.WaitAsync(token);
+        }
+
+        private static TaskCompletionSource Completed()
+        {
+            var source = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            source.SetResult();
+            return source;
+        }
+    }
+}

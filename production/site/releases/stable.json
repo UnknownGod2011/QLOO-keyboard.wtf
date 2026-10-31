@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "channel": "stable",
+  "version": "1.4.21",
+  "minimumVersion": "1.4.17",
+  "publishedAt": "2026-10-07T11:55:30.9114141+00:00",
+  "packageUrl": "https://github.com/UnknownGod2011/keyboard.wtf/releases/download/v1.4.21/keyboard-wtf-setup.exe",
+  "sha256": "45c2e2d08444de1a9293bb7fe116c665697e1054c3d236a9f6616204a0b3d412",
+  "sizeBytes": 89451689,
+  "releaseNotes": "# keyboard.wtf 1.4.21 \u2014 prepared release\n\nThis is a new package identity; the accepted 1.4.20 installer remains a rollback.\nPublication and installed acceptance are separate gates, not implied by this file.\n\n- Adds Luma\u0027s optional companion presentation to Settings and the prepared\n  website, with accessible pause/hide/mute controls and session cleanup. Luma\u0027s\n  credentials and voice sessions are separate from Jarvis. Public Voice remains\n  unavailable until its protected hosted credential/quota gates pass.\n- Checks and provisions the supported Microsoft Visual C\u002B\u002B x64 runtime when\n  needed. Microsoft\u0027s licence/UAC and a required restart are handled explicitly;\n  silent upgrades do not bypass them. No Python, Node or separate .NET setup is\n  required for end users.\n- The reviewed backend separates conservative Live spending safeguards from\n  authoritative customer settlement. Unknown interrupted usage is not guessed\n  into a charge; a bounded, audited company-loss policy applies only to newly\n  enrolled sessions after its waiting period. Historical holds are not silently\n  rewritten. Backend activation remains separately verified.\n\nExisting accepted Jarvis conversation, selected-text translation, screen context,\nBA, Smart Writing, routing, saved items and Store Helper 2.1.28 behavior are not\nredesigned by these desktop changes. Prices and models are unchanged.\n\nEarly launch uses an unsigned Windows installer and manual updates. Fresh-PC/VM\ntesting was owner-waived; code, package and current-PC checks do not constitute\nindependent clean-machine proof. Verify the official download/checksum and never\ndisable protection or bypass malware warnings.\n",
+  "keyId": "kwt-release-2026-01",
+  "signature": "ZYZn4BvTk9NQ/pKk5LvchZyiw3oVUaXAR3gWIPXp10TmUkvHuPKx1aHVxnrfowV3ZVNVuHn2jAkU\u002BdM3tlvNHg=="
+}

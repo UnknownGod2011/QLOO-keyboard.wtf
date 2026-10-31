@@ -1,0 +1,19 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connector development fixture — NOT real accounts</title><link rel="stylesheet" href="/connectors-panel.css"><style>html{--bg:#fff;--text:#111;--muted:#666;--border:#ddd;background:var(--bg);color:var(--text);font:15px system-ui}html[data-theme=dark]{--bg:#090909;--text:#eee;--muted:#aaa;--border:#333}body{margin:0}.fixture-controls{display:flex;flex-wrap:wrap;gap:8px;margin:15px 0}.fixture-controls button{font:inherit;padding:7px}#fixture-warning{font-size:12px;color:var(--muted)}</style></head><body><main class="connector-page"><p id="fixture-warning">Development fixture. No real OAuth, provider, account or billing requests.</p><h1>Connectors</h1><div class="fixture-controls"><button id="theme">Theme</button><button id="failure">API failure</button><button id="reset">Account switch</button><button id="late">Late response</button></div><div id="panel"></div></main><script type="module">
+import { ConnectorPanel } from '/connectors-panel.js';
+const catalog = await fetch('/__fixture-catalog').then(r=>r.json());
+let accounts=[{accountId:'a'.repeat(32),family:'google',label:'personal@example.test',state:'connected',isDefault:true},{accountId:'b'.repeat(32),family:'google',label:'long-work-account-name@harmless-example-company.test',state:'connected',isDefault:false}];
+let fail=false,loads=0,connects=0,defaults=0,disconnects=0,opens=0,lateResolve;
+const panel = new ConnectorPanel(document.getElementById('panel'),{
+ assets:'/connector-icons/', load:async()=>{++loads;if(fail)throw Error('Service unavailable. No connected account has been confirmed.');if(lateResolve)return await new Promise(resolve=>lateResolve=resolve);return {enabled:true,catalog,accounts};},
+ connect:async(id)=>{++connects;return {attemptId:'c'.repeat(32),state:'connecting',redirectUrl:'https://example.test/oauth',expiresAt:new Date(Date.now()+600000).toISOString()};},
+ open:async()=>{++opens;},attempt:async()=>({state:'connected'}),
+ setDefault:async(id)=>{++defaults;accounts=accounts.map(a=>({...a,isDefault:a.accountId===id}));},
+ disconnect:async(id)=>{++disconnects;accounts=accounts.filter(a=>a.accountId!==id);}
+});
+document.querySelector('#theme').onclick=()=>document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';
+document.querySelector('#failure').onclick=()=>{fail=!fail;panel.refresh();};
+document.querySelector('#reset').onclick=()=>{accounts=[];panel.reset();panel.refresh();};
+document.querySelector('#late').onclick=()=>{lateResolve=true;panel.refresh();};
+window.fixture={panel,counts:()=>({loads,connects,defaults,disconnects,opens}),finishLate:()=>{const resolve=lateResolve;lateResolve=null;if(typeof resolve==='function')resolve({enabled:true,catalog,accounts:[{accountId:'f'.repeat(32),family:'google',label:'STALE ACCOUNT',state:'connected'}]});}};
+await panel.refresh();
+</script></body></html>

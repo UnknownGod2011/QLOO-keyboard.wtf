@@ -1,0 +1,363 @@
+using Google.Cloud.Firestore;
+using KeyboardWtf.Staging.Api.Configuration;
+using KeyboardWtf.Staging.Api.Domain;
+using Microsoft.Extensions.Options;
+
+namespace KeyboardWtf.Staging.Api.Services;
+
+public sealed class CatalogService : ICatalogService
+{
+    // RBI/FBIL reference was about INR 95.72 per USD on 2026-07-29.
+    // INR 100 is a deliberately versioned launch floor with a buffer. It is
+    // updated deliberately in server configuration, never fetched per request.
+    internal const long ConservativeUsdToInrPaise = 10_000;
+    internal const int MaximumProviderCostShareBasisPoints = 6_000;
+    private readonly FirestoreDb _db;
+    private readonly PaidSystemOptions _options;
+    private readonly IClock _clock;
+    private CatalogSnapshot? _cached;
+    private DateTimeOffset _cachedUntil;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    public CatalogService(FirestoreDb db, IOptions<PaidSystemOptions> options, IClock clock)
+    {
+        _db = db;
+        _options = options.Value;
+        _clock = clock;
+    }
+
+    public async Task<CatalogSnapshot> GetAsync(CancellationToken cancellationToken)
+    {
+        if (_cached is not null && _cachedUntil > _clock.UtcNow)
+            return _cached;
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_cached is not null && _cachedUntil > _clock.UtcNow)
+                return _cached;
+
+            var snapshot = await _db.Document("config/catalog").GetSnapshotAsync(cancellationToken);
+            _cached = snapshot.Exists ? FromDocument(snapshot) : BootstrapCatalog();
+            _cachedUntil = _clock.UtcNow.AddMinutes(2);
+            return _cached;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<CatalogProduct> GetProductAsync(
+        string sku,
+        CancellationToken cancellationToken,
+        bool allowPaymentCanary = false)
+    {
+        var catalog = await GetAsync(cancellationToken);
+        if (!allowPaymentCanary)
+            EnsurePaymentsEnabled(catalog);
+        return catalog.Products.FirstOrDefault(product =>
+                product.Enabled && string.Equals(product.Sku, sku, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException("The requested product is unavailable.");
+    }
+
+    internal static bool IsPaymentCanary(PaidSystemOptions options, string email) =>
+        !string.IsNullOrWhiteSpace(email)
+        && options.PaymentCanaryEmails.Contains(email, StringComparer.OrdinalIgnoreCase);
+
+    internal static bool IsAiCanary(PaidSystemOptions options, string email) =>
+        !string.IsNullOrWhiteSpace(email)
+        && options.AiCanaryEmails.Contains(email, StringComparer.OrdinalIgnoreCase);
+
+    internal static void EnsurePaymentsEnabled(CatalogSnapshot catalog)
+    {
+        if (catalog.PaymentsKillSwitch)
+            throw new InvalidOperationException(
+                catalog.PaymentsKillSwitchMessage ?? "Payments are temporarily unavailable.");
+    }
+
+    public long EstimateReservationCreditMicros(
+        PricingSnapshot pricing,
+        string prompt,
+        int maxOutputTokens,
+        long taskCapCreditMicros)
+    {
+        // One UTF-16 code unit per token is intentionally conservative across
+        // languages and structured payloads. Reservation is a budget guard,
+        // not a client-visible estimate; unused credit is released at settle.
+        var estimatedInput = Math.Max(1, prompt.Length);
+        var assumedUsage = new ProviderUsage(
+            estimatedInput,
+            Math.Clamp(maxOutputTokens, 1, 65_536),
+            0,
+            0,
+            0,
+            0,
+            estimatedInput + Math.Clamp(maxOutputTokens, 1, 65_536),
+            null,
+            Estimated: true, Known: false);
+        var (_, charge) = CalculateActualCost(pricing, assumedUsage);
+        var withSafetyMargin = checked(charge + Math.Max(10_000, charge / 4));
+        if (withSafetyMargin > taskCapCreditMicros)
+            throw new RequestBudgetExceededException();
+
+        // Reserve the complete caller-approved/server-bounded task budget. This
+        // prevents a manipulated low estimate or unusual tokenisation from
+        // creating an unreserved provider charge; unused credit is released by
+        // the authoritative settlement transaction.
+        return taskCapCreditMicros;
+    }
+
+    public (long ProviderCostUsdMicros, long ChargeCreditMicros) CalculateActualCost(
+        PricingSnapshot pricing,
+        ProviderUsage usage)
+    {
+        // Vertex promptTokenCount includes cachedContentTokenCount. Charge the
+        // cached portion at its discounted rate instead of charging it twice.
+        var cachedInput = Math.Clamp(usage.CachedInputTokens, 0, usage.InputTokens);
+        var inputAudio = Math.Clamp(usage.InputAudioTokens, 0, usage.InputTokens - cachedInput);
+        var regularInput = Math.Max(0, usage.InputTokens - cachedInput - inputAudio);
+        var providerMicros = decimal.Ceiling(
+            Cost(regularInput, pricing.InputUsdMicrosPerMillionTokens)
+            + Cost(usage.OutputTokens, pricing.OutputUsdMicrosPerMillionTokens)
+            + Cost(cachedInput, pricing.CachedInputUsdMicrosPerMillionTokens)
+            + Cost(inputAudio, pricing.InputAudioUsdMicrosPerMillionTokens)
+            + Cost(usage.ReasoningTokens, pricing.ReasoningUsdMicrosPerMillionTokens));
+        var providerCost = checked((long)providerMicros);
+        return (providerCost, CreditsForProviderCost(pricing, providerCost));
+    }
+
+    public (long ProviderCostUsdMicros, long ChargeCreditMicros) CalculateLiveActualCost(
+        PricingSnapshot pricing,
+        ProviderUsage usage,
+        int estimateSafetyBasisPoints)
+    {
+        var inputAudio = Math.Clamp(usage.InputAudioTokens, 0, usage.InputTokens);
+        var inputImage = Math.Clamp(
+            usage.InputImageTokens,
+            0,
+            Math.Max(0, usage.InputTokens - inputAudio));
+        var inputText = Math.Max(0, usage.InputTokens - inputAudio - inputImage);
+        var outputAudio = Math.Clamp(usage.OutputAudioTokens, 0, usage.OutputTokens);
+        var outputText = Math.Max(0, usage.OutputTokens - outputAudio);
+        var providerCost = checked((long)decimal.Ceiling(
+            Cost(inputText, pricing.LiveInputTextUsdMicrosPerMillionTokens)
+            + Cost(inputAudio, pricing.LiveInputAudioUsdMicrosPerMillionTokens)
+            + Cost(inputImage, pricing.LiveInputImageUsdMicrosPerMillionTokens)
+            + Cost(outputText, pricing.LiveOutputTextUsdMicrosPerMillionTokens)
+            + Cost(outputAudio, pricing.LiveOutputAudioUsdMicrosPerMillionTokens)
+            + Cost(usage.ReasoningTokens, pricing.LiveOutputTextUsdMicrosPerMillionTokens)));
+        var baseCharge = CreditsForProviderCost(pricing, providerCost);
+        var charge = usage.Estimated
+            ? checked((long)decimal.Ceiling(
+                (decimal)baseCharge * Math.Clamp(estimateSafetyBasisPoints, 10_000, 20_000) / 10_000m))
+            : baseCharge;
+        return (providerCost, Math.Max(1, charge));
+    }
+
+    private CatalogSnapshot FromDocument(DocumentSnapshot document)
+    {
+        var data = document.ToDictionary();
+        if (_options.DeploymentEnvironment == PaidDeploymentEnvironment.Production)
+            ValidateProductionDocument(data);
+        var pricingMap = data.TryGetValue("pricing", out var pricingValue)
+            ? pricingValue as IDictionary<string, object>
+            : null;
+        var pricing = pricingMap is null
+            ? BootstrapPricing()
+            : new PricingSnapshot(
+                GetString(pricingMap, "version", "vertex-gemini-2.5-live-fx100-2026-08-09"),
+                GetString(pricingMap, "model", _options.VertexModel),
+                GetLong(pricingMap, "inputUsdMicrosPerMillionTokens", 300_000),
+                GetLong(pricingMap, "outputUsdMicrosPerMillionTokens", 2_500_000),
+                GetLong(pricingMap, "cachedInputUsdMicrosPerMillionTokens", 30_000),
+                GetLong(pricingMap, "reasoningUsdMicrosPerMillionTokens", 2_500_000),
+                Math.Max(GetLong(pricingMap, "usdToInrPaise", ConservativeUsdToInrPaise), ConservativeUsdToInrPaise),
+                GetLong(pricingMap, "creditMicrosPerInrPaise", 10_000),
+                _clock.UtcNow,
+                GetLong(pricingMap, "inputAudioUsdMicrosPerMillionTokens", 1_000_000),
+                GetLong(pricingMap, "liveInputTextUsdMicrosPerMillionTokens", 500_000),
+                GetLong(pricingMap, "liveInputAudioUsdMicrosPerMillionTokens", 3_000_000),
+                GetLong(pricingMap, "liveInputImageUsdMicrosPerMillionTokens", 3_000_000),
+                GetLong(pricingMap, "liveOutputTextUsdMicrosPerMillionTokens", 2_000_000),
+                GetLong(pricingMap, "liveOutputAudioUsdMicrosPerMillionTokens", 12_000_000));
+
+        var products = new List<CatalogProduct>();
+        if (data.TryGetValue("products", out var productsValue)
+            && productsValue is IEnumerable<object> rows)
+        {
+            foreach (var row in rows.OfType<IDictionary<string, object>>())
+            {
+                products.Add(new CatalogProduct(
+                    GetString(row, "sku", ""),
+                    GetString(row, "kind", "credits"),
+                    GetString(row, "displayName", ""),
+                    GetLong(row, "amountMinor", 0),
+                    GetString(row, "currency", "INR"),
+                    GetLong(row, "creditMicros", 0),
+                    GetString(row, "razorpayPlanId", null),
+                    GetBool(row, "enabled", false)));
+            }
+        }
+
+        if (products.Count == 0 && _options.AllowBootstrapCatalog
+            && _options.DeploymentEnvironment != PaidDeploymentEnvironment.Production)
+            products.AddRange(BootstrapProducts());
+        if (_options.DeploymentEnvironment == PaidDeploymentEnvironment.Production)
+        {
+            foreach (var product in products)
+                ValidateProductionProduct(product, pricing);
+        }
+
+        return new CatalogSnapshot(
+            GetString(data, "version", "bootstrap-2026-08"),
+            products,
+            pricing,
+            GetBool(data, "killSwitch", false),
+            GetString(data, "killSwitchMessage", null),
+            GetBool(data, "paymentsKillSwitch", false),
+            GetString(data, "paymentsKillSwitchMessage", null));
+    }
+
+    private CatalogSnapshot BootstrapCatalog()
+    {
+        if (!_options.AllowBootstrapCatalog || _options.DeploymentEnvironment == PaidDeploymentEnvironment.Production)
+            throw new InvalidOperationException("The server catalog is not configured.");
+        return new CatalogSnapshot(
+            "vertex-gemini-2.5-live-fx100-2026-08-09",
+            BootstrapProducts(),
+            BootstrapPricing(),
+            false,
+            null);
+    }
+
+    private IReadOnlyList<CatalogProduct> BootstrapProducts()
+    {
+        var monthlyPlanId = Environment.GetEnvironmentVariable(
+            _options.DeploymentEnvironment == PaidDeploymentEnvironment.Production
+                ? "RAZORPAY_LIVE_MONTHLY_PLAN_ID"
+                : "RAZORPAY_TEST_MONTHLY_PLAN_ID");
+        return
+        [
+            new("credits_test_100", "credits", "100 staging credits", 4_900, "INR", 100_000_000, null, true),
+            new("monthly_test", "subscription", "Monthly staging plan", 9_900, "INR", 500_000_000,
+                monthlyPlanId, !string.IsNullOrWhiteSpace(monthlyPlanId)),
+        ];
+    }
+
+    private PricingSnapshot BootstrapPricing() => new(
+        "vertex-gemini-2.5-live-fx100-2026-08-09",
+        _options.VertexModel,
+        300_000,
+        2_500_000,
+        30_000,
+        2_500_000,
+        ConservativeUsdToInrPaise,
+        10_000,
+        _clock.UtcNow,
+        1_000_000,
+        500_000,
+        3_000_000,
+        3_000_000,
+        2_000_000,
+        12_000_000);
+
+    internal static void ValidateProductionDocument(IDictionary<string, object> data)
+    {
+        ProductionConfigurationValues.Text(data, "version");
+        ProductionConfigurationValues.Flag(data, "killSwitch");
+        ProductionConfigurationValues.Flag(data, "paymentsKillSwitch");
+        if (!data.TryGetValue("pricing", out var pricingValue)
+            || pricingValue is not IDictionary<string, object> pricing)
+            throw new InvalidOperationException("Production catalog has no explicit pricing map.");
+        ProductionConfigurationValues.Text(pricing, "version");
+        ProductionConfigurationValues.Text(pricing, "model");
+        foreach (var key in new[]
+        {
+            "inputUsdMicrosPerMillionTokens", "outputUsdMicrosPerMillionTokens",
+            "cachedInputUsdMicrosPerMillionTokens", "reasoningUsdMicrosPerMillionTokens",
+            "inputAudioUsdMicrosPerMillionTokens", "usdToInrPaise", "creditMicrosPerInrPaise",
+            "liveInputTextUsdMicrosPerMillionTokens", "liveInputAudioUsdMicrosPerMillionTokens",
+            "liveInputImageUsdMicrosPerMillionTokens", "liveOutputTextUsdMicrosPerMillionTokens",
+            "liveOutputAudioUsdMicrosPerMillionTokens",
+        })
+            ProductionConfigurationValues.Integer(pricing, key);
+
+        if (!data.TryGetValue("products", out var productsValue) || productsValue is not IEnumerable<object> products)
+            throw new InvalidOperationException("Production catalog has no explicit products array.");
+        var skus = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var value in products)
+        {
+            if (value is not IDictionary<string, object> row)
+                throw new InvalidOperationException("Production catalog contains a malformed product row.");
+            var sku = ProductionConfigurationValues.Text(row, "sku");
+            if (!skus.Add(sku))
+                throw new InvalidOperationException("Production catalog contains duplicate product SKUs.");
+            var kind = ProductionConfigurationValues.Text(row, "kind");
+            var enabled = ProductionConfigurationValues.Flag(row, "enabled");
+            ProductionConfigurationValues.Text(row, "displayName");
+            ProductionConfigurationValues.Text(row, "currency");
+            ProductionConfigurationValues.Integer(row, "amountMinor", enabled ? 1 : 0);
+            ProductionConfigurationValues.Integer(row, "creditMicros", enabled ? 1 : 0);
+            if (enabled && kind is not ("credits" or "subscription"))
+                throw new InvalidOperationException("Production catalog has an unsupported enabled product kind.");
+            if (enabled && kind == "subscription")
+                ProductionConfigurationValues.Text(row, "razorpayPlanId");
+        }
+    }
+
+    internal static void ValidateProductionProduct(
+        CatalogProduct product,
+        PricingSnapshot pricing)
+    {
+        if (!product.Enabled)
+            return;
+        if (product.Sku.Contains("test", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(product.Currency, "INR", StringComparison.Ordinal)
+            || product.AmountMinor <= 0
+            || product.CreditMicros <= 0)
+            throw new InvalidOperationException("The production catalog contains an invalid or staging product.");
+        if (string.Equals(product.Kind, "subscription", StringComparison.Ordinal)
+            && string.IsNullOrWhiteSpace(product.RazorpayPlanId))
+            throw new InvalidOperationException("A production subscription requires a Razorpay plan ID.");
+        var maximumProviderBudgetPaise = decimal.Floor(
+            product.AmountMinor * (decimal)MaximumProviderCostShareBasisPoints / 10_000m);
+        var allowanceProviderBudgetPaise = decimal.Ceiling(
+            product.CreditMicros / (decimal)pricing.CreditMicrosPerInrPaise);
+        if (allowanceProviderBudgetPaise > maximumProviderBudgetPaise)
+            throw new InvalidOperationException(
+                "The production allowance can consume more than the approved provider-cost share of revenue.");
+    }
+
+    private static decimal Cost(long tokens, long microsPerMillion) =>
+        tokens <= 0 ? 0 : (decimal)tokens * microsPerMillion / 1_000_000m;
+
+    private static long CreditsForProviderCost(PricingSnapshot pricing, long providerCostUsdMicros)
+    {
+        var inrPaise = decimal.Ceiling(
+            providerCostUsdMicros * (decimal)pricing.UsdToInrPaise / 1_000_000m);
+        var creditMicros = decimal.Ceiling(inrPaise * pricing.CreditMicrosPerInrPaise);
+        return Math.Max(1, checked((long)creditMicros));
+    }
+
+    private static string GetString(IDictionary<string, object> map, string key, string? fallback) =>
+        map.TryGetValue(key, out var value) && value is not null
+            ? Convert.ToString(value) ?? fallback ?? ""
+            : fallback ?? "";
+
+    private static long GetLong(IDictionary<string, object> map, string key, long fallback) =>
+        map.TryGetValue(key, out var value) && value is not null
+            ? Convert.ToInt64(value)
+            : fallback;
+
+    private static bool GetBool(IDictionary<string, object> map, string key, bool fallback) =>
+        map.TryGetValue(key, out var value) && value is not null
+            ? Convert.ToBoolean(value)
+            : fallback;
+}
+
+internal sealed class RequestBudgetExceededException : InvalidOperationException
+{
+    public RequestBudgetExceededException()
+        : base("The request's conservative maximum cost exceeds its approved task budget.") { }
+}

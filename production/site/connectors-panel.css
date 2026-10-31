@@ -1,0 +1,55 @@
+.connector-page,.connector-panel { --c-bg:var(--paper,var(--bg,#fff)); --c-text:var(--ink,var(--text,#111)); --c-muted:var(--muted,var(--text-dim,#686868)); --c-border:var(--line,var(--border,#dedede)); color:var(--c-text); }
+.connector-panel { max-width:680px; }
+.connector-panel * { box-sizing:border-box; }
+.connector-toolbar { display:flex; gap:10px; align-items:center; margin:18px 0 12px; }
+.connector-search { flex:1; min-width:0; padding:11px 13px; border:1px solid var(--c-border); border-radius:10px; background:transparent; color:inherit; font:inherit; }
+.connector-search:focus { outline:2px solid #719c8c; outline-offset:2px; }
+/* Scoped specificity also defeats the host's generic button hover/disabled
+   styles. The website and embedded Settings keep their own theme/layout. */
+.connector-page .connector-action,.connector-panel .connector-refresh,.connector-panel .connector-action { border:1px solid var(--c-border); background:transparent; color:var(--c-text); border-radius:9px; min-height:36px; padding:7px 11px; font:inherit; cursor:pointer; }
+:root .connector-page .connector-action:hover:not(:disabled),:root .connector-panel .connector-refresh:hover:not(:disabled),:root .connector-panel .connector-action:hover:not(:disabled),
+:root .connector-page .connector-action:active:not(:disabled),:root .connector-panel .connector-refresh:active:not(:disabled),:root .connector-panel .connector-action:active:not(:disabled) { background:color-mix(in srgb,var(--c-text) 7%,var(--c-bg)); color:var(--c-text); }
+:root .connector-page .connector-action:disabled,:root .connector-panel .connector-refresh:disabled,:root .connector-panel .connector-action:disabled { background:var(--c-bg); color:var(--c-text); cursor:wait; }
+:root[data-theme="dark"] .connector-page .connector-action:is(:hover,:active):not(:disabled),
+:root[data-theme="dark"] .connector-panel :is(.connector-action,.connector-refresh):is(:hover,:active):not(:disabled) { background:color-mix(in srgb,var(--c-text) 7%,var(--c-bg)); color:var(--c-text); }
+:root[data-theme="dark"] .connector-page .connector-action:disabled,
+:root[data-theme="dark"] .connector-panel :is(.connector-action,.connector-refresh):disabled,
+:root[data-theme="dark"] .connector-page .connector-action:disabled:is(:hover,:active),
+:root[data-theme="dark"] .connector-panel :is(.connector-action,.connector-refresh):disabled:is(:hover,:active) { background:var(--c-bg); color:var(--c-text); }
+.connector-action:focus-visible,.connector-refresh:focus-visible,.connector-row:focus-visible { outline:2px solid #719c8c; outline-offset:2px; }
+.connector-action[disabled] { cursor:wait; opacity:.6; }
+.connector-status { min-height:24px; font-size:13px; line-height:1.5; color:var(--c-muted); margin:10px 0; }
+.connector-list { max-height:min(58vh,540px); overflow:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:var(--c-border) transparent; padding:2px 5px 8px 2px; }
+.connector-list::-webkit-scrollbar { width:5px; }
+.connector-list::-webkit-scrollbar-thumb { background:var(--c-border); border-radius:5px; }
+.connector-group-label { font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--c-muted); margin:20px 2px 8px; font-weight:600; }
+.connector-row { display:flex; align-items:center; gap:13px; padding:12px 10px; border-bottom:1px solid var(--c-border); }
+.connector-logo { width:25px; height:25px; flex:none; object-fit:contain; }
+html[data-theme="dark"] .connector-logo { filter:invert(1); }
+.connector-name { flex:1; min-width:0; font-size:14px; font-weight:550; color:var(--c-text); }
+.connector-panel .connector-info { flex:none; width:30px; height:30px; min-height:30px; padding:0; border-color:transparent; color:var(--c-muted); font-size:18px; }
+.connector-help { padding:12px 12px 14px 48px; color:var(--c-text); background:color-mix(in srgb,var(--c-text) 3%,var(--c-bg)); border-bottom:1px solid var(--c-border); }
+.connector-help[hidden] { display:none!important; }
+.connector-capabilities { margin:6px 0 0; padding-left:18px; font-size:12px; line-height:1.7; color:var(--c-text); }
+.connector-badge { display:block; font-size:11px; font-weight:400; color:var(--c-muted); margin-top:3px; }
+.connector-panel .connector-symbol { width:35px; height:35px; padding:0; font-size:22px; line-height:1; }
+.connector-panel .connector-symbol.connected { color:#367958; }
+html[data-theme="dark"] .connector-panel .connector-symbol.connected { color:#8ec8a5; }
+.connector-symbol.pending { font-size:18px; }
+.connector-manage { padding:12px 12px 16px 48px; border-bottom:1px solid var(--c-border); }
+.connector-account { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0; }
+.connector-account-identity { flex:1 1 170px; min-width:0; font-size:12px; overflow-wrap:anywhere; }
+.connector-account-state { display:block; font-size:11px; color:var(--c-muted); margin-top:4px; }
+.connector-manage .connector-action { font-size:11px; min-height:31px; }
+.connector-description { font-size:12px; color:var(--c-muted); line-height:1.5; margin:0 0 9px; }
+.connector-family-note { font-size:11px; }
+.connector-empty { color:var(--c-muted); font-size:13px; padding:30px 12px; text-align:center; }
+.connector-page { max-width:760px; margin:40px auto; padding:0 24px 48px; }
+.connector-page h1 { font-size:32px; letter-spacing:-.04em; margin:0 0 10px; }
+.connector-page-lead { color:var(--c-muted); font-size:15px; max-width:570px; line-height:1.6; }
+.connector-identity { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:18px 0; font-size:13px; }
+.connector-identity span { flex:1; min-width:0; overflow-wrap:anywhere; }
+@media(max-width:480px) { .connector-page { margin:26px auto; padding:0 16px 32px; } .connector-manage { padding-left:12px; } .connector-account { gap:7px; } .connector-list { max-height:62vh; } }
+@media(prefers-reduced-motion:reduce) { .connector-panel * { scroll-behavior:auto!important; } }
+/* Explicit display rules must not override native hidden auth/return states. */
+.connector-page [hidden], .connector-panel[hidden] { display: none !important; }

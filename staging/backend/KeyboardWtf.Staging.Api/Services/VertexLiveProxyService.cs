@@ -1,0 +1,1398 @@
+using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Google.Apis.Auth.OAuth2;
+using Grpc.Core;
+using KeyboardWtf.Staging.Api.Configuration;
+using KeyboardWtf.Staging.Api.Domain;
+using KeyboardWtf.Staging.Api.Infrastructure;
+using Microsoft.Extensions.Options;
+
+namespace KeyboardWtf.Staging.Api.Services;
+
+public interface IVertexAccessTokenProvider
+{
+    Task<string> GetAsync(CancellationToken cancellationToken);
+}
+
+public sealed class VertexAccessTokenProvider : IVertexAccessTokenProvider
+{
+    private readonly GoogleCredential _credential = GoogleCredential
+        .GetApplicationDefault()
+        .CreateScoped("https://www.googleapis.com/auth/cloud-platform");
+
+    public Task<string> GetAsync(CancellationToken cancellationToken) =>
+        _credential.UnderlyingCredential.GetAccessTokenForRequestAsync(
+            cancellationToken: cancellationToken);
+}
+
+public sealed class VertexLiveProxyService
+{
+    private const int MaxMessageBytes = 2 * 1024 * 1024;
+    private const int MaxToolDeclarations = 64;
+    private const int MaxSessionResumptionHandleCharacters = 8192;
+    private const string ServerSafetyInstruction =
+        "This is keyboard.wtf Jarvis. Follow the user's current request, but never expose credentials, " +
+        "bypass authentication or security controls, or claim a local action succeeded without a tool result. " +
+        "Passwords, OTPs, CAPTCHAs, payments, destructive actions, and public sends/submissions require explicit user control.";
+    private static readonly HashSet<string> AllowedVoiceNames = new(StringComparer.Ordinal)
+    {
+        "Kore", "Orus", "Puck", "Charon", "Aoede", "Zephyr", "Leda", "Fenrir",
+    };
+    private static readonly HashSet<string> AllowedToolNames = new(StringComparer.Ordinal)
+    {
+        "open_app", "open_keyboard_wtf_settings", "open_folder", "open_path", "open_url", "window_action", "browser_action",
+        "web_search", "browser_automation", "browser_automation_status", "browser_automation_control",
+        "get_desktop_context", "get_clipboard_text", "get_selected_text", "replace_selected_text",
+        "type_text", "press_key", "search_files", "save_note", "add_todo", "list_todos",
+        "complete_todo", "set_timer", "cancel_timer", "list_timers", "system_control", "system_status",
+        "play_media", "open_service_page", "open_camera", "take_photo", "take_screenshot", "inspect_screen",
+        "virtual_desktop_action", "windows_recording_action", "create_workflow", "remember_routine", "edit_workflow",
+        "list_workflows", "run_workflow", "delete_workflow", "remember_app_alias", "remember_path_alias",
+        "remember_link_alias", "remember_workflow_alias", "list_learned_mappings", "forget_learned_mapping",
+        "set_browser_preference", "request_sensitive_action", "confirm_sensitive_action",
+        "cancel_sensitive_action", "open_gmail_draft", "prepare_whatsapp_message", "copy_text",
+        "remember_intent", "recall_intent", "list_intent_memory", "forget_intent_memory", "end_conversation",
+        "connector_resolve", "connector_execute", "connector_control",
+    };
+    private readonly IAccountStore _store;
+    private readonly ICatalogService _catalog;
+    private readonly IModelRoutingService _routing;
+    private readonly IVertexAccessTokenProvider _tokens;
+    private readonly PaidSystemOptions _options;
+    private readonly ILogger<VertexLiveProxyService> _logger;
+
+    public VertexLiveProxyService(
+        IAccountStore store,
+        ICatalogService catalog,
+        IModelRoutingService routing,
+        IVertexAccessTokenProvider tokens,
+        IOptions<PaidSystemOptions> options,
+        ILogger<VertexLiveProxyService> logger)
+    {
+        _store = store;
+        _catalog = catalog;
+        _routing = routing;
+        _tokens = tokens;
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    public async Task RunAsync(
+        HttpContext context,
+        CallerIdentity caller,
+        CancellationToken cancellationToken)
+    {
+        if (!_options.Enabled)
+            throw new InvalidOperationException("Paid AI is temporarily disabled.");
+        if (!context.WebSockets.IsWebSocketRequest)
+            throw new ArgumentException("A WebSocket upgrade is required.");
+        var requestId = context.Request.Query["requestId"].ToString();
+        if (!IsSafeRequestId(requestId))
+            throw new ArgumentException("A stable live-session request ID is required.");
+
+        var catalog = await _catalog.GetAsync(cancellationToken);
+        if (catalog.KillSwitch && !CatalogService.IsAiCanary(_options, caller.Email))
+            throw new InvalidOperationException(catalog.KillSwitchMessage ?? "Paid AI is temporarily unavailable.");
+        var route = await _routing.ResolveAsync(
+            "live-audio",
+            $"{caller.UserId}:{requestId}",
+            cancellationToken);
+        ClientCompatibility.Require(
+            context.Request.Headers[ClientCompatibility.DesktopVersionHeader].ToString(),
+            route.MinimumDesktopVersion);
+        var livePolicy = route.LivePolicy
+            ?? throw new InvalidOperationException("The Live route has no server-owned session policy.");
+        var selectedCandidate = route.Candidates[0];
+        AiUsageService.RequireCreditDenomination(catalog.Pricing, selectedCandidate.Pricing);
+        await _store.EnsureAccountAsync(caller, cancellationToken);
+        var initialReservation = Math.Min(
+            livePolicy.ReservationWindowCreditMicros,
+            livePolicy.MaxSessionCostCreditMicros);
+        var reservation = await _store.ReserveAsync(
+            caller,
+            requestId,
+            selectedCandidate.Model,
+            selectedCandidate.Pricing.Version,
+            initialReservation,
+            livePolicy.MaxSessionCostCreditMicros,
+            _options.MaxRequestsPerMinutePerUser,
+            _options.MaxConcurrentRequestsPerUser,
+            _options.GlobalDailyCreditMicrosCap,
+            cancellationToken,
+            route.Name,
+            livePolicy.MaxSessionSeconds);
+        if (!reservation.Created)
+            throw new InvalidOperationException("This live-session request ID has already been used.");
+
+        ClientWebSocket? provider = null;
+        WebSocket? client = null;
+        var usage = new LiveUsageAccumulator(_options.LiveSessionMaxTrafficBytes);
+        var providerConnected = false;
+        var providerDispatchStarted = false;
+        var outcome = "cancelled";
+        try
+        {
+            var accessToken = await _tokens.GetAsync(cancellationToken);
+            provider = new ClientWebSocket();
+            provider.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+            provider.Options.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+            provider.Options.SetRequestHeader("Content-Type", "application/json");
+            var endpoint = new Uri(
+                $"wss://{selectedCandidate.Location}-aiplatform.googleapis.com/ws/" +
+                "google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent");
+            await provider.ConnectAsync(endpoint, cancellationToken);
+            providerConnected = true;
+
+            client = await context.WebSockets.AcceptWebSocketAsync();
+            var setup = await ReceiveJsonAsync(
+                client,
+                MaxMessageBytes,
+                acceptBinary: false,
+                cancellationToken);
+            var rewritten = RewriteSetup(
+                setup,
+                $"projects/{_options.ProjectId}/locations/{selectedCandidate.Location}/" +
+                $"publishers/google/models/{selectedCandidate.Model}");
+            usage.ObserveClient(rewritten);
+            await _store.MarkReservationProviderStartedAsync(
+                caller.UserId,
+                requestId,
+                cancellationToken);
+            providerDispatchStarted = true;
+            await SendTextAsync(provider, rewritten, cancellationToken);
+
+            using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            session.CancelAfter(TimeSpan.FromSeconds(livePolicy.MaxSessionSeconds));
+            using var accountingGate = new SemaphoreSlim(1, 1);
+            long reservedCreditMicros = reservation.Reservation.ReservedCreditMicros;
+            long budgetChargeHighWater = 0;
+            long CurrentBudgetCharge()
+            {
+                var projectedCharge = LiveBudgetProjection.Charge(
+                    _catalog, selectedCandidate.Pricing, usage.BudgetView(),
+                    _options.LiveEstimateSafetyBasisPoints);
+                Max(ref budgetChargeHighWater, projectedCharge);
+                var currentCharge = Interlocked.Read(ref budgetChargeHighWater);
+                if (currentCharge >= livePolicy.MaxSessionCostCreditMicros)
+                    throw new InvalidOperationException("The Live session reached its approved server budget.");
+                return currentCharge;
+            }
+            async Task EnsureBudgetAsync(CancellationToken token)
+            {
+                var currentCharge = CurrentBudgetCharge();
+                if (currentCharge <= 0)
+                    return;
+                var target = RequiredLiveReservation(
+                    currentCharge,
+                    livePolicy.ReservationWindowCreditMicros,
+                    livePolicy.MaxSessionCostCreditMicros);
+                if (target <= Interlocked.Read(ref reservedCreditMicros))
+                    return;
+                var ensured = await RunShutdownSafeAccountingAsync(accountingGate, async accountingToken =>
+                {
+                    // Both WebSocket relay directions observe usage. Recheck
+                    // after entering the gate so only one rolling-reservation
+                    // extension can transact for this session at a time.
+                    var refreshedTarget = RequiredLiveReservation(CurrentBudgetCharge(),
+                        livePolicy.ReservationWindowCreditMicros, livePolicy.MaxSessionCostCreditMicros);
+                    if (refreshedTarget <= Interlocked.Read(ref reservedCreditMicros))
+                        return Interlocked.Read(ref reservedCreditMicros);
+                    return await _store.EnsureReservationCapacityAsync(
+                        caller.UserId,
+                        requestId,
+                        refreshedTarget,
+                        accountingToken);
+                }, token);
+                Max(ref reservedCreditMicros, ensured);
+            }
+
+            var toProvider = RelayAsync(client, provider, acceptBinary: false, async (message, token) =>
+            {
+                usage.ObserveClient(message);
+                await EnsureBudgetAsync(token);
+            }, session.Token);
+            var toClient = RelayAsync(provider, client, acceptBinary: true, async (message, token) =>
+            {
+                usage.ObserveProvider(message);
+                await EnsureBudgetAsync(token);
+            }, session.Token);
+            var checkpoints = CheckpointUsageAsync(
+                caller.UserId,
+                requestId,
+                usage,
+                selectedCandidate.Pricing,
+                accountingGate,
+                session.Token);
+            // A completed model turn is a normal idle point inside one logical
+            // conversation, not a reason to tear down a healthy socket. The old
+            // post-turn idle task deliberately closed every connection after 30
+            // seconds and forced the desktop through visible reconnects. End a
+            // physical session only when either peer closes, the rolling budget
+            // fails, or the bounded emergency lifetime expires.
+            await Task.WhenAny(toProvider, toClient, checkpoints);
+            session.Cancel();
+            await IgnoreExpectedRelayEndAsync(toProvider);
+            await IgnoreExpectedRelayEndAsync(toClient);
+            await IgnoreExpectedCheckpointEndAsync(checkpoints);
+            outcome = cancellationToken.IsCancellationRequested ? "cancelled" : "completed";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            outcome = "cancelled";
+        }
+        catch (OperationCanceledException)
+        {
+            outcome = "timeout";
+        }
+        catch (Exception exception)
+        {
+            outcome = "provider_failed";
+            _logger.LogWarning(
+                exception,
+                "Vertex Live session failed for request {RequestHash} after connection={ProviderConnected}",
+                Crypto.Sha256(requestId)[..12],
+                providerConnected);
+            await CloseQuietlyAsync(client, WebSocketCloseStatus.InternalServerError, "Live session ended.");
+            if (client is null)
+                throw;
+        }
+        finally
+        {
+            await CloseQuietlyAsync(provider, WebSocketCloseStatus.NormalClosure, "Session ended.");
+            provider?.Dispose();
+            if (_options.ManagedLiveUnknownUsageLossEnabled && providerDispatchStarted)
+            {
+                try
+                {
+                    await _store.RecordManagedLiveSessionClosedAsync(caller.UserId, requestId,
+                        CancellationToken.None);
+                }
+                catch (Exception exception)
+                {
+                    // Missing closure proof prevents a future loss disposition;
+                    // it must never prevent exact settlement or invent final usage.
+                    _logger.LogWarning(exception, "Managed Live closure marker failed for {RequestHash}",
+                        Crypto.Sha256(requestId)[..12]);
+                }
+            }
+            try
+            {
+                var measured = usage.Snapshot();
+                switch (DetermineAccountingDisposition(providerDispatchStarted, measured.TotalTokens,
+                    ProviderUsageMetadata.IsAuthoritative(measured)))
+                {
+                case LiveAccountingDisposition.Settle:
+                {
+                    var (providerCost, charge) = _catalog.CalculateLiveActualCost(
+                        selectedCandidate.Pricing,
+                        measured,
+                        _options.LiveEstimateSafetyBasisPoints);
+                    try
+                    {
+                        await _store.RecordProviderCompletionAsync(
+                            caller.UserId,
+                            requestId,
+                            measured,
+                            charge,
+                            providerCost,
+                            outcome,
+                            CancellationToken.None,
+                            selectedCandidate.Model,
+                            selectedCandidate.Pricing.Version);
+                    }
+                    catch (Exception exception)
+                    {
+                        await _store.MarkReservationForReconciliationAsync(
+                            caller.UserId,
+                            requestId,
+                            "live_provider_completion_evidence_write_failed",
+                            CancellationToken.None);
+                        throw new InvalidOperationException(
+                            "Live usage was incurred but its durable accounting evidence is pending reconciliation.",
+                            exception);
+                    }
+                    Exception? settlementError = null;
+                    for (var attempt = 0; attempt <= _options.MaxRetries; attempt++)
+                    {
+                        try
+                        {
+                            await _store.SettleAsync(
+                                caller.UserId,
+                                requestId,
+                                measured,
+                                charge,
+                                providerCost,
+                                outcome,
+                                CancellationToken.None);
+                            settlementError = null;
+                            break;
+                        }
+                        catch (Exception exception)
+                        {
+                            settlementError = exception;
+                            if (attempt < _options.MaxRetries)
+                                await Task.Delay(TimeSpan.FromMilliseconds(150 * (attempt + 1)));
+                        }
+                    }
+                    if (settlementError is not null)
+                        throw new InvalidOperationException(
+                            "Live usage was incurred but its accounting settlement is pending reconciliation.",
+                            settlementError);
+                    break;
+                }
+                case LiveAccountingDisposition.Reconcile:
+                {
+                    // A successful provider connection plus dispatched setup can
+                    // still be billable even when the Live API supplies no usage
+                    // metadata (for example when the client disconnects before a
+                    // model turn).  Do not issue an automatic refund here: mark
+                    // the reservation for the maintenance resolver, which keeps
+                    // the ledger auditable and releases it only with proof that
+                    // no billable provider work occurred.
+                    await _store.MarkReservationForReconciliationAsync(
+                        caller.UserId,
+                        requestId,
+                        "live_provider_dispatch_without_usage_metadata",
+                        CancellationToken.None);
+                    LogIncompleteAccounting(_logger, requestId, usage.CloseoutEvidence(), measured);
+                    break;
+                }
+                default:
+                {
+                    await _store.ReleaseReservationAsync(
+                        caller.UserId,
+                        requestId,
+                        outcome,
+                        CancellationToken.None);
+                    break;
+                }
+                }
+            }
+            finally
+            {
+                // Finish the authoritative slot mutation before acknowledging
+                // the close to the desktop. The next sequential physical
+                // connection can then reserve immediately instead of racing an
+                // old session that is still settling and surfacing HTTP 409.
+                await CloseQuietlyAsync(client, WebSocketCloseStatus.NormalClosure, "Session ended.");
+                client?.Dispose();
+            }
+        }
+    }
+
+    internal static LiveAccountingDisposition DetermineAccountingDisposition(
+        bool providerDispatchStarted,
+        long measuredTotalTokens) => DetermineAccountingDisposition(providerDispatchStarted, measuredTotalTokens, measuredTotalTokens > 0);
+
+    internal static LiveAccountingDisposition DetermineAccountingDisposition(
+        bool providerDispatchStarted, long measuredTotalTokens, bool knownUsage) =>
+        measuredTotalTokens >= 0 && knownUsage
+            ? LiveAccountingDisposition.Settle
+            : providerDispatchStarted
+                ? LiveAccountingDisposition.Reconcile
+                : LiveAccountingDisposition.Release;
+
+    internal static void LogIncompleteAccounting(
+        ILogger<VertexLiveProxyService> logger,
+        string requestId,
+        LiveUsageCloseoutEvidence evidence,
+        ProviderUsage measured)
+    {
+        try
+        {
+            logger.LogWarning(
+            new EventId(4401, "LiveAccountingPending"),
+            "Vertex Live accounting pending: requestHash={RequestHash} " +
+            "acceptedMetadata={AcceptedMetadata} rejectedMetadata={RejectedMetadata} " +
+            "inputGeneration={InputGeneration} coveredInputGeneration={CoveredInputGeneration} " +
+            "outputGeneration={OutputGeneration} coveredOutputGeneration={CoveredOutputGeneration} " +
+            "inputAudioBytes={InputAudioBytes} outputAudioBytes={OutputAudioBytes} " +
+            "inputTokens={InputTokens} outputTokens={OutputTokens} totalTokens={TotalTokens} " +
+            "inputAudioTokens={InputAudioTokens} outputAudioTokens={OutputAudioTokens} " +
+            "known={Known} estimated={Estimated}",
+            Crypto.Sha256(requestId)[..12],
+            evidence.AcceptedMetadata, evidence.RejectedMetadata,
+            evidence.InputGeneration, evidence.CoveredInputGeneration,
+            evidence.OutputGeneration, evidence.CoveredOutputGeneration,
+            evidence.InputAudioBytes, evidence.OutputAudioBytes,
+            measured.InputTokens, measured.OutputTokens, measured.TotalTokens,
+            measured.InputAudioTokens, measured.OutputAudioTokens,
+            measured.Known, measured.Estimated);
+        }
+        catch (Exception)
+        {
+            // Optional numerical diagnostics cannot change the already durable
+            // reconciliation/slot release or prevent the close handshake.
+        }
+    }
+
+    internal static long RequiredLiveReservation(
+        long currentChargeCreditMicros,
+        long windowCreditMicros,
+        long sessionCapCreditMicros)
+    {
+        if (currentChargeCreditMicros < 0
+            || windowCreditMicros <= 0
+            || sessionCapCreditMicros <= 0)
+            throw new ArgumentOutOfRangeException(nameof(currentChargeCreditMicros));
+        return Math.Min(
+            sessionCapCreditMicros,
+            checked(currentChargeCreditMicros + windowCreditMicros));
+    }
+
+    internal static string RewriteSetup(string json, string model)
+    {
+        if (Encoding.UTF8.GetByteCount(json) > MaxMessageBytes)
+            throw new ArgumentException("The Live setup is too large.");
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(json) as JsonObject
+                ?? throw new ArgumentException("The Live setup is invalid.");
+        }
+        catch (JsonException)
+        {
+            throw new ArgumentException("The Live setup is invalid.");
+        }
+        if (root.Count != 1 || root["setup"] is not JsonObject setup)
+            throw new ArgumentException("The first Live message must be setup.");
+
+        var voiceName = ReadVoiceName(setup);
+        var clientInstruction = ReadSystemInstruction(setup);
+        var tools = ValidateAndCloneTools(setup["tools"]);
+        var sessionResumption = ValidateSessionResumption(setup["sessionResumption"]);
+        var rewritten = new JsonObject
+        {
+            ["setup"] = new JsonObject
+            {
+                ["model"] = model,
+                ["generationConfig"] = new JsonObject
+                {
+                    ["responseModalities"] = new JsonArray("AUDIO"),
+                    ["speechConfig"] = new JsonObject
+                    {
+                        ["voiceConfig"] = new JsonObject
+                        {
+                            ["prebuiltVoiceConfig"] = new JsonObject
+                            {
+                                ["voiceName"] = voiceName,
+                            },
+                        },
+                    },
+                },
+                ["tools"] = tools,
+                // Transcripts are needed by the current desktop for turn state
+                // and visible feedback. Their presence is controlled here, not
+                // by a modified desktop client.
+                ["inputAudioTranscription"] = new JsonObject(),
+                ["outputAudioTranscription"] = new JsonObject(),
+                ["sessionResumption"] = sessionResumption,
+                // Long logical conversations are resumed across sequential
+                // physical connections. Keep the provider context bounded so
+                // continuity does not cause unbounded token growth.
+                ["contextWindowCompression"] = new JsonObject
+                {
+                    ["slidingWindow"] = new JsonObject(),
+                },
+                ["realtimeInputConfig"] = new JsonObject
+                {
+                    ["automaticActivityDetection"] = new JsonObject
+                    {
+                        ["disabled"] = false,
+                        ["prefixPaddingMs"] = 80,
+                        ["silenceDurationMs"] = 550,
+                    },
+                },
+                ["systemInstruction"] = new JsonObject
+                {
+                    ["parts"] = new JsonArray(
+                        new JsonObject
+                        {
+                            ["text"] = ServerSafetyInstruction + "\n\nDesktop context:\n" + clientInstruction,
+                        }),
+                },
+            },
+        };
+        var outgoing = rewritten.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+        // Keep the transport bound after adding server-owned safety/context.
+        // The provider enforces its model's token limit, not a 20k char rule.
+        if (Encoding.UTF8.GetByteCount(outgoing) > MaxMessageBytes)
+            throw new ArgumentException("The Live setup is too large.");
+        return outgoing;
+    }
+
+    private static JsonObject ValidateSessionResumption(JsonNode? node)
+    {
+        if (node is null)
+            return new JsonObject();
+        if (node is not JsonObject config
+            || config.Any(pair => pair.Key != "handle"))
+        {
+            throw new ArgumentException("The Live session-resumption configuration is invalid.");
+        }
+
+        var result = new JsonObject();
+        if (config["handle"] is null)
+            return result;
+        if (config["handle"] is not JsonValue handleValue
+            || !handleValue.TryGetValue<string>(out var handle))
+        {
+            throw new ArgumentException("The Live session-resumption handle is invalid.");
+        }
+
+        handle = (handle ?? "").Trim();
+        if (handle.Length is <= 0 or > MaxSessionResumptionHandleCharacters)
+            throw new ArgumentException("The Live session-resumption handle is invalid.");
+        result["handle"] = handle;
+        return result;
+    }
+
+    private static string ReadVoiceName(JsonObject setup)
+    {
+        var voice = setup["generationConfig"]?["speechConfig"]?["voiceConfig"]?
+            ["prebuiltVoiceConfig"]?["voiceName"]?.GetValue<string>();
+        return voice is not null && AllowedVoiceNames.Contains(voice) ? voice : "Kore";
+    }
+
+    private static string ReadSystemInstruction(JsonObject setup)
+    {
+        var parts = setup["systemInstruction"]?["parts"] as JsonArray;
+        var text = parts?.FirstOrDefault()?["text"]?.GetValue<string>() ?? "";
+        return text;
+    }
+
+    private static JsonArray ValidateAndCloneTools(JsonNode? node)
+    {
+        if (node is not JsonArray tools || tools.Count == 0 || tools.Count > 4)
+            throw new ArgumentException("The Live tool catalog is missing or invalid.");
+
+        var result = new JsonArray();
+        var declarationCount = 0;
+        foreach (var toolNode in tools)
+        {
+            if (toolNode is not JsonObject tool
+                || tool.Count != 1
+                || tool["functionDeclarations"] is not JsonArray declarations)
+                throw new ArgumentException("The Live tool catalog contains an unsupported tool type.");
+            var clonedDeclarations = new JsonArray();
+            foreach (var declarationNode in declarations)
+            {
+                declarationCount++;
+                if (declarationCount > MaxToolDeclarations
+                    || declarationNode is not JsonObject declaration
+                    || declaration["name"] is not JsonValue nameValue
+                    || !nameValue.TryGetValue<string>(out var name)
+                    || !AllowedToolNames.Contains(name))
+                    throw new ArgumentException("The Live tool catalog contains an unapproved function.");
+                clonedDeclarations.Add(declaration.DeepClone());
+            }
+            result.Add(new JsonObject { ["functionDeclarations"] = clonedDeclarations });
+        }
+        return result;
+    }
+
+    private static async Task RelayAsync(
+        WebSocket source,
+        WebSocket destination,
+        bool acceptBinary,
+        Func<string, CancellationToken, Task> observe,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested
+               && source.State == WebSocketState.Open
+               && destination.State == WebSocketState.Open)
+        {
+            var message = await ReceiveJsonAsync(
+                source,
+                MaxMessageBytes,
+                acceptBinary,
+                cancellationToken);
+            await observe(message, cancellationToken);
+            await SendTextAsync(destination, message, cancellationToken);
+        }
+    }
+
+    private static async Task<string> ReceiveJsonAsync(
+        WebSocket socket,
+        int maxBytes,
+        bool acceptBinary,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[64 * 1024];
+        using var stream = new MemoryStream();
+        WebSocketReceiveResult result;
+        WebSocketMessageType? messageType = null;
+        do
+        {
+            result = await socket.ReceiveAsync(buffer, cancellationToken);
+            if (result.MessageType == WebSocketMessageType.Close)
+                throw new OperationCanceledException("The peer closed the Live session.", cancellationToken);
+            if (!IsAcceptedJsonMessageType(result.MessageType, acceptBinary))
+                throw new ArgumentException("The Live peer sent an unsupported WebSocket message type.");
+            if (messageType is not null && messageType != result.MessageType)
+                throw new ArgumentException("A fragmented Live message changed its WebSocket message type.");
+            messageType ??= result.MessageType;
+            if (stream.Length + result.Count > maxBytes)
+                throw new ArgumentException("A Live message exceeded the size limit.");
+            await stream.WriteAsync(buffer.AsMemory(0, result.Count), cancellationToken);
+        } while (!result.EndOfMessage);
+        try
+        {
+            return new UTF8Encoding(false, true).GetString(
+                stream.GetBuffer(),
+                0,
+                checked((int)stream.Length));
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new ArgumentException("A Live JSON message was not valid UTF-8.", exception);
+        }
+    }
+
+    internal static bool IsAcceptedJsonMessageType(
+        WebSocketMessageType messageType,
+        bool acceptBinary) =>
+        messageType == WebSocketMessageType.Text
+        || (acceptBinary && messageType == WebSocketMessageType.Binary);
+
+    private static Task SendTextAsync(
+        WebSocket socket,
+        string message,
+        CancellationToken cancellationToken) =>
+        socket.SendAsync(
+            Encoding.UTF8.GetBytes(message),
+            WebSocketMessageType.Text,
+            true,
+            cancellationToken);
+
+    private static async Task IgnoreExpectedRelayEndAsync(Task task)
+    {
+        try { await task; }
+        catch (OperationCanceledException) { }
+        catch (WebSocketException) { }
+    }
+
+    private static async Task IgnoreExpectedCheckpointEndAsync(Task task)
+    {
+        try { await task; }
+        catch (Exception exception) when (IsExpectedCheckpointEnd(exception)) { }
+    }
+
+    internal static bool IsExpectedCheckpointEnd(Exception exception) =>
+        exception is OperationCanceledException
+        || exception is RpcException { StatusCode: StatusCode.Cancelled };
+
+    private async Task CheckpointUsageAsync(
+        string userId,
+        string requestId,
+        LiveUsageAccumulator usage,
+        PricingSnapshot pricing,
+        SemaphoreSlim accountingGate,
+        CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(_options.LiveUsageCheckpointSeconds));
+        while (await timer.WaitForNextTickAsync(cancellationToken))
+        {
+            var measured = usage.Snapshot();
+            if (measured.TotalTokens <= 0)
+                continue;
+            var (providerCost, charge) = _catalog.CalculateLiveActualCost(
+                pricing,
+                measured,
+                _options.LiveEstimateSafetyBasisPoints);
+            await RunShutdownSafeAccountingAsync(accountingGate, async accountingToken =>
+            {
+                // Checkpoints touch the same reservation/account documents as
+                // rolling budget extensions. Serialize those mutations while
+                // leaving both media relay directions fully concurrent.
+                await _store.CheckpointReservationUsageAsync(
+                    userId,
+                    requestId,
+                    measured,
+                    charge,
+                    providerCost,
+                    accountingToken);
+            }, cancellationToken);
+        }
+    }
+
+    internal static async Task RunShutdownSafeAccountingAsync(
+        SemaphoreSlim gate,
+        Func<CancellationToken, Task> operation,
+        CancellationToken sessionCancellationToken)
+    {
+        await gate.WaitAsync(sessionCancellationToken);
+        try
+        {
+            // Once a durable Firestore accounting transaction has started, a
+            // media-session rollover must not cancel it mid-commit. A cancelled
+            // transaction response is ambiguous (the write may have committed)
+            // and can delay final settlement and Live-slot release. Firestore's
+            // own RPC/transaction deadlines remain the bounded failure policy.
+            await operation(CancellationToken.None);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    internal static async Task<T> RunShutdownSafeAccountingAsync<T>(
+        SemaphoreSlim gate,
+        Func<CancellationToken, Task<T>> operation,
+        CancellationToken sessionCancellationToken)
+    {
+        await gate.WaitAsync(sessionCancellationToken);
+        try
+        {
+            return await operation(CancellationToken.None);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    internal static async Task RunSerializedAccountingAsync(
+        SemaphoreSlim gate,
+        Func<Task> operation,
+        CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            await operation();
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    internal static async Task<T> RunSerializedAccountingAsync<T>(
+        SemaphoreSlim gate,
+        Func<Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            return await operation();
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private static async Task CloseQuietlyAsync(
+        WebSocket? socket,
+        WebSocketCloseStatus status,
+        string description)
+    {
+        if (socket is null)
+            return;
+        try
+        {
+            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+            {
+                // A peer that does not finish the close handshake must not hold
+                // the user's Live slot while durable accounting is waiting to
+                // settle. Disposal immediately follows this bounded attempt.
+                using var close = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                await socket.CloseAsync(status, description, close.Token);
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsSafeRequestId(string value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && value.Length is >= 16 and <= 120
+        && value.All(character => char.IsAsciiLetterOrDigit(character) || character is '_' or '-');
+
+    private static void Max(ref long target, long value)
+    {
+        long current;
+        do
+        {
+            current = Interlocked.Read(ref target);
+            if (value <= current)
+                return;
+        } while (Interlocked.CompareExchange(ref target, value, current) != current);
+    }
+}
+
+internal enum LiveAccountingDisposition
+{
+    Settle,
+    Reconcile,
+    Release,
+}
+
+// Numerical closeout evidence only. No prompt, media, transcript, identity,
+// provider response ID or tool argument is retained in this diagnostic view.
+internal readonly record struct LiveUsageCloseoutEvidence(
+    long AcceptedMetadata,
+    long RejectedMetadata,
+    long InputGeneration,
+    long CoveredInputGeneration,
+    long OutputGeneration,
+    long CoveredOutputGeneration,
+    long InputAudioBytes,
+    long OutputAudioBytes);
+
+internal sealed class LiveUsageAccumulator
+{
+    private readonly long _maxTrafficBytes;
+    private long _trafficBytes;
+    private long _inputAudioBytes;
+    private long _outputAudioBytes;
+    private long _inputTextCharacters;
+    private long _outputTextCharacters;
+    private long _promptTokens;
+    private long _candidateTokens;
+    private long _totalTokens;
+    private long _reasoningTokens;
+    private long _cachedTokens;
+    private long _inputAudioTokens;
+    private long _outputAudioTokens;
+    private long _inputImageTokens;
+    private long _outputImageTokens;
+    private int _usageMetadataSeen;
+    private long _acceptedMetadata;
+    private long _rejectedMetadata;
+    private long _providerContentGeneration;
+    private long _coveredContentGeneration;
+    private long _inputContentGeneration;
+    private long _coveredInputGeneration;
+    private int _providerOutputSeen;
+    private readonly object _metadataLock = new();
+    private string? _providerRequestId;
+    private string? _providerModelVersion;
+    private ProviderUsage _completedTurns = new(0, 0, 0, 0, 0, 0, 0, null);
+    private bool _turnClosed;
+    private bool _requiresTerminalMetadata;
+    private bool _terminalMetadataKnown;
+    private bool _ambiguousTurn;
+    private long _responseInputGeneration = -1;
+    private long _inputAudioStart;
+    private long _outputAudioStart;
+    private long _inputTextStart;
+    private long _outputTextStart;
+    private string? _terminalFingerprint;
+    private ProviderUsage? _closedUsage;
+    private long _closedInputAudioBytes;
+    private long _closedOutputAudioBytes;
+    private long _closedInputTextCharacters;
+    private long _closedOutputTextCharacters;
+    private ProviderUsage _budgetFloor = LiveBudgetProjection.Empty;
+    private ProviderUsage _budgetLatestResponse = LiveBudgetProjection.Empty;
+    private long _budgetInputTextUnits;
+    private long _budgetOutputTextUnits;
+    private long _budgetInputTextAnchor;
+    private long _budgetOutputTextAnchor;
+    private long _budgetInputAudioAnchor;
+    private long _budgetOutputAudioAnchor;
+    private long _budgetReportedInputAudio;
+    private long _budgetReportedOutputAudio;
+    private long _budgetReportedInputText;
+    private long _budgetReportedOutputText;
+    private bool _budgetCarryContext;
+    private long _budgetResponseInputTextUnits;
+
+    public LiveUsageAccumulator(long maxTrafficBytes) =>
+        _maxTrafficBytes = maxTrafficBytes;
+
+    public void ObserveClient(string json)
+    {
+        lock (_metadataLock) ObserveClientCore(json);
+    }
+
+    private void ObserveClientCore(string json)
+    {
+        AddTraffic(json);
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            var wasClosed = _turnClosed;
+            if (HasClientContent(root))
+            {
+                if (_turnClosed) BeginNextTurn();
+                if (root.TryGetProperty("toolResponse", out _) && _providerOutputSeen != 0)
+                    _ambiguousTurn = true; // Do not infer that one final report subsumes several tool generations.
+                Interlocked.Increment(ref _inputContentGeneration);
+            }
+            if (root.TryGetProperty("realtimeInput", out var realtime)
+                && realtime.TryGetProperty("audio", out var audio)
+                && audio.TryGetProperty("data", out var data))
+                Interlocked.Add(ref _inputAudioBytes, Base64ByteCount(data.GetString()));
+            Interlocked.Add(ref _inputTextCharacters, CountTextCharacters(root));
+            var budgetText = CountBudgetInputUnits(root);
+            _budgetInputTextUnits = checked(_budgetInputTextUnits + budgetText);
+            if (wasClosed && (budgetText > 0 || _inputAudioBytes > _closedInputAudioBytes))
+                _budgetCarryContext = true;
+        }
+        catch (JsonException) { }
+    }
+
+    public void ObserveProvider(string json)
+    {
+        lock (_metadataLock) ObserveProviderCore(json);
+    }
+
+    private void ObserveProviderCore(string json)
+    {
+        AddTraffic(json);
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            var terminal = root.TryGetProperty("serverContent", out var serverContent)
+                && serverContent.ValueKind == JsonValueKind.Object
+                && serverContent.TryGetProperty("turnComplete", out var ended) && ended.ValueKind == JsonValueKind.True;
+            var fingerprint = terminal ? TerminalFingerprint(root) : null;
+            if (_turnClosed && terminal && fingerprint == _terminalFingerprint)
+                return; // An identical idle terminal frame is not another billable turn.
+            if (!_turnClosed && _requiresTerminalMetadata && terminal
+                && fingerprint == _terminalFingerprint && _responseInputGeneration < 0)
+                _ambiguousTurn = true; // A replay's own final content cannot also prove a fresh response.
+            if (HasProviderContent(root, out var emittedOutput))
+            {
+                if (_turnClosed)
+                {
+                    var newAudioInput = _inputAudioBytes > _closedInputAudioBytes;
+                    BeginNextTurn();
+                    _budgetCarryContext = true;
+                    if (!newAudioInput) _ambiguousTurn = true;
+                }
+                if (_responseInputGeneration < 0)
+                {
+                    _responseInputGeneration = Interlocked.Read(ref _inputContentGeneration);
+                    _budgetResponseInputTextUnits = _budgetInputTextUnits;
+                }
+                Interlocked.Increment(ref _providerContentGeneration);
+            }
+            if (emittedOutput)
+                Interlocked.Exchange(ref _providerOutputSeen, 1);
+            if (serverContent.ValueKind == JsonValueKind.Object
+                && serverContent.TryGetProperty("interrupted", out var interrupted) && interrupted.ValueKind == JsonValueKind.True)
+                _ambiguousTurn = true;
+            var acceptedCurrentFrame = false;
+            long budgetInputAudioDelta = 0, budgetOutputAudioDelta = 0;
+            long budgetInputTextDelta = 0, budgetOutputTextDelta = 0;
+            ProviderUsage? budgetReceipt = null;
+            if (!_turnClosed && root.TryGetProperty("usageMetadata", out var metadata))
+            {
+                if (ProviderUsageMetadata.TryParse(metadata, out var usage, allowToolInput: true))
+                {
+                    var first = Volatile.Read(ref _usageMetadataSeen) == 0;
+                    // Choose one coherent response vector. Never combine maxima
+                    // from different receipts into tokens the provider did not report.
+                    if (first || (usage.InputTokens >= _promptTokens && usage.OutputTokens >= _candidateTokens
+                        && usage.TotalTokens >= _totalTokens))
+                    {
+                        budgetInputAudioDelta = BudgetCategoryAdvance(ref _budgetReportedInputAudio, usage.InputAudioTokens, first);
+                        budgetOutputAudioDelta = BudgetCategoryAdvance(ref _budgetReportedOutputAudio, usage.OutputAudioTokens, first);
+                        budgetInputTextDelta = BudgetCategoryAdvance(ref _budgetReportedInputText,
+                            Math.Max(0, usage.InputTokens - usage.InputAudioTokens - usage.InputImageTokens - usage.CachedInputTokens), first);
+                        budgetOutputTextDelta = BudgetCategoryAdvance(ref _budgetReportedOutputText,
+                            usage.OutputTokens - usage.OutputAudioTokens - usage.OutputImageTokens, first);
+                        budgetReceipt = usage;
+                        if (first || usage.InputTokens > _promptTokens)
+                            _coveredInputGeneration = _inputContentGeneration;
+                        if (first || usage.OutputTokens > _candidateTokens)
+                            _coveredContentGeneration = _providerContentGeneration;
+                        _promptTokens = usage.InputTokens;
+                        _candidateTokens = usage.OutputTokens;
+                        _totalTokens = usage.TotalTokens;
+                        _reasoningTokens = usage.ReasoningTokens;
+                        _cachedTokens = usage.CachedInputTokens;
+                        _inputAudioTokens = usage.InputAudioTokens;
+                        _outputAudioTokens = usage.OutputAudioTokens;
+                        _inputImageTokens = usage.InputImageTokens;
+                        _outputImageTokens = usage.OutputImageTokens;
+                        _usageMetadataSeen = 1;
+                        acceptedCurrentFrame = true;
+                    }
+                    Interlocked.Increment(ref _acceptedMetadata);
+                }
+                else
+                    Interlocked.Increment(ref _rejectedMetadata);
+            }
+            lock (_metadataLock)
+            {
+                if (root.TryGetProperty("responseId", out var responseId))
+                    _providerRequestId = responseId.GetString() ?? _providerRequestId;
+                if (root.TryGetProperty("modelVersion", out var modelVersion))
+                    _providerModelVersion = modelVersion.GetString() ?? _providerModelVersion;
+            }
+            if (root.TryGetProperty("serverContent", out var server)
+                && server.TryGetProperty("modelTurn", out var turn)
+                && turn.TryGetProperty("parts", out var parts))
+            {
+                foreach (var part in parts.EnumerateArray())
+                {
+                    if (part.TryGetProperty("inlineData", out var inlineData)
+                        && inlineData.TryGetProperty("data", out var data))
+                        Interlocked.Add(ref _outputAudioBytes, Base64ByteCount(data.GetString()));
+                }
+            }
+            Interlocked.Add(ref _outputTextCharacters, CountTextCharacters(root));
+            _budgetOutputTextUnits = checked(_budgetOutputTextUnits + CountBudgetOutputUnits(root));
+            if (budgetReceipt is not null)
+            {
+                _budgetLatestResponse = budgetReceipt;
+                _budgetCarryContext = false;
+                // A receipt is not a delivery ACK for the entire outstanding
+                // tail. Consume only the newly reported matching category;
+                // text advances cannot erase audio, nor can a tiny audio
+                // advance erase a much larger estimate. Never invoice this.
+                ConsumeBudgetUnits(ref _budgetInputAudioAnchor, _inputAudioBytes, budgetInputAudioDelta, 1_280);
+                ConsumeBudgetUnits(ref _budgetOutputAudioAnchor, _outputAudioBytes, budgetOutputAudioDelta, 1_920);
+                ConsumeBudgetUnits(ref _budgetInputTextAnchor, _budgetInputTextUnits, budgetInputTextDelta, 1);
+                ConsumeBudgetUnits(ref _budgetOutputTextAnchor, _budgetOutputTextUnits, budgetOutputTextDelta, 1);
+                // The floor is the reported vector, not SnapshotCore's possible
+                // inferred audio fallback (which would count the same tail twice).
+                _budgetFloor = LiveBudgetProjection.Add(_completedTurns, budgetReceipt) with { Known = false };
+            }
+            if (terminal && !_turnClosed)
+            {
+                _turnClosed = true;
+                _terminalFingerprint = fingerprint;
+                _terminalMetadataKnown = (acceptedCurrentFrame || (!_requiresTerminalMetadata
+                    && _usageMetadataSeen != 0 && _coveredInputGeneration == _inputContentGeneration
+                    && _coveredContentGeneration == _providerContentGeneration)) && !_ambiguousTurn
+                    && (_responseInputGeneration < 0 || _responseInputGeneration == _inputContentGeneration)
+                    && (!_requiresTerminalMetadata || _candidateTokens == 0 || _responseInputGeneration >= 0);
+                if (budgetReceipt is not null && _terminalMetadataKnown && _responseInputGeneration >= 0)
+                {
+                    // A coherent terminal receipt covers the text already present
+                    // when this response began. Its real token count need not equal
+                    // our conservative UTF-16 estimate. Retaining that difference
+                    // counts acknowledged setup/history as imaginary new work.
+                    // Never clear later input, partial receipts or audio tails;
+                    // this anchor is guard-only, not settlement evidence.
+                    _budgetInputTextAnchor = Math.Max(_budgetInputTextAnchor, _budgetResponseInputTextUnits);
+                }
+                _closedInputAudioBytes = _inputAudioBytes;
+                _closedOutputAudioBytes = _outputAudioBytes;
+                _closedInputTextCharacters = _inputTextCharacters;
+                _closedOutputTextCharacters = _outputTextCharacters;
+                _closedUsage = SnapshotCore();
+            }
+        }
+        catch (JsonException) { }
+    }
+
+    public ProviderUsage Snapshot()
+    {
+        lock (_metadataLock) return SnapshotCore();
+    }
+
+    public LiveBudgetView BudgetView()
+    {
+        lock (_metadataLock)
+        {
+            var inputAudio = DivideRoundUp(_inputAudioBytes - _budgetInputAudioAnchor, 1_280);
+            var outputAudio = DivideRoundUp(_outputAudioBytes - _budgetOutputAudioAnchor, 1_920);
+            // Use the existing reservation convention of one UTF-16 unit per
+            // token for unseen text/structured input; /4 is not conservative
+            // across languages. This is never exact billed usage.
+            var input = checked(_budgetInputTextUnits - _budgetInputTextAnchor + inputAudio);
+            var output = checked(_budgetOutputTextUnits - _budgetOutputTextAnchor + outputAudio);
+            var unreported = new ProviderUsage(input, output, 0, 0, 0,
+                checked(inputAudio + outputAudio), checked(input + output), null, null,
+                inputAudio, outputAudio, Estimated: true, Known: false);
+            if (_budgetCarryContext)
+                unreported = LiveBudgetProjection.Add(unreported,
+                    LiveBudgetProjection.ContextCarry(_budgetLatestResponse));
+            return new LiveBudgetView(_budgetFloor, unreported);
+        }
+    }
+
+    private ProviderUsage SnapshotCore()
+    {
+        if (_turnClosed && _closedUsage is not null)
+            return _inputAudioBytes == _closedInputAudioBytes ? _closedUsage : _closedUsage with { Known = false };
+        // Vertex Live does not currently provide countTokens. When cumulative
+        // usage metadata is absent, estimate 25 native-audio tokens per second
+        // from 16 kHz input and 24 kHz output PCM byte counts, conservatively
+        // folding those tokens into the billable input/output categories.
+        var estimatedInputAudio = DivideRoundUp(_inputAudioBytes - _inputAudioStart, 1_280);
+        var estimatedOutputAudio = DivideRoundUp(_outputAudioBytes - _outputAudioStart, 1_920);
+        var estimatedText = DivideRoundUp(_inputTextCharacters - _inputTextStart, 4);
+        var estimatedOutputText = DivideRoundUp(_outputTextCharacters - _outputTextStart, 4);
+        var exactMetadata = Volatile.Read(ref _usageMetadataSeen) == 1;
+        var providerInput = Interlocked.Read(ref _promptTokens);
+        var providerOutput = Interlocked.Read(ref _candidateTokens);
+        // Native Live receipts describe one response's input (including its
+        // session context) and output. Completed response vectors are summed
+        // exactly once below; repetition inside one response is not another cost.
+        var input = exactMetadata
+            ? providerInput
+            : estimatedText + estimatedInputAudio;
+        var output = exactMetadata
+            ? providerOutput
+            : estimatedOutputText + estimatedOutputAudio;
+        var total = exactMetadata
+            ? Interlocked.Read(ref _totalTokens)
+            : input + output;
+        var providerInputAudio = Interlocked.Read(ref _inputAudioTokens);
+        var providerOutputAudio = Interlocked.Read(ref _outputAudioTokens);
+        var inputAudio = Math.Clamp(
+            providerInputAudio > 0 ? providerInputAudio : estimatedInputAudio,
+            0,
+            input);
+        var outputAudio = Math.Clamp(
+            providerOutputAudio > 0 ? providerOutputAudio : estimatedOutputAudio,
+            0,
+            output);
+        var inputImage = Math.Clamp(Interlocked.Read(ref _inputImageTokens), 0, input - inputAudio);
+        var outputImage = Math.Clamp(Interlocked.Read(ref _outputImageTokens), 0, output - outputAudio);
+        var estimated = !exactMetadata
+            || (input > 0 && providerInputAudio == 0 && estimatedInputAudio > 0)
+            || (output > 0 && providerOutputAudio == 0 && estimatedOutputAudio > 0);
+        string? requestId;
+        string? modelVersion;
+        lock (_metadataLock)
+        {
+            requestId = _providerRequestId;
+            modelVersion = _providerModelVersion;
+        }
+        var result = new ProviderUsage(
+            input,
+            output,
+            Interlocked.Read(ref _cachedTokens),
+            Interlocked.Read(ref _reasoningTokens),
+            inputImage + outputImage,
+            inputAudio + outputAudio,
+            total,
+            requestId,
+            modelVersion,
+            inputAudio,
+            outputAudio,
+            inputImage,
+            outputImage,
+            estimated,
+            Known: exactMetadata && !estimated
+                && !_ambiguousTurn
+                && (!_turnClosed || _terminalMetadataKnown)
+                && (!_requiresTerminalMetadata || (_turnClosed && _terminalMetadataKnown))
+                && Interlocked.Read(ref _cachedTokens) == 0 // Native Live has no cached-token price in this contract.
+                && Interlocked.Read(ref _providerContentGeneration) == Interlocked.Read(ref _coveredContentGeneration)
+                && Interlocked.Read(ref _inputContentGeneration) == Interlocked.Read(ref _coveredInputGeneration)
+                && (Volatile.Read(ref _providerOutputSeen) == 0 || providerOutput > 0)
+                && (_outputAudioBytes == _outputAudioStart || providerOutput > 0));
+        return AddTurns(_completedTurns, ProviderUsageMetadata.IsAuthoritative(result) ? result : result with { Known = false });
+    }
+
+    private void BeginNextTurn()
+    {
+        // Freeze the terminal vector, not any subsequently arriving microphone
+        // frames. Continuous listening after a response belongs to the next turn.
+        _completedTurns = _closedUsage ?? SnapshotCore();
+        _promptTokens = _candidateTokens = _totalTokens = _reasoningTokens = _cachedTokens = 0;
+        _inputAudioTokens = _outputAudioTokens = _inputImageTokens = _outputImageTokens = 0;
+        _usageMetadataSeen = _providerOutputSeen = 0;
+        _inputAudioStart = _closedInputAudioBytes;
+        _outputAudioStart = _closedOutputAudioBytes;
+        _inputTextStart = _closedInputTextCharacters;
+        _outputTextStart = _closedOutputTextCharacters;
+        _turnClosed = _terminalMetadataKnown = _ambiguousTurn = false;
+        _requiresTerminalMetadata = true;
+        _responseInputGeneration = -1;
+        _closedUsage = null;
+    }
+
+    private static ProviderUsage AddTurns(ProviderUsage completed, ProviderUsage current) => new(
+        checked(completed.InputTokens + current.InputTokens), checked(completed.OutputTokens + current.OutputTokens),
+        checked(completed.CachedInputTokens + current.CachedInputTokens), checked(completed.ReasoningTokens + current.ReasoningTokens),
+        checked(completed.ImageTokens + current.ImageTokens), checked(completed.AudioTokens + current.AudioTokens),
+        checked(completed.TotalTokens + current.TotalTokens), current.ProviderRequestId, current.ProviderModelVersion,
+        checked(completed.InputAudioTokens + current.InputAudioTokens), checked(completed.OutputAudioTokens + current.OutputAudioTokens),
+        checked(completed.InputImageTokens + current.InputImageTokens), checked(completed.OutputImageTokens + current.OutputImageTokens),
+        completed.Estimated || current.Estimated, completed.Known && current.Known);
+
+    private static string TerminalFingerprint(JsonElement root)
+    {
+        // Formatting/property order cannot turn one terminal receipt into two.
+        // Retain only a session-local hash; never log/store its source content.
+        using var stream = new MemoryStream();
+        try
+        {
+            using (var writer = new Utf8JsonWriter(stream)) WriteCanonical(writer, root);
+            return Convert.ToHexString(SHA256.HashData(stream.GetBuffer().AsSpan(0, checked((int)stream.Length))));
+        }
+        finally { Array.Clear(stream.GetBuffer()); }
+    }
+
+    private static void WriteCanonical(Utf8JsonWriter writer, JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            writer.WriteStartObject();
+            foreach (var property in element.EnumerateObject().OrderBy(item => item.Name, StringComparer.Ordinal))
+            {
+                writer.WritePropertyName(property.Name);
+                WriteCanonical(writer, property.Value);
+            }
+            writer.WriteEndObject();
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            writer.WriteStartArray();
+            foreach (var item in element.EnumerateArray()) WriteCanonical(writer, item);
+            writer.WriteEndArray();
+        }
+        else element.WriteTo(writer);
+    }
+
+    internal LiveUsageCloseoutEvidence CloseoutEvidence()
+    {
+        lock (_metadataLock) return new(
+        Interlocked.Read(ref _acceptedMetadata),
+        Interlocked.Read(ref _rejectedMetadata),
+        Interlocked.Read(ref _inputContentGeneration),
+        Interlocked.Read(ref _coveredInputGeneration),
+        Interlocked.Read(ref _providerContentGeneration),
+        Interlocked.Read(ref _coveredContentGeneration),
+        Interlocked.Read(ref _inputAudioBytes),
+        Interlocked.Read(ref _outputAudioBytes));
+    }
+
+    private void AddTraffic(string json)
+    {
+        var total = Interlocked.Add(ref _trafficBytes, Encoding.UTF8.GetByteCount(json));
+        if (total > _maxTrafficBytes)
+            throw new InvalidOperationException("The Live session traffic limit was reached.");
+    }
+
+    private static long Base64ByteCount(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return 0;
+        var padding = value.EndsWith("==", StringComparison.Ordinal) ? 2
+            : value.EndsWith('=') ? 1 : 0;
+        return Math.Max(0, value.Length * 3L / 4L - padding);
+    }
+
+    private static bool HasProviderContent(JsonElement root, out bool output)
+    {
+        output = root.TryGetProperty("toolCall", out var calls) && calls.ValueKind == JsonValueKind.Object
+            && calls.TryGetProperty("functionCalls", out var functions) && functions.ValueKind == JsonValueKind.Array
+            && functions.GetArrayLength() > 0;
+        var found = output;
+        if (!root.TryGetProperty("serverContent", out var server) || server.ValueKind != JsonValueKind.Object)
+            return found;
+        // Transcriptions describe the audio, not a second billable response.
+        // Their ordering relative to modelTurn is explicitly not guaranteed.
+        if (server.TryGetProperty("modelTurn", out var turn) && turn.ValueKind == JsonValueKind.Object
+            && turn.TryGetProperty("parts", out var parts) && parts.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var part in parts.EnumerateArray())
+                if (part.ValueKind == JsonValueKind.Object
+                    && !(part.TryGetProperty("thought", out var thought) && thought.ValueKind == JsonValueKind.True)
+                    && ((part.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String
+                        && !string.IsNullOrEmpty(text.GetString())) || part.TryGetProperty("inlineData", out _) || part.TryGetProperty("functionCall", out _)))
+                {
+                    output = true;
+                    found = true;
+                }
+        }
+        return found;
+    }
+
+    private static bool HasClientContent(JsonElement root) =>
+        (root.TryGetProperty("clientContent", out var content) && content.ValueKind == JsonValueKind.Object
+            && content.TryGetProperty("turns", out var turns) && turns.ValueKind == JsonValueKind.Array
+            && turns.GetArrayLength() > 0)
+        || (root.TryGetProperty("toolResponse", out var response) && response.ValueKind == JsonValueKind.Object
+            && response.TryGetProperty("functionResponses", out var functions) && functions.ValueKind == JsonValueKind.Array
+            && functions.GetArrayLength() > 0)
+        || (root.TryGetProperty("realtimeInput", out var realtime) && realtime.ValueKind == JsonValueKind.Object
+            && realtime.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(text.GetString()));
+
+    private static long CountTextCharacters(JsonElement element)
+    {
+        long total = 0;
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                if (string.Equals(property.Name, "text", StringComparison.OrdinalIgnoreCase)
+                    && property.Value.ValueKind == JsonValueKind.String)
+                    total += property.Value.GetString()?.Length ?? 0;
+                else
+                    total += CountTextCharacters(property.Value);
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                total += CountTextCharacters(item);
+        }
+        return total;
+    }
+
+    private static long CountBudgetInputUnits(JsonElement root)
+    {
+        long total = 0;
+        foreach (var name in new[] { "setup", "clientContent", "toolResponse" })
+            if (root.TryGetProperty(name, out var value))
+                total = checked(total + value.GetRawText().Length);
+        if (root.TryGetProperty("realtimeInput", out var realtime)
+            && realtime.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
+            total = checked(total + (text.GetString()?.Length ?? 0));
+        return total;
+    }
+
+    private static long CountBudgetOutputUnits(JsonElement root)
+    {
+        long total = 0;
+        if (root.TryGetProperty("toolCall", out var toolCall))
+            total = toolCall.GetRawText().Length;
+        if (root.TryGetProperty("serverContent", out var server)
+            && server.TryGetProperty("modelTurn", out var modelTurn))
+            total = checked(total + CountTextCharacters(modelTurn));
+        return total; // Transcription echoes are not independently emitted text.
+    }
+
+    private static long DivideRoundUp(long value, long divisor) =>
+        value <= 0 ? 0 : (value + divisor - 1) / divisor;
+
+    private static void ConsumeBudgetUnits(ref long anchor, long observed, long reportedTokens, long unitsPerToken)
+    {
+        var pending = observed - anchor;
+        if (pending <= 0 || reportedTokens <= 0) return;
+        // Compare before multiplying: provider counters may approach Int64.MaxValue.
+        anchor = reportedTokens >= DivideRoundUp(pending, unitsPerToken)
+            ? observed : checked(anchor + reportedTokens * unitsPerToken);
+    }
+
+    private static long BudgetCategoryAdvance(ref long reportedHighWater, long count, bool firstReceipt)
+    {
+        // A category correction cannot consume the same reported amount twice.
+        // This high water is guard-only and resets at the first receipt of each
+        // response; invoice vectors remain coherent, never merged maxima.
+        var delta = firstReceipt ? count : Math.Max(0, count - reportedHighWater);
+        reportedHighWater = firstReceipt ? count : Math.Max(reportedHighWater, count);
+        return delta;
+    }
+
+    private static void Max(ref long target, long value)
+    {
+        long current;
+        do
+        {
+            current = Interlocked.Read(ref target);
+            if (value <= current)
+                return;
+        } while (Interlocked.CompareExchange(ref target, value, current) != current);
+    }
+}

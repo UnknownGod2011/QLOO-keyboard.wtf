@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    {
+      "path": "keyboard.wtf.exe",
+      "required": true,
+      "minBytes": 1,
+      "maxBytes": 536870912,
+      "sha256": null
+    },
+    {
+      "path": "LICENSE",
+      "required": true,
+      "minBytes": 1089,
+      "maxBytes": 1089,
+      "sha256": "baacf54a88820ca6a8f85e39640ad68b9ceee4bbad11966706369a10cacae64e"
+    },
+    {
+      "path": "NOTICES.md",
+      "required": true,
+      "minBytes": 4964,
+      "maxBytes": 4964,
+      "sha256": "02d95dc52931c04fc755e5d7d07829ad88cb53dbc4fdbb2b17740d5cdd278709"
+    },
+    {
+      "path": "browser-helper/README.md",
+      "required": true,
+      "minBytes": 1274,
+      "maxBytes": 1274,
+      "sha256": "b93b2ce824f8efbbfe9656759f3c0ed6c2d8232daee9ff8f4dea6911ddc8a9d0"
+    },
+    {
+      "path": "browser-helper/content-script.js",
+      "required": true,
+      "minBytes": 42046,
+      "maxBytes": 42046,
+      "sha256": "4dcf024aa2f00578c5b55fcaa81470164076107a8e0291461ab69ccc7495a01d"
+    },
+    {
+      "path": "browser-helper/manifest.json",
+      "required": true,
+      "minBytes": 1637,
+      "maxBytes": 1637,
+      "sha256": "e4c5954ef4a47c327a80c467022a9e33daf1babba23060492fd56eb5e8ad4af7"
+    },
+    {
+      "path": "browser-helper/popup.css",
+      "required": true,
+      "minBytes": 2088,
+      "maxBytes": 2088,
+      "sha256": "6697543890701920068faf7c687f0e36367c0cfd1420f52c6f4155e530362c41"
+    },
+    {
+      "path": "browser-helper/popup.html",
+      "required": true,
+      "minBytes": 1543,
+      "maxBytes": 1543,
+      "sha256": "34e4679ccc998c14e556cf93f9b6ca3479b3bc6c69ca6d7f791ffcf34f8a45d4"
+    },
+    {
+      "path": "browser-helper/popup.js",
+      "required": true,
+      "minBytes": 1243,
+      "maxBytes": 1243,
+      "sha256": "69f1a41c2bda83983e1051016cbbc1f0436c9e7facd1a5fa87deb955fe029ff9"
+    },
+    {
+      "path": "browser-helper/service-worker.js",
+      "required": true,
+      "minBytes": 47375,
+      "maxBytes": 47375,
+      "sha256": "0634eef567f8c53581249533771ef76cdfdbed4d7eaf77daf853b3755d13434a"
+    },
+    {
+      "path": "browser-helper/icons/icon-128.png",
+      "required": true,
+      "minBytes": 3128,
+      "maxBytes": 3128,
+      "sha256": "7b04e4170247b396dbe063ee60b2db65abbd51bb2e2e13a1d58c5e58f89c483c"
+    },
+    {
+      "path": "browser-helper/icons/icon-16.png",
+      "required": true,
+      "minBytes": 487,
+      "maxBytes": 487,
+      "sha256": "f740d0d34861afd3a48d67ce56cb780a9391fc386382b3abdc56e1a2222695a7"
+    },
+    {
+      "path": "browser-helper/icons/icon-32.png",
+      "required": true,
+      "minBytes": 905,
+      "maxBytes": 905,
+      "sha256": "2648f64d8fa29bb7a5cbc33eddcbce9689725f76c6a79f05f7be099555df1595"
+    },
+    {
+      "path": "browser-helper/icons/icon-48.png",
+      "required": true,
+      "minBytes": 1239,
+      "maxBytes": 1239,
+      "sha256": "d490f56d2525b2c03deb62ee37c7db830f36b3536b17cd7681ae22434854b06e"
+    },
+    {
+      "path": "tts/voices/de_DE-thorsten-medium.onnx.json",
+      "required": true,
+      "minBytes": 5305,
+      "maxBytes": 5305,
+      "sha256": "645de72e66b1cda9a043ce43b92f3351c5fd5c6bcfeb0cf2cbc78c06eb270bd3"
+    },
+    {
+      "path": "tts/voices/en_US-amy-medium.onnx.json",
+      "required": true,
+      "minBytes": 5374,
+      "maxBytes": 5374,
+      "sha256": "a1bb2e6354e1279bd0869c492e55bc7e9d22f76bf2b53f9fcf44ce62134e112e"
+    },
+    {
+      "path": "ggml-base-whisper.dll",
+      "required": true,
+      "minBytes": 636928,
+      "maxBytes": 636928,
+      "sha256": "e6c362421b6d5a5c1b52341f88d3d72764de29f05141748cc3faad2f6348063f"
+    },
+    {
+      "path": "runtimes/win-x64/ggml-base-whisper.dll",
+      "required": true,
+      "minBytes": 636928,
+      "maxBytes": 636928,
+      "sha256": "e6c362421b6d5a5c1b52341f88d3d72764de29f05141748cc3faad2f6348063f"
+    },
+    {
+      "path": "ggml-cpu-whisper.dll",
+      "required": true,
+      "minBytes": 782848,
+      "maxBytes": 782848,
+      "sha256": "480a23afc6deea301c5cda66cf462fa2f2eb7ff9bca63b8f4f933a0e8dc5d4dd"
+    },
+    {
+      "path": "runtimes/win-x64/ggml-cpu-whisper.dll",
+      "required": true,
+      "minBytes": 782848,
+      "maxBytes": 782848,
+      "sha256": "480a23afc6deea301c5cda66cf462fa2f2eb7ff9bca63b8f4f933a0e8dc5d4dd"
+    },
+    {
+      "path": "ggml-whisper.dll",
+      "required": true,
+      "minBytes": 67072,
+      "maxBytes": 67072,
+      "sha256": "2e0ac238c2bc178a5c1f09b3bde2421904b191bce1cc1c13dc64309ca3b9cb36"
+    },
+    {
+      "path": "runtimes/win-x64/ggml-whisper.dll",
+      "required": true,
+      "minBytes": 67072,
+      "maxBytes": 67072,
+      "sha256": "2e0ac238c2bc178a5c1f09b3bde2421904b191bce1cc1c13dc64309ca3b9cb36"
+    },
+    {
+      "path": "whisper.dll",
+      "required": true,
+      "minBytes": 484864,
+      "maxBytes": 484864,
+      "sha256": "07ec2fac4946005ba7380f2c2e9ccfa3ad23007592d074aa698ed5df6bfb4938"
+    },
+    {
+      "path": "runtimes/win-x64/whisper.dll",
+      "required": true,
+      "minBytes": 484864,
+      "maxBytes": 484864,
+      "sha256": "07ec2fac4946005ba7380f2c2e9ccfa3ad23007592d074aa698ed5df6bfb4938"
+    }
+  ]
+}

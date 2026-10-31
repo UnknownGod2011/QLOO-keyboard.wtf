@@ -1,0 +1,339 @@
+using KeyboardWtf.Staging.Api.Domain;
+using KeyboardWtf.Staging.Api.Contracts;
+using System.Text.Json;
+
+namespace KeyboardWtf.Staging.Api.Services;
+
+public interface IClock
+{
+    DateTimeOffset UtcNow { get; }
+}
+
+public interface IReviewService
+{
+    Task<ReviewPageSnapshot> GetPageAsync(
+        int limit,
+        string? cursor,
+        CancellationToken cancellationToken);
+    Task<ReviewSnapshot?> GetOwnAsync(string userId, CancellationToken cancellationToken);
+    Task<ReviewSnapshot> UpsertAsync(
+        CallerIdentity caller,
+        int rating,
+        string text,
+        CancellationToken cancellationToken);
+    Task<bool> DeleteOwnAsync(string userId, CancellationToken cancellationToken);
+    Task<bool> DeleteAsModeratorAsync(
+        CallerIdentity caller,
+        string reviewId,
+        CancellationToken cancellationToken);
+    bool IsModerator(CallerIdentity caller);
+}
+
+public sealed class SystemClock : IClock
+{
+    public DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
+}
+
+public interface IIdentityService
+{
+    Task<CallerIdentity?> AuthenticateAsync(HttpContext context, CancellationToken cancellationToken);
+    // Deletion retries cannot repopulate a tombstone through normal profile sync.
+    // Older implementations must explicitly support this, never silently delegate.
+    Task<CallerIdentity?> AuthenticateForAccountDeletionAsync(HttpContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<CallerIdentity?>(null);
+    Task<CallerIdentity> VerifyFirebaseAsync(string idToken, CancellationToken cancellationToken);
+    Task DeleteFirebaseUserAsync(string userId, CancellationToken cancellationToken);
+}
+
+public interface IAccountStore
+{
+    Task EnsureAccountAsync(CallerIdentity caller, CancellationToken cancellationToken);
+    Task<AccountSnapshot> GetAccountAsync(string userId, CancellationToken cancellationToken);
+    Task<UsagePageSnapshot> GetUsagePageAsync(
+        string userId,
+        int limit,
+        string? cursor,
+        CancellationToken cancellationToken);
+    Task<PurchasePageSnapshot> GetPurchasePageAsync(
+        string userId,
+        int limit,
+        string? cursor,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+    Task<ReservationResult> ReserveAsync(
+        CallerIdentity caller,
+        string requestId,
+        string model,
+        string pricingVersion,
+        long reserveCreditMicros,
+        long taskCapCreditMicros,
+        int requestsPerMinute,
+        int maxConcurrent,
+        long globalDailyCap,
+        CancellationToken cancellationToken,
+        string activityType = "ai_request",
+        int? reservationLifetimeSeconds = null);
+    Task<SettlementResult> SettleAsync(
+        string userId,
+        string requestId,
+        ProviderUsage usage,
+        long actualCreditMicros,
+        long providerCostUsdMicros,
+        string outcome,
+        CancellationToken cancellationToken);
+    Task MarkReservationProviderStartedAsync(
+        string userId,
+        string requestId,
+        CancellationToken cancellationToken);
+    Task RecordTerminalProviderRejectionAsync(
+        string userId,
+        string requestId,
+        int httpStatus,
+        CancellationToken cancellationToken);
+    Task<long> EnsureReservationCapacityAsync(
+        string userId,
+        string requestId,
+        long targetReservedCreditMicros,
+        CancellationToken cancellationToken);
+    Task RecordProviderCompletionAsync(
+        string userId,
+        string requestId,
+        ProviderUsage usage,
+        long actualCreditMicros,
+        long providerCostUsdMicros,
+        string outcome,
+        CancellationToken cancellationToken,
+        string? model = null,
+        string? pricingVersion = null);
+    Task CheckpointReservationUsageAsync(
+        string userId,
+        string requestId,
+        ProviderUsage usage,
+        long estimatedCreditMicros,
+        long providerCostUsdMicros,
+        CancellationToken cancellationToken);
+    Task MarkReservationForReconciliationAsync(
+        string userId,
+        string requestId,
+        string outcome,
+        CancellationToken cancellationToken);
+    Task ReleaseReservationAsync(
+        string userId,
+        string requestId,
+        string outcome,
+        CancellationToken cancellationToken);
+    // Missing implementations fail closed: no closure evidence or loss release.
+    Task RecordManagedLiveSessionClosedAsync(string userId, string requestId, CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+    Task<ManagedLiveLossResolution> ResolveManagedLiveUnknownUsageLossAsync(
+        string userId, string requestId, CancellationToken cancellationToken) =>
+        Task.FromResult(ManagedLiveLossResolution.NotEligible);
+    Task<DesktopLoginAttempt> CreateLoginAttemptAsync(
+        string stateHash,
+        string deviceNonceHash,
+        string pkceChallenge,
+        string callbackUri,
+        DateTimeOffset expiresAt,
+        CancellationToken cancellationToken);
+    Task<(DesktopLoginAttempt Attempt, string AuthorizationCode)> AuthorizeLoginAttemptAsync(
+        string attemptId,
+        string stateHash,
+        string deviceNonceHash,
+        string userId,
+        CancellationToken cancellationToken);
+    Task<DesktopSessionTokens> ExchangeLoginAttemptAsync(
+        string attemptId,
+        string stateHash,
+        string deviceNonceHash,
+        string authorizationCodeHash,
+        string pkceVerifier,
+        string deviceName,
+        string deviceInstallationId,
+        TimeSpan accessLifetime,
+        TimeSpan refreshLifetime,
+        CancellationToken cancellationToken);
+    Task<CallerIdentity?> AuthenticateDesktopTokenAsync(string accessToken, CancellationToken cancellationToken);
+    Task<DesktopSessionTokens> RefreshSessionAsync(
+        string refreshToken,
+        TimeSpan accessLifetime,
+        TimeSpan refreshLifetime,
+        CancellationToken cancellationToken);
+    Task RevokeSessionAsync(string userId, string? sessionId, bool allDevices, CancellationToken cancellationToken);
+    Task RevokeDeviceAsync(string userId, string deviceId, CancellationToken cancellationToken);
+    Task DeleteAccountOperationalDataAsync(string userId, CancellationToken cancellationToken);
+    // Old stores must not silently delete while recurring mandates remain live.
+    Task<AccountDeletionSubscriptions> BeginAccountDeletionAsync(string userId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Subscription-safe account deletion is unavailable.");
+    Task<AccountDeletionSubscriptions> BeginConfirmedAccountDeletionAsync(CallerIdentity caller, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Resumable account deletion is unavailable.");
+    Task<AccountDeletionProgress> GetConfirmedAccountDeletionProgressAsync(string userId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Resumable account deletion is unavailable.");
+    Task CompleteAccountDeletionAsync(string userId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Resumable account deletion is unavailable.");
+    Task RecordAccountDeletionSubscriptionStoppedAsync(
+        string userId, AccountDeletionSubscription subscription, string providerStatus, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Subscription-safe account deletion is unavailable.");
+    Task<string?> FindUserIdByEmailAsync(string email, CancellationToken cancellationToken);
+    Task<AccountSnapshot> GrantCreditsAsync(
+        string userId,
+        long creditMicros,
+        string reason,
+        string idempotencyKey,
+        string actor,
+        CancellationToken cancellationToken);
+    Task<bool> BeginPurchaseAsync(
+        string userId,
+        string purchaseId,
+        CatalogProduct product,
+        string idempotencyKey,
+        CancellationToken cancellationToken);
+    Task AttachPurchaseProviderObjectAsync(
+        string userId,
+        string purchaseId,
+        string providerObjectId,
+        string providerObjectType,
+        CancellationToken cancellationToken);
+    Task MarkPurchaseFailedAsync(
+        string userId,
+        string purchaseId,
+        string outcome,
+        CancellationToken cancellationToken);
+    Task CancelPendingPurchaseAsync(
+        string userId,
+        string purchaseId,
+        CancellationToken cancellationToken);
+    Task MarkCheckoutSignatureVerifiedAsync(
+        string userId,
+        string purchaseId,
+        string providerObjectId,
+        string providerPaymentId,
+        CancellationToken cancellationToken);
+    Task<PaymentWebhookResult> ApplyPaymentWebhookAsync(
+        string eventId,
+        string eventType,
+        string providerObjectId,
+        string? providerPaymentId,
+        string? providerOrderId,
+        string? providerSubscriptionId,
+        string? purchaseId,
+        string? providerEventObjectId,
+        long? providerAmountMinor,
+        string status,
+        CancellationToken cancellationToken,
+        DateTimeOffset? subscriptionCycleEndsAt = null,
+        string? providerCurrency = null,
+        string? providerProductSku = null);
+}
+
+public interface ICatalogService
+{
+    Task<CatalogSnapshot> GetAsync(CancellationToken cancellationToken);
+    Task<CatalogProduct> GetProductAsync(
+        string sku,
+        CancellationToken cancellationToken,
+        bool allowPaymentCanary = false);
+    long EstimateReservationCreditMicros(
+        PricingSnapshot pricing,
+        string prompt,
+        int maxOutputTokens,
+        long taskCapCreditMicros);
+    (long ProviderCostUsdMicros, long ChargeCreditMicros) CalculateActualCost(
+        PricingSnapshot pricing,
+        ProviderUsage usage);
+    (long ProviderCostUsdMicros, long ChargeCreditMicros) CalculateLiveActualCost(
+        PricingSnapshot pricing,
+        ProviderUsage usage,
+        int estimateSafetyBasisPoints);
+}
+
+public interface IModelRoutingService
+{
+    Task<ModelRouteSnapshot> ResolveAsync(
+        string? taskKind,
+        string routingKey,
+        CancellationToken cancellationToken);
+}
+
+public sealed record VertexGenerateResult(string Text, ProviderUsage Usage, string? CompleteText = null);
+
+internal sealed class VertexRequestRejectedException : InvalidOperationException
+{
+    public VertexRequestRejectedException(int statusCode)
+        : base($"Vertex AI rejected the request ({statusCode}).")
+    {
+        StatusCode = statusCode;
+    }
+
+    public int StatusCode { get; }
+}
+
+public interface IVertexAiClient
+{
+    Task<int> CountTokensAsync(
+        string model,
+        string location,
+        string prompt,
+        string? systemInstruction,
+        int maxOutputTokens,
+        JsonElement? responseJsonSchema,
+        IReadOnlyList<InlineImageRequest>? images,
+        InlineAudioRequest? audio,
+        CancellationToken cancellationToken) =>
+        Task.FromException<int>(new InvalidOperationException("Exact provider token counting is unavailable."));
+
+    Task<VertexGenerateResult> GenerateAsync(
+        string model,
+        string location,
+        string prompt,
+        string? systemInstruction,
+        int maxOutputTokens,
+        JsonElement? responseJsonSchema,
+        IReadOnlyList<InlineImageRequest>? images,
+        InlineAudioRequest? audio,
+        CancellationToken cancellationToken);
+}
+
+// Nonfinancial admission for exceptional provider token counting only.
+public interface ITokenCountAdmission
+{
+    Task AdmitAsync(CallerIdentity caller, string requestId, CancellationToken cancellationToken);
+}
+
+public interface IPaymentProvider
+{
+    string Name { get; }
+    bool IsConfigured { get; }
+    Task<PaymentOrder> CreateOrderAsync(
+        string purchaseId,
+        CatalogProduct product,
+        CancellationToken cancellationToken);
+    Task<PaymentSubscription> CreateSubscriptionAsync(
+        string purchaseId,
+        CatalogProduct product,
+        CancellationToken cancellationToken);
+    Task<ProviderSubscriptionCancellation> CancelSubscriptionAtCycleEndAsync(
+        string subscriptionId,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+    Task<ProviderSubscriptionCancellation> InspectSubscriptionCancellationStateAsync(
+        string subscriptionId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+    Task<ProviderSubscriptionCancellation> CancelSubscriptionImmediatelyAsync(
+        string subscriptionId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException();
+    Task<ProviderOrderInspection> InspectOrderAsync(
+        string orderId,
+        CancellationToken cancellationToken);
+    Task<ProviderSubscriptionInspection> InspectSubscriptionAsync(
+        string subscriptionId,
+        CancellationToken cancellationToken);
+    Task<IReadOnlyList<ProviderRefund>> InspectRefundsAsync(
+        string paymentId,
+        CancellationToken cancellationToken);
+    Task<IReadOnlyList<ProviderDispute>> InspectDisputesAsync(
+        string paymentId,
+        CancellationToken cancellationToken);
+    bool VerifyOrderCheckoutSignature(string orderId, string paymentId, string signature);
+    bool VerifySubscriptionCheckoutSignature(string subscriptionId, string paymentId, string signature);
+    bool VerifyWebhookSignature(string rawBody, string signature);
+}

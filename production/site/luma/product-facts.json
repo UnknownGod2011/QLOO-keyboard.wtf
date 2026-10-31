@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "sources": ["production/site/index.html", "production/site/pricing.html", "production/site/support.html", "docs/production/EARLY_LAUNCH_REMAINING_ACTIONS.md"],
+  "facts": {
+    "platform": "Windows 10 and 11 x64",
+    "macOS": "Coming soon; no Mac download",
+    "helper": "Chrome Web Store Helper 2.1.28 for supported Chrome page and browser tasks",
+    "features": ["dictation", "writing help", "selected-text questions and translation", "screen understanding", "app and website opening", "supported browser automation"],
+    "personal": "Own compatible API key; no fallback to Managed charges",
+    "managed": "Signed-in account allowance; server-confirmed plan and usage in Account & Billing",
+    "installer": "One normal Windows installer configures the native host; separate Store Helper for Chrome interaction",
+    "warnings": "Early installer is unsigned/unrecognized. Verify official source. Browser Keep/Keep anyway differs from SmartScreen More info and Run anyway. Do not bypass malware warnings or disable protection.",
+    "updates": "Normal installer; unattended installation disabled",
+    "support": "Share version, time and visible error; never keys or private selected text"
+  }
+}

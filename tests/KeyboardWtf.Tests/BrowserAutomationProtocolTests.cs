@@ -1,0 +1,4675 @@
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using KeyboardWtf.Services;
+using KeyboardWtf.Services.BrowserAutomationV2;
+using KeyboardWtf.Services.PaidStaging;
+using Xunit;
+
+namespace KeyboardWtf.Tests;
+
+public sealed class BrowserAutomationProtocolTests
+{
+    [Theory]
+    [InlineData("")]
+    [InlineData("youtube search MrBeast")]
+    [InlineData("/results?search_query=MrBeast")]
+    [InlineData("javascript:alert(1)")]
+    public async Task Malformed_navigation_stays_inside_the_existing_bounded_planner_retry(string invalidUrl)
+    {
+        var calls = 0;
+        var decision = await BrowserAutomationPlanner.ExecutePaidPlanWithMalformedRetryAsync(_ =>
+        {
+            calls++;
+            return Task.FromResult(new BrowserPlannerDecision { Action = new BrowserPlannerAction {
+                Type = "navigate", Url = calls == 1 ? invalidUrl : "https://example.org/verified" } });
+        }, CancellationToken.None);
+        Assert.Equal(2, calls);
+        Assert.Equal("https://example.org/verified", decision.Action.Url);
+    }
+
+    [Theory]
+    [InlineData("type")]
+    [InlineData("paste")]
+    public void Planner_wire_write_without_mode_is_rejected_even_when_reasoning_says_replace(string type)
+    {
+        // Captured real planner failure: full final value, but no action.replace.
+        var json = JsonSerializer.Serialize(new
+        {
+            evaluation = "Use replace=true to preserve the existing text and add the suffix.",
+            action = new { type, targetId = "notes", text = "Existing note / reviewed" },
+        });
+        Assert.Throws<InvalidDataException>(() => BrowserAutomationPlanner.ParseDecision(json));
+    }
+
+    [Theory]
+    [InlineData("type", true, "Existing note / reviewed")]
+    [InlineData("type", false, " / reviewed")]
+    [InlineData("paste", true, "Replacement")]
+    [InlineData("paste", false, " suffix")]
+    public void Planner_wire_write_preserves_explicit_replacement_or_insertion(string type, bool replace, string text)
+    {
+        var json = JsonSerializer.Serialize(new { action = new { type, replace, text } });
+        var action = BrowserAutomationPlanner.ParseDecision(json).Action;
+        Assert.Equal(replace, action.Replace);
+        Assert.Equal(text, action.Text);
+    }
+
+    [Fact]
+    public async Task Ambiguous_wire_write_uses_existing_single_retry_and_never_executes()
+    {
+        var calls = 0;
+        var decision = await BrowserAutomationPlanner.ExecutePaidPlanWithMalformedRetryAsync(
+            _ =>
+            {
+                calls++;
+                return Task.FromResult(BrowserAutomationPlanner.ParseDecision(calls == 1
+                    ? "{\"action\":{\"type\":\"type\",\"text\":\"Existing note / reviewed\"}}"
+                    : "{\"action\":{\"type\":\"type\",\"text\":\" / reviewed\",\"replace\":false}}"));
+            }, CancellationToken.None);
+        Assert.Equal(2, calls);
+        Assert.False(decision.Action.Replace);
+        Assert.Equal(" / reviewed", decision.Action.Text);
+    }
+
+    [Fact]
+    public void Planner_write_mode_is_required_by_schema_and_described_to_model()
+    {
+        var schema = typeof(BrowserAutomationPlanner).GetField("Schema",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!.GetValue(null);
+        var json = JsonSerializer.SerializeToElement(schema);
+        var required = json.GetProperty("properties").GetProperty("action").GetProperty("required");
+        Assert.Contains(required.EnumerateArray(), item => item.GetString() == "replace");
+        var prompt = BrowserAutomationPlanner.BuildPrompt("Edit the notes", new(), [], []);
+        Assert.Contains("only the new text to insert/append", prompt);
+        Assert.Contains("complete desired field value", prompt);
+    }
+
+    [Theory]
+    [InlineData("No tab with id: 42.")]
+    [InlineData("The requested tab is not owned by this browser task.")]
+    public void Missing_task_tab_failures_get_one_bounded_recovery(string error)
+    {
+        Assert.True(BrowserAutomationCoordinator.IsMissingTaskTabError(error));
+        Assert.False(BrowserAutomationCoordinator.IsMissingTaskTabError("The page control is stale."));
+        Assert.True(BrowserAutomationCoordinator.ShouldRecoverMissingTaskTab(
+            "navigate",
+            error,
+            recoveryAlreadyAttempted: false));
+        Assert.False(BrowserAutomationCoordinator.ShouldRecoverMissingTaskTab(
+            "navigate",
+            error,
+            recoveryAlreadyAttempted: true));
+        Assert.False(BrowserAutomationCoordinator.ShouldRecoverMissingTaskTab(
+            "click",
+            error,
+            recoveryAlreadyAttempted: false));
+    }
+
+    [Theory]
+    [InlineData("Please sign in to Gmail.", "login_required")]
+    [InlineData("Complete the CAPTCHA manually.", "captcha_required")]
+    [InlineData("Confirm the destructive delete.", "confirmation_required")]
+    [InlineData("Grant browser permission.", "permission_required")]
+    [InlineData("Provide the URL of the target service.", "ambiguous_target")]
+    [InlineData("Complete this step in Chrome.", "manual_step")]
+    public void Intervention_reason_is_structured_without_losing_the_exact_instruction(
+        string reason,
+        string expectedKind)
+    {
+        Assert.Equal(expectedKind, BrowserAutomationCoordinator.ClassifyIntervention(reason));
+        var speech = BrowserAutomationCoordinator.BuildInterventionSpeech(reason);
+        Assert.Contains(reason, speech);
+        Assert.Contains("same task", speech, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("cancel browser automation", speech, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Planner_intervention_keeps_missing_reason_and_known_optional_status()
+    {
+        var intervention = BrowserAutomationCoordinator.BuildPlannerIntervention(
+            new BrowserPlannerDecision
+            {
+                NeedsUserAction = true,
+                UserAction = "Provide the project URL.",
+                UserActionReason = "The optional profile field is empty.",
+                UserActionRequired = false,
+                UserActionSkippable = true,
+                Action = new BrowserPlannerAction { Type = "needs_user_action" },
+            });
+
+        Assert.Equal("Provide the project URL.", intervention.Missing);
+        Assert.Equal("The optional profile field is empty.", intervention.Explanation);
+        Assert.False(intervention.Required);
+        Assert.True(intervention.CanSkip);
+    }
+
+    [Fact]
+    public void Sensitive_intervention_cannot_be_made_skippable_by_planner_output()
+    {
+        var intervention = BrowserAutomationCoordinator.BuildPlannerIntervention(
+            new BrowserPlannerDecision
+            {
+                NeedsUserAction = true,
+                UserAction = "Complete the CAPTCHA.",
+                UserActionReason = "The site requires a security challenge.",
+                UserActionSkippable = true,
+                Action = new BrowserPlannerAction { Type = "needs_user_action" },
+            });
+
+        Assert.True(intervention.Required);
+        Assert.False(intervention.CanSkip);
+        Assert.Equal("captcha_required", intervention.Kind);
+    }
+
+    [Fact]
+    public void Explicit_skip_may_override_a_planner_label_only_for_the_exact_live_optional_field()
+    {
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Provide text for the field: Was any relevant action missing from the plugin feature list?",
+            Explanation = "The requested value was not supplied.",
+            Required = true,
+            CanSkip = false,
+        };
+        var optionalPage = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldId = "project-note",
+                    FieldLabel = "Was any relevant action missing from the plugin's feature list? If so, please describe what it is",
+                    FieldRequired = false,
+                },
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldId = "action-rating",
+                    FieldLabel = "Were the plugin action names clear?",
+                    FieldRequired = true,
+                },
+            ],
+        };
+        var requiredPage = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldId = "project-note",
+                    FieldLabel = "Was any relevant action missing from the plugin's feature list? If so, please describe what it is",
+                    FieldRequired = true,
+                },
+            ],
+        };
+
+        Assert.True(BrowserAutomationCoordinator.IsInterventionForKnownOptionalPageField(
+            intervention,
+            optionalPage));
+        var reconciled = BrowserAutomationCoordinator.ReconcileInterventionWithPageMetadata(
+            intervention,
+            optionalPage);
+        Assert.False(reconciled.Required);
+        Assert.True(reconciled.CanSkip);
+        var skipped = new HashSet<string>(StringComparer.Ordinal)
+        {
+            BrowserAutomationCoordinator.InterventionFingerprint(reconciled),
+        };
+        Assert.True(BrowserAutomationCoordinator.ShouldSkipIntervention(
+            skipUnavailableOptionalInputs: false,
+            skipped,
+            BrowserAutomationCoordinator.ReconcileInterventionWithPageMetadata(
+                intervention,
+                optionalPage)));
+        Assert.False(BrowserAutomationCoordinator.IsInterventionForKnownOptionalPageField(
+            intervention,
+            requiredPage));
+        Assert.False(BrowserAutomationCoordinator.IsInterventionForKnownOptionalPageField(
+            new BrowserUserIntervention
+            {
+                Missing = "Provide the account email.",
+                Required = true,
+            },
+            optionalPage));
+    }
+
+    [Fact]
+    public void Paused_task_accepts_skip_when_exact_live_field_is_known_optional()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.NeedsUserAction);
+        runtimeType.GetProperty("Intervention")!.SetValue(runtime, new BrowserUserIntervention
+        {
+            Missing = "Provide text for the field: Was any relevant action missing from the plugin feature list?",
+            Explanation = "The requested value was not supplied.",
+            Required = true,
+            CanSkip = false,
+        });
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldId = "project-note",
+                    FieldLabel = "Was any relevant action missing from the plugin's feature list? If so, please describe what it is",
+                    FieldRequired = false,
+                },
+            ],
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        Assert.True(coordinator.TryAddTaskGuidance(
+            "Skip that optional field and continue.",
+            out _));
+        Assert.Equal(BrowserTaskState.ReadingPage, coordinator.Snapshot().State);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public void Authorized_optional_skip_is_terminal_evidence_only_for_an_unchanged_no_mutation_task()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            TabId = 42,
+            Url = "https://example.test/form",
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "optional-input",
+                    FieldId = "optional-note",
+                    FieldLabel = "Optional installation note (plugin + extension)",
+                    FieldRequired = false,
+                    FieldAnswered = false,
+                    Visible = true,
+                    Enabled = true,
+                    Value = "",
+                },
+            ],
+        };
+        var checkpoints = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [BrowserAutomationCoordinator.SkippedFieldCheckpointKey(
+                page.TabId,
+                "optional-note")] = BrowserAutomationCoordinator.SkippedFieldState(
+                    page,
+                    "optional-note"),
+        };
+        var rejected = new BrowserVerificationResult
+        {
+            Error = "No current-task evidence proves the requested outcome.",
+        };
+
+        var verified = BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+            "Fill the optional field 'Optional installation note (plugin plus extension)'. Ask me for the value to put in this field.",
+            new BrowserPlannerDecision { Done = true },
+            page,
+            Array.Empty<BrowserActionReceipt>(),
+            checkpoints,
+            rejected);
+
+        Assert.True(verified.Verified);
+        Assert.Contains("remained unchanged", verified.Evidence);
+
+        page.Controls[0].Value = "unexpected write";
+        page.Controls[0].FieldAnswered = true;
+        Assert.Same(
+            rejected,
+            BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+                "Ask me for the value to put in the optional installation note.",
+                new BrowserPlannerDecision { Done = true },
+                page,
+                Array.Empty<BrowserActionReceipt>(),
+                checkpoints,
+                rejected));
+    }
+
+    [Fact]
+    public void Authorized_optional_skip_never_bypasses_mutation_or_page_evidence()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            TabId = 42,
+            Url = "https://example.test/form",
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "optional-input",
+                    FieldId = "optional-note",
+                    FieldRequired = false,
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+        var checkpoints = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [BrowserAutomationCoordinator.SkippedFieldCheckpointKey(
+                page.TabId,
+                "optional-note")] = BrowserAutomationCoordinator.SkippedFieldState(
+                    page,
+                    "optional-note"),
+        };
+        var rejected = new BrowserVerificationResult { Error = "rejected" };
+        var receipt = new BrowserActionReceipt { Ok = true, Action = "type" };
+
+        Assert.Same(
+            rejected,
+            BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+                "Fill this form and skip the optional note.",
+                new BrowserPlannerDecision { Done = true },
+                page,
+                Array.Empty<BrowserActionReceipt>(),
+                checkpoints,
+                rejected));
+        Assert.Same(
+            rejected,
+            BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+                "Use copied text to fill the current form; skip the optional note.",
+                new BrowserPlannerDecision { Done = true },
+                page,
+                Array.Empty<BrowserActionReceipt>(),
+                checkpoints,
+                rejected));
+        Assert.Same(
+            rejected,
+            BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+                "Ask me for the optional note.",
+                new BrowserPlannerDecision { Done = true },
+                page,
+                new[] { receipt },
+                checkpoints,
+                rejected));
+
+        page.TabId = 99;
+        Assert.Same(
+            rejected,
+            BrowserAutomationCoordinator.VerifyAuthorizedNoMutationCompletion(
+                "Ask me for the optional note.",
+                new BrowserPlannerDecision { Done = true },
+                page,
+                Array.Empty<BrowserActionReceipt>(),
+                checkpoints,
+                rejected));
+    }
+
+    [Theory]
+    [InlineData("Fill what is known and skip unavailable optional fields.", true)]
+    [InlineData("Leave any unknown optional values blank.", true)]
+    [InlineData("Fill the form carefully.", false)]
+    public void Task_level_optional_skip_policy_is_bounded(string request, bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.AllowsSkippingUnavailableOptionalInputs(request));
+
+        var optional = new BrowserUserIntervention
+        {
+            Missing = "An optional profile URL",
+            CanSkip = true,
+        };
+        var required = new BrowserUserIntervention
+        {
+            Missing = "A required account URL",
+            Required = true,
+        };
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.ShouldSkipIntervention(
+                expected,
+                new HashSet<string>(),
+                optional));
+        Assert.False(BrowserAutomationCoordinator.ShouldSkipIntervention(
+            true,
+            new HashSet<string>(),
+            required));
+    }
+
+    [Theory]
+    [InlineData("https://project.example and https://github.com/example/project", true)]
+    [InlineData("The project URL is https://project.example", true)]
+    [InlineData("What do you think about this project?", false)]
+    [InlineData("Switch to the second browser tab.", false)]
+    [InlineData("Open Gmail", false)]
+    public void Paused_url_request_accepts_only_answer_shaped_guidance(
+        string guidance,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsRelevantManualAnswer(
+                new BrowserUserIntervention
+                {
+                    Missing = "Please provide the project and repository URLs.",
+                    Required = true,
+                },
+                guidance));
+    }
+
+    [Fact]
+    public void Paused_task_adopts_a_fresh_active_tab_only_after_clear_user_handoff()
+    {
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Navigate to the intended form page, then tell me when it is ready.",
+            Explanation = "The current page is not the form the task needs.",
+            Required = true,
+        };
+        var current = new BrowserPageSnapshot
+        {
+            WindowId = 8,
+            TabId = 41,
+            Url = "https://source.example/context",
+        };
+        var freshOtherTab = new BrowserHelperStatus
+        {
+            Connected = true,
+            ActiveTabFresh = true,
+            WindowId = 8,
+            TabId = 57,
+            ActiveUrl = "https://forms.example/target",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "I'm on the correct form now; continue here.",
+            current,
+            freshOtherTab));
+        Assert.True(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "Use this current form and resume here.",
+            current,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                ActiveTabFresh = true,
+                WindowId = 12,
+                TabId = 91,
+            }));
+        Assert.True(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "I'm on the correct form now; continue here.",
+            current,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                ActiveTabFresh = true,
+                WindowId = 8,
+                TabId = 41,
+                ActiveUrl = "https://forms.example/target",
+            }));
+        Assert.False(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "What do you think about the project?",
+            current,
+            freshOtherTab));
+        Assert.False(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "What do you think about the project?",
+            current,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                ActiveTabFresh = true,
+                WindowId = 8,
+                TabId = 41,
+                ActiveUrl = "https://forms.example/target",
+            }));
+        Assert.False(BrowserAutomationCoordinator.ShouldAdoptFreshActiveTabForGuidance(
+            intervention,
+            "Continue here.",
+            current,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                ActiveTabFresh = true,
+                WindowId = 8,
+                TabId = 41,
+                ActiveUrl = "https://source.example/context",
+            }));
+    }
+
+    [Fact]
+    public void Paused_task_never_consumes_farewell_or_explicit_browser_cancellation_as_field_guidance()
+    {
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Provide the remaining required value.",
+            Required = true,
+        };
+
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "goodbye"));
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+                "Okay, cancel browser automation and try again."));
+    }
+
+    [Fact]
+    public void Paused_task_accepts_natural_answers_grounded_in_the_requested_live_fields()
+    {
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Provide the operating system and tested devices.",
+            Explanation = "Those required form questions are unanswered.",
+            Required = true,
+        };
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "os-windows",
+                    FieldId = "operating-system",
+                    FieldLabel = "Operating system",
+                    Role = "radio",
+                    AccessibleName = "Windows 11",
+                    Visible = true,
+                    Enabled = true,
+                },
+                new BrowserControl
+                {
+                    Id = "device-mouse",
+                    FieldId = "tested-devices",
+                    FieldLabel = "Tested devices",
+                    Role = "checkbox",
+                    AccessibleName = "MX Master 4",
+                    Visible = true,
+                    Enabled = true,
+                },
+                new BrowserControl
+                {
+                    Id = "unrelated-windows",
+                    FieldId = "favorite-topic",
+                    FieldLabel = "Favorite topic",
+                    Role = "radio",
+                    AccessibleName = "Windows 11",
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+
+        Assert.True(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "I use Windows 11 and tested with MX Master 4.",
+            page));
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "I was thinking about a different product strategy.",
+            page));
+    }
+
+    [Fact]
+    public void Paused_task_accepts_a_contextual_single_character_option_without_substring_matches()
+    {
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Please provide the stability rating from 1 to 5.",
+            Explanation = "The overall performance and stability question is required.",
+            Required = true,
+        };
+        var page = new BrowserPageSnapshot
+        {
+            Controls = Enumerable.Range(1, 5)
+                .Select(value => new BrowserControl
+                {
+                    Id = $"stability-{value}",
+                    FieldId = "stability-rating",
+                    FieldLabel = "Overall performance and stability rating",
+                    Role = "radio",
+                    AccessibleName = value.ToString(),
+                    Visible = true,
+                    Enabled = true,
+                })
+                .ToArray(),
+        };
+
+        Assert.True(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "The stability rating you asked for is 4 out of 5.",
+            page));
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "The stability rating shown elsewhere is 14 out of 50.",
+            page));
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            intervention,
+            "I have 4 ideas about product strategy.",
+            page));
+    }
+
+    [Fact]
+    public void Nonempty_default_value_does_not_answer_a_missing_user_reference()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "comment", FieldId = "comment-field", FieldLabel = "Project notes",
+                    Role = "textbox", AccessibleName = "Project notes", Value = "Initial notes",
+                    FieldAnswered = true, FieldRequired = false, Visible = true, Enabled = true,
+                },
+            ],
+        };
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Please provide the project reference for Project notes.",
+            Explanation = "The user has not supplied the reference.",
+            CanSkip = true,
+        };
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page));
+        var check = new BrowserPlannerAction
+        {
+            Type = "type", TargetFieldId = "comment-field", TargetRole = "textbox",
+            TargetName = "Project notes", Text = "The actual reference",
+        };
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page, [check]));
+        check.Text = "Initial notes"; // Explicitly requested, rather than inferred from nonempty content.
+        Assert.True(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page, [check]));
+        check.Text = "Corrected reference";
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page, [check]));
+        check.Text = "Initial notes";
+        check.TargetFieldId = "a-different-field";
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page, [check]));
+        check.TargetFieldId = "comment-field";
+        check.Type = "uncheck"; // Inappropriate state type must not masquerade as an answer.
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(intervention, page, [check]));
+    }
+
+    [Theory]
+    [InlineData("Project notes:")]
+    [InlineData("Project notes?")]
+    [InlineData("Project notes *")]
+    [InlineData("Project notes：")]
+    public void Optional_field_identity_does_not_require_spoken_label_punctuation(string label)
+    {
+        var field = new BrowserControl
+        {
+            Id = "notes", FieldId = "notes-field", FieldLabel = label,
+            Role = "textbox", Visible = true, Enabled = true,
+            Value = "Default notes", FieldAnswered = true, FieldRequired = false,
+        };
+        var page = new BrowserPageSnapshot { TabId = 12, Controls = [field] };
+        var intervention = new BrowserUserIntervention
+        {
+            Missing = "Please provide the reference for Project notes.", Required = true,
+        };
+        var reconciled = BrowserAutomationCoordinator.ReconcileInterventionWithPageMetadata(intervention, page);
+        Assert.True(reconciled.CanSkip);
+        Assert.False(reconciled.Required);
+        Assert.Same(field, BrowserAutomationCoordinator.FindInterventionPageField(intervention, page));
+        field.FieldRequired = true;
+        Assert.False(BrowserAutomationCoordinator.ReconcileInterventionWithPageMetadata(intervention, page).CanSkip);
+        field.FieldRequired = false;
+        page.Controls = [field, new BrowserControl
+        {
+            Id = "other", FieldId = "other-field", FieldLabel = "Project notes",
+            Role = "textbox", Visible = true, Enabled = true, FieldRequired = false,
+        }];
+        Assert.Null(BrowserAutomationCoordinator.FindInterventionPageField(intervention, page));
+    }
+
+    [Fact]
+    public void Verified_expected_field_state_suppresses_only_its_redundant_intervention()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "stability-4",
+                    FieldId = "stability-rating",
+                    FieldLabel = "Overall performance and stability of the Chrome plugin",
+                    FieldAnswered = true,
+                    Checked = true,
+                    FieldRequired = true,
+                    Role = "radio",
+                    AccessibleName = "4",
+                    Visible = true,
+                    Enabled = true,
+                },
+                new BrowserControl
+                {
+                    Id = "usefulness-8",
+                    FieldId = "usefulness-rating",
+                    FieldLabel = "Usefulness of the Chrome plugin",
+                    FieldAnswered = false,
+                    FieldRequired = true,
+                    Role = "radio",
+                    AccessibleName = "8",
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+
+        BrowserPlannerAction[] expectedFields =
+        [
+            new()
+            {
+                Type = "check", TargetRole = "radio", TargetName = "4",
+                TargetFieldId = "stability-rating",
+            },
+        ];
+        Assert.True(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(
+            new BrowserUserIntervention
+            {
+                Missing = "Please provide the required stability rating for the Chrome plugin.",
+                Explanation = "The overall performance and stability question is required.",
+                Required = true,
+            },
+            page, expectedFields));
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(
+            new BrowserUserIntervention
+            {
+                Missing = "Please provide the required usefulness rating for the Chrome plugin.",
+                Explanation = "The usefulness question is required.",
+                Required = true,
+            },
+            page, expectedFields));
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(
+            new BrowserUserIntervention
+            {
+                Missing = "Please complete the one-time password challenge.",
+                Explanation = "Security verification is required.",
+                Required = true,
+            },
+            page, expectedFields));
+    }
+
+    [Fact]
+    public void Answered_source_editor_cannot_suppress_an_unanswered_target_field_intervention()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "source-context",
+                    FieldId = "source-context",
+                    FieldLabel = "Selected task context Full name Test User Email address unavailable Optional note skip it",
+                    FieldAnswered = true,
+                    FieldRequired = false,
+                    Role = "textbox",
+                    Visible = true,
+                    Enabled = true,
+                },
+                new BrowserControl
+                {
+                    Id = "email",
+                    FieldId = "email",
+                    FieldLabel = "Email address",
+                    FieldAnswered = false,
+                    FieldRequired = true,
+                    Role = "textbox",
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+
+        Assert.False(BrowserAutomationCoordinator.IsRequestedInterventionAlreadySatisfied(
+            new BrowserUserIntervention
+            {
+                Missing = "Please provide a valid email address.",
+                Explanation = "The Email address field is required.",
+                Required = true,
+            },
+            page));
+    }
+
+    [Theory]
+    [InlineData(BrowserTaskState.Planning)]
+    [InlineData(BrowserTaskState.ReadingPage)]
+    [InlineData(BrowserTaskState.Executing)]
+    [InlineData(BrowserTaskState.WaitingForPage)]
+    [InlineData(BrowserTaskState.AnalyzingImage)]
+    [InlineData(BrowserTaskState.Verifying)]
+    [InlineData(BrowserTaskState.Paused)]
+    [InlineData(BrowserTaskState.NeedsUserAction)]
+    public void Explicit_current_page_handoff_is_eligible_from_every_nonterminal_task_state(
+        BrowserTaskState state) =>
+        Assert.True(BrowserAutomationCoordinator.CanAcceptAuthorizedPageHandoff(state));
+
+    [Theory]
+    [InlineData(BrowserTaskState.Queued)]
+    [InlineData(BrowserTaskState.Completed)]
+    [InlineData(BrowserTaskState.CompletedWithNote)]
+    [InlineData(BrowserTaskState.Partial)]
+    [InlineData(BrowserTaskState.Blocked)]
+    [InlineData(BrowserTaskState.Cancelling)]
+    [InlineData(BrowserTaskState.Cancelled)]
+    [InlineData(BrowserTaskState.Failed)]
+    public void Terminal_task_cannot_adopt_a_new_foreground_tab(BrowserTaskState state) =>
+        Assert.False(BrowserAutomationCoordinator.CanAcceptAuthorizedPageHandoff(state));
+
+    [Fact]
+    public async Task Intervention_gate_is_armed_before_a_visible_state_can_resume_it()
+    {
+        var gate = new BrowserAutomationCoordinator.AsyncPauseGate();
+        var published = false;
+
+        var wait = BrowserAutomationCoordinator.ArmPauseBeforePublishingAsync(
+            gate,
+            () =>
+            {
+                published = true;
+                gate.Resume();
+            },
+            CancellationToken.None);
+
+        await wait.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.True(published);
+    }
+
+    [Fact]
+    public void Planner_prompt_requires_structured_intervention_and_authoritative_skip_policy()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Fill the available fields and skip unavailable optional fields.",
+            new BrowserPageSnapshot(),
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("exact missing information", prompt);
+        Assert.Contains("userActionReason", prompt);
+        Assert.Contains("userActionSkippable", prompt);
+        Assert.Contains("Never skip a required or safety-sensitive dependency", prompt);
+    }
+
+    [Fact]
+    public void Planner_receives_fresh_selected_context_and_must_use_known_values_before_asking()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Fill the current form from the selected information without submitting it.",
+            new BrowserPageSnapshot
+            {
+                Url = "https://forms.example/application",
+                SelectedText = "Project name: Clear Finch. Team size: 3. Website: https://clearfinch.example",
+            },
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("CURRENT SELECTED TEXT", prompt, StringComparison.Ordinal);
+        Assert.Contains("Project name: Clear Finch", prompt, StringComparison.Ordinal);
+        Assert.Contains("consume every supported value", prompt, StringComparison.Ordinal);
+        Assert.Contains("genuinely missing required value", prompt, StringComparison.Ordinal);
+        Assert.Contains("an optional field with an answer in the supplied context is requested too", prompt, StringComparison.Ordinal);
+        Assert.Contains("for a radio/checkbox use type='check' or 'uncheck'", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Voice_tool_cancellation_suppresses_only_the_duplicate_lifecycle_announcement()
+    {
+        Assert.False(BrowserAutomationCoordinator.ShouldAnnounceOutcome(
+            BrowserTaskState.Cancelled,
+            suppressCancellationAnnouncement: true));
+        Assert.True(BrowserAutomationCoordinator.ShouldAnnounceOutcome(
+            BrowserTaskState.Cancelled,
+            suppressCancellationAnnouncement: false));
+        Assert.True(BrowserAutomationCoordinator.ShouldAnnounceOutcome(
+            BrowserTaskState.NeedsUserAction,
+            suppressCancellationAnnouncement: true));
+    }
+
+    [Theory]
+    [InlineData(BrowserTaskState.Planning)]
+    [InlineData(BrowserTaskState.Executing)]
+    [InlineData(BrowserTaskState.WaitingForPage)]
+    [InlineData(BrowserTaskState.NeedsUserAction)]
+    [InlineData(BrowserTaskState.Partial)]
+    public void Local_cancel_immediately_clears_every_visible_browser_task_state(BrowserTaskState state)
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, state);
+        runtimeType.GetProperty("Intervention")!.SetValue(runtime, new BrowserUserIntervention
+        {
+            Missing = "A required value",
+            Required = true,
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        Assert.True(coordinator.RequestCancel("test cancellation", announceOutcome: false));
+        var snapshot = coordinator.Snapshot();
+        Assert.Equal(BrowserTaskState.Cancelled, snapshot.State);
+        Assert.Equal(BrowserAutomationOutcome.Cancelled, snapshot.Outcome);
+        Assert.Null(snapshot.Intervention);
+        Assert.False(snapshot.CanCancel);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Jarvis_session_shutdown_silently_cleans_a_partial_browser_task()
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Partial);
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+        var announcements = 0;
+        coordinator.AnnouncementRequested += _ => announcements++;
+
+        var commands = new CommandRegistry(
+            null, null, null, null, null,
+            browserAutomation: coordinator);
+        await commands.HandleJarvisSessionEndingAsync();
+
+        Assert.Equal(BrowserTaskState.Cancelled, coordinator.Snapshot().State);
+        Assert.Empty(coordinator.RecentTerminalOutcomes());
+        Assert.Equal(0, announcements);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public void Superseded_runtime_cannot_overwrite_the_active_task_status()
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var activeField = typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var publish = typeof(BrowserAutomationCoordinator).GetMethod(
+            "Publish", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var stale = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var current = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var observed = new List<string>();
+        coordinator.StatusChanged += snapshot => observed.Add(snapshot.TaskId);
+
+        activeField.SetValue(coordinator, current);
+        publish.Invoke(coordinator, [stale]);
+        publish.Invoke(coordinator, [current]);
+
+        Assert.Equal(
+            [(string)runtimeType.GetProperty("TaskId")!.GetValue(current)!],
+            observed);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(stale)!).Dispose();
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(current)!).Dispose();
+    }
+
+    [Fact]
+    public void Native_message_frames_round_trip_without_truncation()
+    {
+        var payload = Encoding.UTF8.GetBytes("{\"text\":\"Jarvis 🟠 browser\"}");
+        using var stream = new MemoryStream();
+
+        BrowserNativeMessagingHost.WriteFrame(stream, payload);
+        stream.Position = 0;
+
+        Assert.Equal(payload, BrowserNativeMessagingHost.ReadFrame(stream));
+    }
+
+    [Fact]
+    public void Source_extension_versions_match_the_protocol()
+    {
+        var root = FindRepositoryRoot();
+        var extension = Path.Combine(root, "extensions", "keyboard-wtf-browser-helper-v2");
+        using var manifest = JsonDocument.Parse(
+            File.ReadAllText(Path.Combine(extension, "manifest.json")));
+        var expected = BrowserHelperProtocol.Version;
+
+        Assert.Equal(BrowserHelperProtocol.PackageVersion, manifest.RootElement.GetProperty("version").GetString());
+        Assert.Contains(
+            $"const VERSION = \"{expected}\"",
+            File.ReadAllText(Path.Combine(extension, "service-worker.js")));
+        Assert.Contains(
+            $"const VERSION = \"{expected}\"",
+            File.ReadAllText(Path.Combine(extension, "content-script.js")));
+        var hostPermissions = manifest.RootElement
+            .GetProperty("host_permissions")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.Contains("<all_urls>", hostPermissions);
+
+        var permissions = manifest.RootElement
+            .GetProperty("permissions")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.Contains("alarms", permissions);
+        Assert.Contains("webNavigation", permissions);
+        Assert.True(manifest.RootElement
+            .GetProperty("content_scripts")[0]
+            .GetProperty("all_frames")
+            .GetBoolean());
+        Assert.True(manifest.RootElement
+            .GetProperty("content_scripts")[0]
+            .GetProperty("match_origin_as_fallback")
+            .GetBoolean());
+
+        var externalMatches = manifest.RootElement
+            .GetProperty("externally_connectable")
+            .GetProperty("matches")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.Equal(new[]
+        {
+            "https://keyboardwtf.com/*",
+            "https://www.keyboardwtf.com/*",
+            "https://keyboard-wtf.vercel.app/*",
+        }, externalMatches);
+        Assert.DoesNotContain(externalMatches, match => match?.Contains('*') == true && match.StartsWith("*", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Public_website_status_requires_a_live_native_handshake_and_exposes_no_page_data()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+        var website = File.ReadAllText(Path.Combine(root, "production", "site", "chrome-helper-status.js"));
+
+        Assert.Contains("chrome.runtime.onMessageExternal.addListener", worker, StringComparison.Ordinal);
+        Assert.Contains("nativePort && nativeHandshakeReady && helper.commandChannelReady", worker, StringComparison.Ordinal);
+        Assert.Contains("PUBLIC_SITE_ORIGINS", worker, StringComparison.Ordinal);
+        Assert.Contains("keyboard_wtf_public_helper_status", website, StringComparison.Ordinal);
+        Assert.Contains("result?.connected === true && result?.ready === true", website, StringComparison.Ordinal);
+        Assert.DoesNotContain("activeUrl:", worker[worker.IndexOf("chrome.runtime.onMessageExternal", StringComparison.Ordinal)..worker.IndexOf("function connectNative", StringComparison.Ordinal)], StringComparison.Ordinal);
+        Assert.DoesNotContain("activeTitle:", worker[worker.IndexOf("chrome.runtime.onMessageExternal", StringComparison.Ordinal)..worker.IndexOf("function connectNative", StringComparison.Ordinal)], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Restricted_inputs_never_expose_values_or_accept_automation()
+    {
+        var root = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "content-script.js"));
+
+        Assert.Contains("function isRestrictedInput(element)", script);
+        Assert.Contains("\"password\", \"file\"", script);
+        Assert.Contains("Passwords and file uploads require direct user action.", script);
+        Assert.Contains("if (isRestrictedInput(element)) return \"\";", script);
+        Assert.Contains("input:not([type='password']):not([type='file'])", script);
+    }
+
+    [Fact]
+    public void Optional_receipt_capture_cannot_block_the_live_action()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("if (command.captureBeforeAction)", worker);
+        Assert.Contains("screenshotDataUrl = \"\";", worker);
+        Assert.Contains("commit_action", worker);
+    }
+
+    [Fact]
+    public void Native_bridge_recovers_from_a_sleeping_worker_or_stalled_response()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("chrome.alarms.onAlarm.addListener", worker);
+        Assert.Contains("ensureBridgeAlarm", worker);
+        Assert.Contains("NATIVE_RESPONSE_TIMEOUT_MS", worker);
+        Assert.Contains("stalePort?.disconnect", worker);
+        Assert.Contains("pollBusy = false", worker);
+        Assert.Contains("clearTimeout(pending.timer)", worker);
+        Assert.Contains("lastNativeResponseAt", worker);
+    }
+
+    [Fact]
+    public void Native_bridge_discards_a_port_that_rejects_post_message_synchronously()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("const port = nativePort;", worker);
+        Assert.Contains("port.postMessage(message);", worker);
+        Assert.Contains("resetNativePort(String(error?.message || error), port);", worker);
+        Assert.Contains("resetNativePort(error.message, port);", worker);
+        Assert.Contains("if (expectedPort && nativePort !== expectedPort) return;", worker);
+        Assert.DoesNotContain("nativePort.postMessage(message);", worker);
+    }
+
+    [Fact]
+    public void Active_cursor_paste_is_a_verified_helper_contract()
+    {
+        var root = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "content-script.js"));
+
+        Assert.Contains("activeEditable", script);
+        Assert.Contains("focus_active_cursor", script);
+        Assert.Contains("verify_active_text", script);
+        Assert.Contains("valueContains", script);
+        Assert.Contains("hidden textarea as the active native", script);
+        Assert.DoesNotContain("document.execCommand(\"paste\"", script);
+
+        var coordinator = File.ReadAllText(Path.Combine(
+            root,
+            "src",
+            "Services",
+            "BrowserAutomationV2",
+            "BrowserAutomationCoordinator.cs"));
+        var nativeInput = File.ReadAllText(Path.Combine(
+            root,
+            "src",
+            "Services",
+            "BrowserAutomationV2",
+            "BrowserTrustedInput.cs"));
+        Assert.Contains("SelectPreviousText", coordinator);
+        Assert.Contains("CopySelection", coordinator);
+        Assert.Contains("editorReceiptMarker", coordinator);
+        Assert.Contains("Atomic native editor paste was verified", coordinator);
+        Assert.Contains("ClipboardHelper.Restore", coordinator);
+        Assert.Contains("SelectPreviousText", nativeInput);
+        Assert.Contains("CopySelection", nativeInput);
+        Assert.Contains("DeleteSelection", nativeInput);
+        Assert.Contains("CollapseSelectionToEnd", nativeInput);
+    }
+
+    [Fact]
+    public void Highlight_and_action_share_fresh_live_target_geometry()
+    {
+        var root = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "content-script.js"));
+
+        Assert.Contains("Responsive pages can reflow between prepare_action and commit_action.", script);
+        Assert.Contains("liveRect = target.getBoundingClientRect();", script);
+        Assert.Contains("targetBounds = rectangle(liveRect);", script);
+        Assert.Contains("drawHighlight(liveRect);", script);
+        Assert.Contains("sameIdentity(targetIdentity, semanticIdentity(target))", script);
+    }
+
+    [Fact]
+    public void Repeated_same_site_navigation_is_bounded_across_cosmetic_goal_wording()
+    {
+        var attempts = new Dictionary<string, int>(StringComparer.Ordinal);
+        var first = new BrowserPlannerAction
+        {
+            Type = "navigate",
+            Url = "https://example.test/search?a=1",
+        };
+        var second = new BrowserPlannerAction
+        {
+            Type = "navigate",
+            Url = "https://example.test/search?b=2",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, first, "Navigate to the search results page.", 2, out _));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, second, "Open the standard search interface.", 2, out _));
+        Assert.False(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, first, "Return to the main search page.", 2, out var count));
+        Assert.Equal(3, count);
+    }
+
+    [Fact]
+    public void Progressed_url_is_not_discarded_by_a_same_site_home_navigation()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Url = "https://example.test/search?origin=A&destination=B",
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "navigate",
+            Url = "https://example.test/search",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetNavigationRegression(
+            "Find and compare the cheapest result.",
+            page,
+            action,
+            out var reason));
+        Assert.Contains("removes", reason, StringComparison.OrdinalIgnoreCase);
+        Assert.False(BrowserAutomationCoordinator.TryGetNavigationRegression(
+            "Reset and start over.",
+            page,
+            action,
+            out _));
+    }
+
+    [Fact]
+    public void Search_prerequisite_is_not_repeated_after_it_reaches_the_verified_target_page()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Url = "https://example.test/articles/ada-lovelace",
+            Title = "Ada Lovelace",
+        };
+        var receipts = new BrowserActionReceipt[]
+        {
+            new()
+            {
+                Ok = true,
+                Action = "type",
+                TargetRole = "searchbox",
+                TargetName = "Search",
+                ExpectedValue = "Ada Lovelace",
+                ValueMatches = true,
+            },
+            new()
+            {
+                Ok = true,
+                Action = "click",
+                TargetRole = "link",
+                TargetName = "Ada Lovelace — mathematician",
+                Navigation = true,
+                BeforeUrl = "https://example.test/search",
+                AfterUrl = "https://example.test/articles/ada-lovelace",
+            },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetSatisfiedSearchPrerequisite(
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "press_key",
+                TargetRole = "searchbox",
+                TargetName = "Search this site",
+                Key = "Enter",
+            },
+            "Submit the search query for Ada Lovelace.",
+            receipts,
+            out var reason));
+        Assert.Contains("already led", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.False(BrowserAutomationCoordinator.TryGetSatisfiedSearchPrerequisite(
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "type",
+                TargetRole = "searchbox",
+                TargetName = "Search this site",
+                Text = "Analytical Engine",
+            },
+            "Search this site for Analytical Engine.",
+            receipts,
+            out _));
+    }
+
+    [Fact]
+    public void Search_prerequisite_is_not_marked_satisfied_when_link_click_stays_on_homepage()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Url = "https://example.test/",
+            Title = "Example home",
+        };
+        var receipts = new BrowserActionReceipt[]
+        {
+            new()
+            {
+                Ok = true,
+                Action = "type",
+                TargetRole = "searchbox",
+                TargetName = "Search",
+                ExpectedValue = "Ada Lovelace",
+                ValueMatches = true,
+            },
+            new()
+            {
+                Ok = true,
+                Action = "click",
+                TargetRole = "link",
+                TargetName = "Ada Lovelace — mathematician",
+                Navigation = true,
+                BeforeUrl = "https://example.test/",
+                AfterUrl = "https://example.test/",
+            },
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryGetSatisfiedSearchPrerequisite(
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "press_key",
+                TargetRole = "searchbox",
+                TargetName = "Search this site",
+                Key = "Enter",
+            },
+            "Submit the search query for Ada Lovelace.",
+            receipts,
+            out _));
+    }
+
+    [Fact]
+    public void Child_action_deadline_is_not_the_authoritative_five_minute_task_deadline()
+    {
+        // Reproduces the installed path where a navigation killed the old
+        // content script before its command acknowledgement returned at the
+        // per-command boundary, while the current task timer was still live.
+        Assert.True(BrowserAutomationCoordinator.IsChildOperationCancellation(
+            authoritativeTaskCancellationRequested: false));
+
+        // The real task deadline (or an explicit cancellation) remains
+        // authoritative and must not be recovered as a child timeout.
+        Assert.False(BrowserAutomationCoordinator.IsChildOperationCancellation(
+            authoritativeTaskCancellationRequested: true));
+    }
+
+    [Fact]
+    public void Delayed_stale_navigation_cannot_replace_a_verified_detail_page_with_its_homepage()
+    {
+        var verifiedNavigation = new BrowserActionReceipt
+        {
+            Ok = true,
+            Navigation = true,
+            Action = "click",
+            BeforeUrl = "https://example.test/",
+            AfterUrl = "https://example.test/articles/ada-lovelace",
+        };
+        var latePage = new BrowserPageSnapshot
+        {
+            Url = "https://example.test/",
+            Title = "Example home",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldRestoreLateNavigationRegression(
+            "Open the Ada Lovelace article and find the requested fact.",
+            verifiedNavigation,
+            latePage));
+        Assert.False(BrowserAutomationCoordinator.ShouldRestoreLateNavigationRegression(
+            "Go back to the website homepage.",
+            verifiedNavigation,
+            latePage));
+        Assert.False(BrowserAutomationCoordinator.ShouldRestoreLateNavigationRegression(
+            "Open the Ada Lovelace article.",
+            verifiedNavigation,
+            new BrowserPageSnapshot
+            {
+                Url = verifiedNavigation.AfterUrl,
+                Title = "Ada Lovelace",
+            }));
+    }
+
+    [Fact]
+    public void Navigation_that_finishes_during_planning_supersedes_the_old_page_snapshot()
+    {
+        var plannedPage = new BrowserPageSnapshot
+        {
+            TabId = 42,
+            Url = "https://example.test/search?q=ada",
+        };
+        var progressedStatus = new BrowserHelperStatus
+        {
+            Connected = true,
+            CommandChannelReady = true,
+            ActiveTabFresh = true,
+            TabId = 42,
+            ActiveUrl = "https://example.test/articles/ada-lovelace",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.PlannerPageWasSupersededDuringPlanning(
+            plannedPage,
+            progressedStatus));
+        Assert.False(BrowserAutomationCoordinator.PlannerPageWasSupersededDuringPlanning(
+            plannedPage,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                CommandChannelReady = true,
+                ActiveTabFresh = true,
+                TabId = 42,
+                ActiveUrl = plannedPage.Url,
+            }));
+        Assert.False(BrowserAutomationCoordinator.PlannerPageWasSupersededDuringPlanning(
+            plannedPage,
+            new BrowserHelperStatus
+            {
+                Connected = true,
+                CommandChannelReady = true,
+                ActiveTabFresh = true,
+                TabId = 99,
+                ActiveUrl = "https://example.test/articles/ada-lovelace",
+            }));
+    }
+
+    [Fact]
+    public void Navigation_observed_during_planning_becomes_task_scoped_progress()
+    {
+        var receipt = BrowserAutomationCoordinator.CreateObservedNavigationReceipt(
+            "task-1",
+            new BrowserPageSnapshot
+            {
+                WindowId = 7,
+                TabId = 42,
+                Url = "https://example.test/search?q=grace",
+                Title = "Search",
+                Fingerprint = "before",
+            },
+            new BrowserPageSnapshot
+            {
+                WindowId = 7,
+                TabId = 42,
+                Url = "https://example.test/articles/grace-hopper",
+                Title = "Grace Hopper",
+                Fingerprint = "after",
+                GraphVersion = 9,
+                DomEpoch = "epoch-2",
+            });
+
+        Assert.NotNull(receipt);
+        Assert.True(receipt.Ok);
+        Assert.True(receipt.Navigation);
+        Assert.Equal("navigate", receipt.Action);
+        Assert.Equal("Grace Hopper", receipt.TargetName);
+        Assert.Equal(42, receipt.TabId);
+        Assert.Null(BrowserAutomationCoordinator.CreateObservedNavigationReceipt(
+            "task-1",
+            new BrowserPageSnapshot
+            {
+                TabId = 42,
+                Url = "https://example.test/articles/grace-hopper",
+            },
+            new BrowserPageSnapshot
+            {
+                TabId = 42,
+                Url = "https://example.test/",
+            }));
+    }
+
+    [Fact]
+    public async Task Paid_planner_retries_one_malformed_response_then_continues()
+    {
+        var attempts = 0;
+        var retries = 0;
+
+        var result = await BrowserAutomationPlanner.ExecutePaidPlanWithMalformedRetryAsync(
+            _ =>
+            {
+                attempts++;
+                return attempts == 1
+                    ? Task.FromException<BrowserPlannerDecision>(
+                        new System.Text.Json.JsonException("truncated"))
+                    : Task.FromResult(new BrowserPlannerDecision
+                    {
+                        Action = new BrowserPlannerAction { Type = "done" },
+                        ResultSummary = "Recovered",
+                    });
+            },
+            CancellationToken.None,
+            _ => retries++);
+
+        Assert.Equal(2, attempts);
+        Assert.Equal(1, retries);
+        Assert.True(result.Done);
+        Assert.Equal("Recovered", result.ResultSummary);
+    }
+
+    [Fact]
+    public async Task Paid_planner_fails_cleanly_after_two_malformed_responses()
+    {
+        var attempts = 0;
+        var retries = 0;
+
+        await Assert.ThrowsAsync<System.Text.Json.JsonException>(() =>
+            BrowserAutomationPlanner.ExecutePaidPlanWithMalformedRetryAsync(
+                _ =>
+                {
+                    attempts++;
+                    return Task.FromException<BrowserPlannerDecision>(
+                        new System.Text.Json.JsonException($"truncated-{attempts}"));
+                },
+                CancellationToken.None,
+                _ => retries++));
+
+        Assert.Equal(2, attempts);
+        Assert.Equal(1, retries);
+    }
+
+    [Fact]
+    public async Task Paid_planner_does_not_retry_a_valid_response()
+    {
+        var attempts = 0;
+
+        var result = await BrowserAutomationPlanner.ExecutePaidPlanWithMalformedRetryAsync(
+            _ =>
+            {
+                attempts++;
+                return Task.FromResult(new BrowserPlannerDecision
+                {
+                    Action = new BrowserPlannerAction { Type = "done" },
+                    ResultSummary = "Valid",
+                });
+            },
+            CancellationToken.None);
+
+        Assert.Equal(1, attempts);
+        Assert.True(result.Done);
+        Assert.Equal("Valid", result.ResultSummary);
+    }
+
+    [Fact]
+    public async Task Paid_browser_task_waits_for_a_transient_per_minute_limit_without_losing_its_plan()
+    {
+        var attempts = 0;
+        var waits = new List<TimeSpan>();
+        var decision = await BrowserAutomationPlanner.ExecutePaidPlanWithRateLimitRecoveryAsync(
+            _ => ++attempts == 1
+                ? Task.FromException<BrowserPlannerDecision>(
+                    new PaidApiException(HttpStatusCode.Conflict,
+                        "The per-minute request limit has been reached. Try again shortly."))
+                : Task.FromResult(new BrowserPlannerDecision
+                {
+                    Action = new BrowserPlannerAction { Type = "done" },
+                    ResultSummary = "Continued same task",
+                }),
+            CancellationToken.None,
+            waits.Add,
+            (_, _) => Task.CompletedTask);
+
+        Assert.Equal(2, attempts);
+        Assert.Equal([TimeSpan.FromSeconds(20)], waits);
+        Assert.Equal("Continued same task", decision.ResultSummary);
+    }
+
+    [Fact]
+    public async Task Paid_browser_task_does_not_retry_unrelated_conflicts_or_wait_forever()
+    {
+        var attempts = 0;
+        var waits = 0;
+        await Assert.ThrowsAsync<PaidApiException>(() =>
+            BrowserAutomationPlanner.ExecutePaidPlanWithRateLimitRecoveryAsync(
+                _ =>
+                {
+                    attempts++;
+                    return Task.FromException<BrowserPlannerDecision>(
+                        new PaidApiException(HttpStatusCode.Conflict,
+                            "Another one-shot AI request is already running for this account."));
+                },
+                CancellationToken.None,
+                _ => waits++,
+                (_, _) => Task.CompletedTask));
+        Assert.Equal(1, attempts);
+        Assert.Equal(0, waits);
+
+        attempts = 0;
+        await Assert.ThrowsAsync<PaidApiException>(() =>
+            BrowserAutomationPlanner.ExecutePaidPlanWithRateLimitRecoveryAsync(
+                _ =>
+                {
+                    attempts++;
+                    return Task.FromException<BrowserPlannerDecision>(
+                        new PaidApiException(HttpStatusCode.Conflict,
+                            "The per-minute request limit has been reached. Try again shortly."));
+                },
+                CancellationToken.None,
+                _ => waits++,
+                (_, _) => Task.CompletedTask));
+        Assert.Equal(4, attempts);
+        Assert.Equal(3, waits);
+    }
+
+    [Fact]
+    public async Task Cancelling_browser_task_interrupts_its_rate_limit_wait()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var attempts = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            BrowserAutomationPlanner.ExecutePaidPlanWithRateLimitRecoveryAsync(
+                _ =>
+                {
+                    attempts++;
+                    return Task.FromException<BrowserPlannerDecision>(
+                        new PaidApiException(HttpStatusCode.Conflict,
+                            "The per-minute request limit has been reached. Try again shortly."));
+                },
+                cancellation.Token,
+                _ => { },
+                (wait, token) =>
+                {
+                    cancellation.Cancel();
+                    return Task.Delay(wait, token);
+                }));
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public void Context_free_calendar_day_is_rejected_for_an_explicit_date()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName = "7",
+        };
+        var control = new BrowserControl
+        {
+            Id = "day-7",
+            Role = "button",
+            AccessibleName = "7",
+            Text = "7",
+            Visible = true,
+            Enabled = true,
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetAmbiguousExplicitDateTarget(
+            "Select September 7, 2026 as the departure date.",
+            action,
+            control,
+            out var reason));
+        Assert.Contains("context-free", reason, StringComparison.OrdinalIgnoreCase);
+
+        control.AccessibleName = "September 7, 2026";
+        Assert.False(BrowserAutomationCoordinator.TryGetAmbiguousExplicitDateTarget(
+            "Select September 7, 2026 as the departure date.",
+            action,
+            control,
+            out _));
+    }
+
+    [Fact]
+    public void Grounded_control_cannot_silently_switch_to_another_requested_month()
+    {
+        var request =
+            "Find a round-trip option for September 7 through September 14, 2026.";
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName =
+                "Done. Search for round trip options departing on December 7, 2026.",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetExplicitConstraintConflict(
+            request,
+            action,
+            null,
+            out var reason));
+        Assert.Contains("different month", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Helper_scans_and_executes_controls_inside_normal_child_frames()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+        var script = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "content-script.js"));
+
+        Assert.Contains("chrome.webNavigation.getAllFrames", worker);
+        Assert.Contains("mergeFrameSnapshots", worker);
+        Assert.Contains("frameForCommand", worker);
+        Assert.Contains("frameIds: [frameId]", worker);
+        Assert.Contains("scopedControlId", worker);
+        Assert.Contains("isEligibleChildFrame", worker);
+        Assert.Contains("isInheritedOriginFrame", worker);
+        Assert.Contains("__active_cursor__", worker);
+        Assert.Contains("scan(message.taskId, Number(message.frameId || 0))", script);
+        Assert.Contains("describeControl(id, element, rect, frameId)", script);
+        Assert.Contains("targetId: command.controlId || \"\"", script);
+        Assert.Contains("contextualAccessibleLabel", script);
+        Assert.Contains("referencedLabelText", script);
+        Assert.Contains("A stale short label such as a calendar day is unsafe", script);
+    }
+
+    [Fact]
+    public void Exact_quoted_current_cursor_text_uses_the_verified_direct_paste_path()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            ActiveEditable = true,
+            ActiveEditorId = "f7:__active_cursor__",
+            ActiveEditorRole = "textbox",
+            ActiveEditorName = "Document editor",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryBuildDirectActiveCursorPasteAction(
+            "In this document, place the exact text \"safe validation text\" at the current cursor.",
+            page,
+            out var action));
+        Assert.Equal("paste", action.Type);
+        Assert.Equal("f7:__active_cursor__", action.TargetId);
+        Assert.Equal("safe validation text", action.Text);
+    }
+
+    [Theory]
+    [InlineData("Write me a poem.")]
+    [InlineData("Summarize this document.")]
+    [InlineData("Place the text at the current cursor.")]
+    public void Direct_cursor_paste_requires_an_active_cursor_and_explicit_quoted_text(
+        string request)
+    {
+        Assert.False(BrowserAutomationCoordinator.TryBuildDirectActiveCursorPasteAction(
+            request,
+            new BrowserPageSnapshot
+            {
+                ActiveEditable = true,
+                ActiveEditorId = "f7:__active_cursor__",
+            },
+            out _));
+    }
+
+    [Fact]
+    public void Task_tab_activation_requires_an_exact_owned_tab_identifier()
+    {
+        var owned = new HashSet<int> { 41, 73 };
+
+        Assert.True(BrowserAutomationCoordinator.TryResolveTaskTabTarget(
+            new BrowserPlannerAction { Type = "activate_tab", TargetId = "tab:73" },
+            owned,
+            out var tabId));
+        Assert.Equal(73, tabId);
+        Assert.False(BrowserAutomationCoordinator.TryResolveTaskTabTarget(
+            new BrowserPlannerAction { Type = "activate_tab", TargetId = "tab:99" },
+            owned,
+            out _));
+        Assert.False(BrowserAutomationCoordinator.TryResolveTaskTabTarget(
+            new BrowserPlannerAction { Type = "activate_tab", TargetId = "73" },
+            owned,
+            out _));
+    }
+
+    [Theory]
+    [InlineData("Summarize this page and paste it into Google Docs.", true)]
+    [InlineData("Place the exact text at the current cursor.", true)]
+    [InlineData("Summarize this page and copy it to the clipboard.", false)]
+    public void Destination_editor_workflows_are_not_terminated_at_intermediate_clipboard_steps(
+        string request,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.RequiresDestinationEditorTransfer(request));
+    }
+
+    [Fact]
+    public void Planner_type_on_the_active_document_editor_uses_trusted_native_paste()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            ActiveEditable = true,
+            ActiveEditorId = "f9:editor",
+            ActiveEditorName = "Document content",
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Id = "f9:editor",
+                    Role = "textbox",
+                    AccessibleName = "Document content",
+                    Editable = true,
+                    Visible = true,
+                },
+            },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldUseTrustedEditorPaste(
+            "Paste the summary into this Google Doc.",
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "type",
+                TargetId = "f9:editor",
+                TargetRole = "textbox",
+                TargetName = "Document content",
+                Text = "summary",
+            }));
+        Assert.False(BrowserAutomationCoordinator.ShouldUseTrustedEditorPaste(
+            "Fill this form.",
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "type",
+                TargetId = "f9:editor",
+                Text = "answer",
+            }));
+    }
+
+    [Fact]
+    public void Browser_result_text_is_not_persisted_by_general_notifications()
+    {
+        var root = FindRepositoryRoot();
+        var coordinator = File.ReadAllText(Path.Combine(
+            root,
+            "src",
+            "Services",
+            "BrowserAutomationV2",
+            "BrowserAutomationCoordinator.cs"));
+        var notifications = File.ReadAllText(Path.Combine(
+            root,
+            "src",
+            "Services",
+            "NotificationService.cs"));
+
+        Assert.Contains("AttentionTransient(\"Browser automation\", finalSummary)", coordinator);
+        Assert.Contains("WarningTransient(\"Browser automation\", message)", coordinator);
+        Assert.Contains("notifySystem: true, writeLog: false", notifications);
+        Assert.Contains("notifySystem: false, writeLog: false", notifications);
+    }
+
+    [Fact]
+    public void Unowned_tabs_are_reused_only_for_the_exact_requested_page()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("sameReusablePage(safeUrl(tab.url), target)", worker);
+        Assert.Contains("current.pathname", worker);
+        Assert.Contains("current.search === target.search", worker);
+    }
+
+    [Fact]
+    public void Helper_is_installed_into_one_stable_versioned_folder()
+    {
+        var root = FindRepositoryRoot();
+        var source = Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2");
+        var destination = Path.Combine(
+            Path.GetTempPath(),
+            $"keyboard-wtf-helper-{Guid.NewGuid():N}");
+
+        try
+        {
+            BrowserNativeHostInstaller.InstallExtension(source, destination);
+
+            Assert.True(BrowserNativeHostInstaller.ExtensionVersionMatches(destination));
+            using var manifest = JsonDocument.Parse(
+                File.ReadAllText(Path.Combine(destination, "manifest.json")));
+            Assert.Equal(
+                BrowserHelperProtocol.PackageVersion,
+                manifest.RootElement.GetProperty("version").GetString());
+            Assert.Contains(
+                $"const VERSION = \"{BrowserHelperProtocol.Version}\"",
+                File.ReadAllText(Path.Combine(destination, "service-worker.js")));
+            Assert.Contains(
+                $"const VERSION = \"{BrowserHelperProtocol.Version}\"",
+                File.ReadAllText(Path.Combine(destination, "content-script.js")));
+            Assert.True(File.Exists(Path.Combine(destination, "popup.html")));
+            Assert.True(File.Exists(Path.Combine(destination, "popup.css")));
+            Assert.True(File.Exists(Path.Combine(destination, "popup.js")));
+            Assert.True(File.Exists(Path.Combine(destination, "icons", "icon-128.png")));
+        }
+        finally
+        {
+            if (Directory.Exists(destination))
+                Directory.Delete(destination, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Native_helper_accepts_the_store_and_development_id_only()
+    {
+        Assert.Equal(
+            "gojdebdikepkpapmnggeljneamjdigbh",
+            BrowserHelperProtocol.StoreExtensionId);
+        Assert.Equal(
+            "gfndpohemndahmmeealkdobepjacblnf",
+            BrowserHelperProtocol.DevelopmentExtensionId);
+        Assert.True(BrowserHelperProtocol.IsAllowedExtensionId(
+            BrowserHelperProtocol.StoreExtensionId));
+        Assert.True(BrowserHelperProtocol.IsAllowedExtensionId(
+            BrowserHelperProtocol.DevelopmentExtensionId));
+        Assert.False(BrowserHelperProtocol.IsAllowedExtensionId(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+
+        Assert.True(BrowserNativeMessagingHost.IsNativeHostInvocation(new[]
+        {
+            $"chrome-extension://{BrowserHelperProtocol.StoreExtensionId}/",
+        }));
+        Assert.True(BrowserNativeMessagingHost.IsNativeHostInvocation(new[]
+        {
+            $"chrome-extension://{BrowserHelperProtocol.DevelopmentExtensionId}/",
+        }));
+        Assert.False(BrowserNativeMessagingHost.IsNativeHostInvocation(new[]
+        {
+            "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+        }));
+    }
+
+    [Fact]
+    public void Store_and_development_origins_are_both_registered()
+    {
+        Assert.Equal(new[]
+        {
+            $"chrome-extension://{BrowserHelperProtocol.StoreExtensionId}/",
+            $"chrome-extension://{BrowserHelperProtocol.DevelopmentExtensionId}/",
+        }, BrowserHelperProtocol.AllowedExtensionOrigins);
+        Assert.True(BrowserNativeHostInstaller.HasExactAllowedOrigins(
+            BrowserHelperProtocol.AllowedExtensionOrigins));
+        Assert.False(BrowserNativeHostInstaller.HasExactAllowedOrigins(
+            BrowserHelperProtocol.AllowedExtensionOrigins.Append(
+                "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/")));
+    }
+
+    [Fact]
+    public void Native_host_diagnostics_distinguish_current_stale_and_unsafe_registration()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "keyboard-wtf-native-host-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var current = Path.Combine(directory, "current.exe");
+            var old = Path.Combine(directory, "old.exe");
+            File.WriteAllBytes(current, [0]);
+            File.WriteAllBytes(old, [0]);
+            var manifest = Path.Combine(directory, "host.json");
+
+            WriteNativeHostManifest(manifest, current, BrowserHelperProtocol.AllowedExtensionOrigins);
+            Assert.True(BrowserNativeHostInstaller.EvaluateManifest(manifest, current).Ready);
+
+            WriteNativeHostManifest(manifest, old, BrowserHelperProtocol.AllowedExtensionOrigins);
+            var stale = BrowserNativeHostInstaller.EvaluateManifest(manifest, current);
+            Assert.False(stale.Ready);
+            Assert.Contains("another keyboard.wtf installation", stale.Issue, StringComparison.OrdinalIgnoreCase);
+
+            WriteNativeHostManifest(
+                manifest,
+                current,
+                BrowserHelperProtocol.AllowedExtensionOrigins.Append(
+                    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"));
+            var unsafeRegistration = BrowserNativeHostInstaller.EvaluateManifest(manifest, current);
+            Assert.False(unsafeRegistration.Ready);
+            Assert.Contains("unsafe", unsafeRegistration.Issue, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    private static void WriteNativeHostManifest(
+        string path,
+        string executable,
+        IEnumerable<string> origins) =>
+        File.WriteAllText(path, JsonSerializer.Serialize(new
+        {
+            name = "wtf.keyboard.browser",
+            description = "test",
+            path = executable,
+            type = "stdio",
+            allowed_origins = origins,
+        }));
+
+    [Fact]
+    public void Two_fresh_helper_identities_fail_closed()
+    {
+        var now = DateTime.UtcNow;
+        var both = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase)
+        {
+            [BrowserHelperProtocol.StoreExtensionId] = now,
+            [BrowserHelperProtocol.DevelopmentExtensionId] = now,
+        };
+
+        Assert.True(BrowserHelperBridge.HasMultipleFreshExtensionIds(both, now));
+        both[BrowserHelperProtocol.DevelopmentExtensionId] = now.AddSeconds(-5);
+        Assert.False(BrowserHelperBridge.HasMultipleFreshExtensionIds(both, now));
+    }
+
+    [Fact]
+    public void Provider_url_keeps_navigation_context_but_redacts_credentials()
+    {
+        var url =
+            "https://example.test/search?q=keyboard&access_token=secret&api_key=private#session=hidden";
+        var redacted = BrowserAutomationText.RedactUrlForProvider(url);
+
+        Assert.Contains("q=keyboard", redacted);
+        Assert.Contains("access_token=%5Bredacted%5D", redacted);
+        Assert.Contains("api_key=%5Bredacted%5D", redacted);
+        Assert.Contains("session=%5Bredacted%5D", redacted);
+        Assert.DoesNotContain("secret", redacted);
+        Assert.DoesNotContain("private", redacted);
+        Assert.DoesNotContain("hidden", redacted);
+    }
+
+    [Fact]
+    public void Unicode_truncation_does_not_split_surrogate_pairs()
+    {
+        var value = "ab🟠cd";
+        var truncated = BrowserAutomationText.Truncate(value, 3);
+
+        Assert.Equal("ab🟠", truncated);
+        Assert.False(char.IsHighSurrogate(truncated[^1]));
+    }
+
+    [Fact]
+    public void Protected_active_tab_reports_the_real_readiness_error()
+    {
+        var error = BrowserHelperBridge.ResolveStatusError(
+            BrowserHelperProtocol.Version,
+            "",
+            "",
+            "Open a normal http/https page to use current-tab automation.");
+
+        Assert.Equal(
+            "Open a normal http/https page to use current-tab automation.",
+            error);
+    }
+
+    [Theory]
+    [InlineData("chrome://newtab", true)]
+    [InlineData("edge://newtab", true)]
+    [InlineData("about:blank", true)]
+    [InlineData("", true)]
+    [InlineData("https://example.test/", false)]
+    [InlineData("http://localhost:8090/", false)]
+    public void Protected_or_blank_tabs_are_identified_without_affecting_normal_pages(
+        string url,
+        bool expected) =>
+        Assert.Equal(expected, BrowserAutomationCoordinator.IsProtectedOrBlankUrl(url));
+
+    [Theory]
+    [InlineData("chrome://newtab", true)]
+    [InlineData("chrome://newtab/", true)]
+    [InlineData("chrome://new-tab-page", true)]
+    [InlineData("edge://newtab/", true)]
+    [InlineData("about:blank", true)]
+    [InlineData("chrome://extensions", false)]
+    [InlineData("chrome://settings", false)]
+    [InlineData("https://example.test/", false)]
+    [InlineData("", false)]
+    public void Only_disposable_protected_tabs_are_eligible_for_service_worker_bootstrap(
+        string url,
+        bool expected) =>
+        Assert.Equal(expected, BrowserHelperBridge.IsDisposableProtectedOrBlankUrl(url));
+
+    [Fact]
+    public void Real_start_gate_allows_only_a_fresh_supported_helper_on_a_disposable_tab()
+    {
+        static BrowserHelperStatus Status(
+            bool connected = true,
+            bool disposable = true,
+            string extensionId = BrowserHelperProtocol.StoreExtensionId,
+            string serviceWorkerVersion = BrowserHelperProtocol.Version,
+            bool multipleHelpers = false,
+            int? windowId = 4,
+            int? tabId = 12,
+            bool supportsAuthority = true) => new()
+        {
+            Connected = connected,
+            CommandAuthoritySupported = supportsAuthority,
+            ActiveTabIsDisposableProtectedOrBlank = disposable,
+            ExtensionId = extensionId,
+            ServiceWorkerVersion = serviceWorkerVersion,
+            MultipleHelpersDetected = multipleHelpers,
+            WindowId = windowId,
+            TabId = tabId,
+        };
+
+        Assert.True(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(Status()));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(connected: false)));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(disposable: false)));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(extensionId: "forged-extension-id")));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(serviceWorkerVersion: "0.0.0")));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(multipleHelpers: true)));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(tabId: null)));
+        Assert.False(BrowserHelperBridge.CanBootstrapDisposableProtectedTab(
+            Status(supportsAuthority: false)));
+    }
+
+    [Theory]
+    [InlineData("begin_task", true)]
+    [InlineData("navigate", true)]
+    [InlineData("open_tab", true)]
+    [InlineData("click", false)]
+    [InlineData("type", false)]
+    public void Only_service_worker_safe_commands_bypass_content_script_readiness(
+        string action,
+        bool expected) =>
+        Assert.Equal(expected, BrowserHelperBridge.IsServiceWorkerCommand(action));
+
+    [Fact]
+    public void Upcoming_helper_leases_a_protected_tab_then_requires_safe_https_navigation()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("return protectedPageSnapshot(command.taskId, current)", worker,
+            StringComparison.Ordinal);
+        Assert.Contains("Choose navigate with a safe absolute http/https destination", worker,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("chrome.tabs.update(current.id, { url: \"https://", worker,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Protected_blank_tab_is_reused_but_an_unrelated_normal_page_is_preserved()
+    {
+        Assert.False(BrowserAutomationCoordinator.ShouldOpenDestinationInNewTab(
+            currentPageIntent: false,
+            destinationTabOpened: false,
+            initialTabWasProtectedOrBlank: true,
+            initialTabId: 7,
+            currentTabId: 7,
+            actionType: "navigate",
+            currentUrl: "chrome://newtab",
+            destinationUrl: "https://www.youtube.com/"));
+
+        Assert.True(BrowserAutomationCoordinator.ShouldOpenDestinationInNewTab(
+            currentPageIntent: false,
+            destinationTabOpened: false,
+            initialTabWasProtectedOrBlank: false,
+            initialTabId: 7,
+            currentTabId: 7,
+            actionType: "navigate",
+            currentUrl: "https://devpost.com/",
+            destinationUrl: "https://www.youtube.com/"));
+    }
+
+    [Fact]
+    public void Only_the_first_successful_task_navigation_gets_a_readiness_wait()
+    {
+        var navigated = new BrowserActionReceipt { Ok = true, Navigation = true };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldStabilizeFirstNavigation(
+            alreadyStabilized: false,
+            actionType: "navigate",
+            navigated));
+        Assert.False(BrowserAutomationCoordinator.ShouldStabilizeFirstNavigation(
+            alreadyStabilized: true,
+            actionType: "navigate",
+            navigated));
+        Assert.False(BrowserAutomationCoordinator.ShouldStabilizeFirstNavigation(
+            alreadyStabilized: false,
+            actionType: "click",
+            navigated));
+        Assert.False(BrowserAutomationCoordinator.ShouldStabilizeFirstNavigation(
+            alreadyStabilized: false,
+            actionType: "navigate",
+            new BrowserActionReceipt { Ok = false, Navigation = true }));
+    }
+
+    [Fact]
+    public void Successful_no_change_link_click_waits_for_a_delayed_same_tab_navigation()
+    {
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = true,
+            Action = "click",
+            TargetRole = "link",
+            TargetName = "RevenueCat Shipaton 2026",
+            BeforeUrl = "https://devpost.com/hackathons?order_by=prize-amount",
+            AfterUrl = "https://devpost.com/hackathons?order_by=prize-amount",
+            NoVisibleChange = true,
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldAwaitDelayedLinkNavigation(
+            "click",
+            receipt));
+        Assert.True(BrowserAutomationCoordinator.TryReconcileDelayedLinkNavigation(
+            17,
+            receipt,
+            new BrowserHelperStatus
+            {
+                TabId = 17,
+                WindowId = 4,
+                ActiveUrl = "https://revenuecat-shipaton-2026.devpost.com/",
+            }));
+        Assert.True(receipt.Navigation);
+        Assert.False(receipt.NoVisibleChange);
+        Assert.Equal(
+            "https://revenuecat-shipaton-2026.devpost.com/",
+            receipt.AfterUrl);
+        Assert.Equal(17, receipt.TabId);
+        Assert.Equal(4, receipt.WindowId);
+    }
+
+    [Fact]
+    public void Timed_out_navigation_is_reconciled_only_from_a_readable_exact_owned_destination()
+    {
+        var before = new BrowserPageSnapshot
+        {
+            WindowId = 7,
+            TabId = 42,
+            Url = "https://example.test/hackathons",
+            Title = "Hackathons",
+            Fingerprint = "before",
+        };
+        var fresh = new BrowserPageSnapshot
+        {
+            WindowId = 7,
+            TabId = 42,
+            Url = "https://example.test/hackathons?order_by=prize-amount",
+            Title = "Sorted hackathons",
+            PageText = "Prize amount",
+            Fingerprint = "after",
+            GraphVersion = 9,
+            DomEpoch = "epoch-2",
+        };
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = false,
+            Action = "navigate",
+            Error = "The page did not finish loading in time.",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryReconcileUsableTimedOutNavigation(
+            before,
+            fresh.Url,
+            42,
+            fresh,
+            receipt));
+        Assert.True(receipt.Ok);
+        Assert.True(receipt.Navigation);
+        Assert.Equal(fresh.Url, receipt.AfterUrl);
+        Assert.Equal("", receipt.Error);
+    }
+
+    [Theory]
+    [InlineData(43, "https://example.test/hackathons?order_by=prize-amount", "The page did not finish loading in time.")]
+    [InlineData(42, "https://example.test/hackathons?order_by=recent", "The page did not finish loading in time.")]
+    [InlineData(42, "https://example.test/hackathons?order_by=prize-amount", "The Chrome Helper disconnected.")]
+    public void Timed_out_navigation_never_adopts_another_tab_url_or_failure(
+        int freshTabId,
+        string freshUrl,
+        string error)
+    {
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = false,
+            Action = "navigate",
+            Error = error,
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryReconcileUsableTimedOutNavigation(
+            new BrowserPageSnapshot
+            {
+                WindowId = 7,
+                TabId = 42,
+                Url = "https://example.test/hackathons",
+            },
+            "https://example.test/hackathons?order_by=prize-amount",
+            42,
+            new BrowserPageSnapshot
+            {
+                WindowId = 7,
+                TabId = freshTabId,
+                Url = freshUrl,
+                Title = "Hackathons",
+            },
+            receipt));
+        Assert.False(receipt.Ok);
+    }
+
+    [Fact]
+    public void Delayed_link_reconciliation_never_adopts_another_tab()
+    {
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = true,
+            Action = "click",
+            TargetRole = "link",
+            BeforeUrl = "https://example.test/list",
+            AfterUrl = "https://example.test/list",
+            NoVisibleChange = true,
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryReconcileDelayedLinkNavigation(
+            17,
+            receipt,
+            new BrowserHelperStatus
+            {
+                TabId = 18,
+                ActiveUrl = "https://example.test/detail",
+            }));
+        Assert.False(receipt.Navigation);
+        Assert.True(receipt.NoVisibleChange);
+        Assert.Equal("https://example.test/list", receipt.AfterUrl);
+    }
+
+    [Fact]
+    public void Healthy_command_channel_does_not_surface_a_stale_bridge_error()
+    {
+        var error = BrowserHelperBridge.ResolveStatusError(
+            BrowserHelperProtocol.Version,
+            BrowserHelperProtocol.Version,
+            "https://example.test/",
+            "Keyboard.wtf native bridge heartbeat was stale.",
+            BrowserHelperProtocol.StoreExtensionId,
+            commandChannelReady: true);
+
+        Assert.Empty(error);
+    }
+
+    [Fact]
+    public void Stale_content_script_is_distinguished_from_service_worker_mismatch()
+    {
+        Assert.Equal(
+            $"Chrome Helper content script version mismatch. Expected {BrowserHelperProtocol.Version}.",
+            BrowserHelperBridge.ResolveStatusError(
+                BrowserHelperProtocol.Version,
+                "0.6.20",
+                "https://example.test/",
+                ""));
+
+        Assert.Equal(
+            $"Chrome Helper service worker version mismatch. Expected {BrowserHelperProtocol.Version}.",
+            BrowserHelperBridge.ResolveStatusError(
+                "0.6.20",
+                BrowserHelperProtocol.Version,
+                "https://example.test/",
+            ""));
+    }
+
+    [Fact]
+    public void Planner_does_not_discard_a_final_required_action()
+    {
+        var decision = new BrowserPlannerDecision
+        {
+            Done = true,
+            Action = new BrowserPlannerAction
+            {
+                Type = "copy_clipboard",
+                Text = "safe fixture summary",
+            },
+        };
+
+        BrowserAutomationPlanner.ValidateDecision(decision);
+
+        Assert.False(decision.Done);
+        Assert.Equal("copy_clipboard", decision.Action.Type);
+    }
+
+    [Fact]
+    public void Explicit_done_action_is_terminal()
+    {
+        var decision = new BrowserPlannerDecision
+        {
+            Action = new BrowserPlannerAction { Type = "done" },
+        };
+
+        BrowserAutomationPlanner.ValidateDecision(decision);
+
+        Assert.True(decision.Done);
+    }
+
+    [Theory]
+    [InlineData("Click Oldest on this page.", true)]
+    [InlineData("Please press the Refresh results icon.", true)]
+    [InlineData("Choose Smart.", true)]
+    [InlineData("Click Oldest and open the first video.", false)]
+    [InlineData("Open Amazon and add a product.", false)]
+    [InlineData("Fill this form.", false)]
+    public void Only_one_explicit_control_action_can_stop_from_local_evidence(
+        string request,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsExplicitSingleControlActionRequest(request));
+    }
+
+    [Fact]
+    public void Unrequested_final_action_is_replanned_instead_of_becoming_user_guidance()
+    {
+        var decision = new BrowserAutomationSafetyDecision
+        {
+            MayStart = false,
+            PauseBeforeSensitiveStep = true,
+            Reason =
+                "Pressing Enter here could submit or send. The user did not explicitly request the final action.",
+        };
+
+        Assert.True(
+            BrowserAutomationCoordinator.IsUnrequestedFinalActionRejection(decision));
+        Assert.False(
+            BrowserAutomationCoordinator.IsUnrequestedFinalActionRejection(
+                new BrowserAutomationSafetyDecision
+                {
+                    MayStart = false,
+                    PauseBeforeSensitiveStep = true,
+                    Reason = "This password step requires the user.",
+                }));
+    }
+
+    [Fact]
+    public void Grounded_read_only_noop_is_normalized_to_done()
+    {
+        var decision = new BrowserPlannerDecision
+        {
+            ResultSummary = "The current page is a safe fixture.",
+            Action = new BrowserPlannerAction { Type = "none" },
+        };
+
+        BrowserAutomationPlanner.ValidateDecision(decision);
+
+        Assert.True(decision.Done);
+        Assert.Equal("done", decision.Action.Type);
+    }
+
+    [Fact]
+    public void Unknown_planner_action_is_rejected_before_execution()
+    {
+        var decision = new BrowserPlannerDecision
+        {
+            Action = new BrowserPlannerAction { Type = "invented_action" },
+        };
+
+        Assert.Throws<InvalidDataException>(
+            () => BrowserAutomationPlanner.ValidateDecision(decision));
+    }
+
+    [Fact]
+    public void Fresh_custom_option_state_confirms_the_requested_value()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Role = "option",
+                    AccessibleName = "Rock",
+                    Selected = true,
+                },
+            },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.FreshStateConfirmsOption(
+            page,
+            new BrowserPlannerAction
+            {
+                Type = "click",
+                TargetRole = "option",
+                TargetName = "Rock",
+            },
+            new BrowserActionReceipt { TargetRole = "option", TargetName = "Rock" }));
+    }
+
+    [Theory]
+    [InlineData("Choose")]
+    [InlineData("Select")]
+    [InlineData("Select an option")]
+    public void Placeholder_option_is_never_completion_evidence(string placeholder)
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Role = "option",
+                    AccessibleName = placeholder,
+                    Selected = true,
+                },
+            },
+        };
+
+        Assert.False(BrowserAutomationCoordinator.FreshStateConfirmsOption(
+            page,
+            new BrowserPlannerAction { Type = "click", TargetName = placeholder },
+            new BrowserActionReceipt { TargetRole = "option", TargetName = placeholder }));
+    }
+
+    [Fact]
+    public void Noop_custom_listbox_click_uses_trusted_keyboard_fallback()
+    {
+        Assert.True(BrowserAutomationCoordinator.ShouldUseListboxKeyboardFallback(
+            new BrowserPlannerAction { Type = "click", TargetRole = "listbox" },
+            new BrowserActionReceipt
+            {
+                Ok = true,
+                TargetRole = "listbox",
+                NoVisibleChange = true,
+            }));
+        Assert.False(BrowserAutomationCoordinator.ShouldUseListboxKeyboardFallback(
+            new BrowserPlannerAction { Type = "click", TargetRole = "button" },
+            new BrowserActionReceipt
+            {
+                Ok = true,
+                TargetRole = "button",
+                NoVisibleChange = true,
+            }));
+    }
+
+    [Fact]
+    public void Non_native_select_is_resolved_to_the_exact_live_option()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "select_option",
+            Option = "Rock",
+        };
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = false,
+            Error = "The target is not a native select control.",
+        };
+        var page = new BrowserPageSnapshot
+        {
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Id = "broad",
+                    Role = "listbox",
+                    AccessibleName = "What are the planets made of? Rock Gas",
+                    Enabled = true,
+                    Visible = true,
+                    Bounds = new BrowserRectangle { Width = 500, Height = 200 },
+                },
+                new BrowserControl
+                {
+                    Id = "rock",
+                    Role = "option",
+                    AccessibleName = "Rock",
+                    Enabled = true,
+                    Visible = true,
+                    Bounds = new BrowserRectangle { Width = 120, Height = 40 },
+                },
+                new BrowserControl
+                {
+                    Id = "gas",
+                    Role = "option",
+                    AccessibleName = "Gas",
+                    Enabled = true,
+                    Visible = true,
+                    Bounds = new BrowserRectangle { Width = 120, Height = 40 },
+                },
+            },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldResolveCustomOption(action, receipt));
+        Assert.Equal(
+            "rock",
+            BrowserAutomationCoordinator.FindCustomOptionControl(page, action)?.Id);
+    }
+
+    [Theory]
+    [InlineData("combobox", false, true)]
+    [InlineData("listbox", false, true)]
+    [InlineData("textbox", true, false)]
+    [InlineData("combobox", true, false)]
+    public void Text_for_a_noneditable_choice_uses_option_selection(
+        string role,
+        bool editable,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.ShouldNormalizeChoiceTyping(
+                new BrowserPlannerAction
+                {
+                    Type = "type",
+                    Text = "Speech recognition",
+                },
+                new BrowserControl
+                {
+                    Role = role,
+                    Editable = editable,
+                }));
+    }
+
+    [Theory]
+    [InlineData("July 29 2026", "2026-07-29")]
+    [InlineData("July 29 2026.", "2026-07-29")]
+    [InlineData("July 29th, 2026", "2026-07-29")]
+    [InlineData("July 29, 2026", "2026-07-29")]
+    [InlineData("29 Jul 2026", "2026-07-29")]
+    [InlineData("2026-07-29", "2026-07-29")]
+    public void Natural_date_text_is_normalized_for_native_date_controls(
+        string text,
+        string expected)
+    {
+        Assert.True(
+            BrowserAutomationCoordinator.TryNormalizeNativeDateTyping(
+                new BrowserPlannerAction
+                {
+                    Type = "type",
+                    Text = text,
+                },
+                new BrowserControl
+                {
+                    InputType = "date",
+                    Editable = true,
+                },
+                out var normalized));
+        Assert.Equal(expected, normalized);
+    }
+
+    [Fact]
+    public void Native_date_paste_is_normalized_before_clipboard_execution()
+    {
+        Assert.True(
+            BrowserAutomationCoordinator.TryNormalizeNativeDateTyping(
+                new BrowserPlannerAction
+                {
+                    Type = "paste",
+                    Text = "July 29 2026.",
+                },
+                new BrowserControl
+                {
+                    InputType = "date",
+                    Editable = true,
+                },
+                out var normalized));
+        Assert.Equal("2026-07-29", normalized);
+    }
+
+    [Theory]
+    [InlineData("01/02/2026")]
+    [InlineData("tomorrow")]
+    [InlineData("")]
+    public void Ambiguous_or_relative_date_text_is_not_normalized_for_native_date_controls(
+        string text)
+    {
+        Assert.False(
+            BrowserAutomationCoordinator.TryNormalizeNativeDateTyping(
+                new BrowserPlannerAction
+                {
+                    Type = "type",
+                    Text = text,
+                },
+                new BrowserControl
+                {
+                    InputType = "date",
+                    Editable = true,
+                },
+                out _));
+    }
+
+    [Fact]
+    public void Custom_option_resolution_does_not_guess_a_partial_match()
+    {
+        var option = BrowserAutomationCoordinator.FindCustomOptionControl(
+            new BrowserPageSnapshot
+            {
+                Controls = new[]
+                {
+                    new BrowserControl
+                    {
+                        Id = "rock-and-ice",
+                        Role = "option",
+                        AccessibleName = "Rock and ice",
+                        Enabled = true,
+                        Visible = true,
+                    },
+                },
+            },
+            new BrowserPlannerAction { Type = "select_option", Option = "Rock" });
+
+        Assert.Null(option);
+    }
+
+    [Fact]
+    public void Custom_option_can_use_the_immediate_goal_when_the_model_omits_option()
+    {
+        var option = BrowserAutomationCoordinator.FindCustomOptionControl(
+            new BrowserPageSnapshot
+            {
+                Controls = new[]
+                {
+                    new BrowserControl
+                    {
+                        Id = "rock",
+                        Role = "div",
+                        Text = "Rock",
+                        Enabled = true,
+                        Visible = true,
+                        SafeActions = new[] { "focus", "click" },
+                        Bounds = new BrowserRectangle { Width = 120, Height = 40 },
+                    },
+                },
+            },
+            new BrowserPlannerAction { Type = "select_option" },
+            "Select 'Rock' from the open dropdown.");
+
+        Assert.Equal("rock", option?.Id);
+    }
+
+    [Theory]
+    [InlineData("Select 'Rock' from the open menu.", "", "Rock")]
+    [InlineData("", "Choose Rock for the planet composition question.", "Rock")]
+    [InlineData("", "Select option Gas from this dropdown.", "Gas")]
+    public void Explicit_custom_option_is_recovered_without_guessing(
+        string goal,
+        string request,
+        string expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.ResolveRequestedCustomOption(
+                new BrowserPlannerAction(),
+                goal,
+                request));
+    }
+
+    [Fact]
+    public void Repeated_identical_grounded_action_is_bounded()
+    {
+        var attempts = new Dictionary<string, int>();
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "listbox",
+            TargetName = "Planet composition",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, 3, out var first));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, 3, out var second));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, 3, out var third));
+        Assert.False(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, 3, out var fourth));
+        Assert.Equal((1, 2, 3, 4), (first, second, third, fourth));
+    }
+
+    [Fact]
+    public void No_progress_strategy_is_scoped_to_the_unchanged_page_state()
+    {
+        var exhausted = new HashSet<string>();
+        var failedPage = new BrowserPageSnapshot
+        {
+            TabId = 41,
+            Fingerprint = "page-state-a",
+        };
+        var changedPage = new BrowserPageSnapshot
+        {
+            TabId = 41,
+            Fingerprint = "page-state-b",
+        };
+        var failedAction = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = "g1c9",
+            TargetRole = "button",
+            TargetName = "Filter",
+        };
+
+        BrowserAutomationCoordinator.RememberNoProgressStrategy(
+            exhausted,
+            failedPage,
+            failedAction);
+
+        Assert.True(BrowserAutomationCoordinator.IsKnownNoProgressStrategy(
+            exhausted,
+            failedPage,
+            new BrowserPlannerAction
+            {
+                Type = "click",
+                TargetId = "g2c4",
+                TargetRole = "button",
+                TargetName = "Filter",
+            }));
+        Assert.False(BrowserAutomationCoordinator.IsKnownNoProgressStrategy(
+            exhausted,
+            changedPage,
+            failedAction));
+        Assert.False(BrowserAutomationCoordinator.IsKnownNoProgressStrategy(
+            exhausted,
+            failedPage,
+            new BrowserPlannerAction
+            {
+                Type = "click",
+                TargetRole = "link",
+                TargetName = "Requested creator",
+            }));
+    }
+
+    [Fact]
+    public void Repetition_budget_is_scoped_to_page_state()
+    {
+        var attempts = new Dictionary<string, int>();
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName = "Next",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "page-a", 1, out _));
+        Assert.False(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "page-a", 1, out _));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "page-b", 1, out _));
+    }
+
+    [Fact]
+    public void Grounded_action_identity_uses_the_live_semantic_name_before_retry_accounting()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "calendar-day-volatile-42",
+                    Role = "button",
+                    AccessibleName = "Monday, September 7, 2026",
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = "calendar-day-volatile-42",
+            TargetRole = "button",
+            TargetName = "7",
+        };
+
+        var control = BrowserAutomationCoordinator.GroundActionIdentity(page, action);
+
+        Assert.NotNull(control);
+        Assert.Equal("Monday, September 7, 2026", action.TargetName);
+    }
+
+    [Fact]
+    public void Grounded_action_identity_prefers_the_declared_name_over_a_recycled_id()
+    {
+        var wrong = new BrowserControl
+        {
+            Id = "volatile-control-1",
+            Role = "link",
+            AccessibleName = "Resources",
+            Visible = true,
+            Enabled = true,
+        };
+        var prizeSort = new BrowserControl
+        {
+            Id = "volatile-control-2",
+            Role = "link",
+            AccessibleName = "Prize amount",
+            Visible = true,
+            Enabled = true,
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = wrong.Id,
+            TargetRole = "link",
+            TargetName = "Prize amount",
+        };
+
+        var control = BrowserAutomationCoordinator.GroundActionIdentity(
+            new BrowserPageSnapshot { Controls = [wrong, prizeSort] },
+            action);
+
+        Assert.Same(prizeSort, control);
+        Assert.Equal(prizeSort.Id, action.TargetId);
+        Assert.Equal(prizeSort.AccessibleName, action.TargetName);
+    }
+
+    [Fact]
+    public void Grounded_action_identity_clears_a_recycled_id_when_the_declared_target_is_absent()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = "volatile-control-1",
+            TargetRole = "link",
+            TargetName = "Prize amount",
+        };
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = action.TargetId,
+                    Role = "link",
+                    AccessibleName = "Resources",
+                    Visible = true,
+                    Enabled = true,
+                },
+            ],
+        };
+
+        Assert.Null(BrowserAutomationCoordinator.GroundActionIdentity(page, action));
+        Assert.Empty(action.TargetId);
+    }
+
+    [Fact]
+    public void Quoted_immediate_goal_rejects_an_unrelated_live_click_target()
+    {
+        var control = new BrowserControl
+        {
+            Id = "organization-filter",
+            Role = "span",
+            AccessibleName = "Student organization",
+            Visible = true,
+            Enabled = true,
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = control.Id,
+            TargetRole = control.Role,
+            TargetName = control.AccessibleName,
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetDeclaredGoalTargetConflict(
+            "Click on 'Prize amount' in the sort options.",
+            action,
+            control,
+            out var reason));
+        Assert.Contains("Prize amount", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Quoted_immediate_goal_uses_the_live_control_over_stale_planner_metadata()
+    {
+        var control = new BrowserControl
+        {
+            Id = "featured-sort",
+            Role = "link",
+            AccessibleName = "Featured",
+            Visible = true,
+            Enabled = true,
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = control.Id,
+            TargetRole = control.Role,
+            TargetName = "Prize amount",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetDeclaredGoalTargetConflict(
+            "Click the 'Prize amount' sort option.",
+            action,
+            control,
+            out var reason));
+        Assert.Contains("featured", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Quoted_immediate_goal_accepts_a_longer_live_card_name()
+    {
+        var control = new BrowserControl
+        {
+            Id = "hackathon-card",
+            Role = "link",
+            AccessibleName = "Neighborhood Hacks upcoming online $9,650 in prizes",
+            Visible = true,
+            Enabled = true,
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = control.Id,
+            TargetRole = control.Role,
+            TargetName = control.AccessibleName,
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryGetDeclaredGoalTargetConflict(
+            "Open the first hackathon in the sorted list ('Neighborhood Hacks').",
+            action,
+            control,
+            out _));
+    }
+
+    [Fact]
+    public void Unquoted_immediate_goal_does_not_create_a_new_target_grammar()
+    {
+        var control = new BrowserControl
+        {
+            Id = "result",
+            Role = "link",
+            AccessibleName = "Example result",
+            Visible = true,
+            Enabled = true,
+        };
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetId = control.Id,
+            TargetRole = control.Role,
+            TargetName = control.AccessibleName,
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryGetDeclaredGoalTargetConflict(
+            "Open the first matching result.",
+            action,
+            control,
+            out _));
+    }
+
+    [Theory]
+    [InlineData("Find round-trip flights.", "Done. Search for one-way flights")]
+    [InlineData("Play the oldest video.", "Latest")]
+    [InlineData("Sort in descending order.", "Ascending")]
+    public void Explicit_constraints_reject_semantically_opposite_live_controls(
+        string request,
+        string targetName)
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName = targetName,
+        };
+
+        Assert.True(
+            BrowserAutomationCoordinator.TryGetExplicitConstraintConflict(
+                request,
+                action,
+                null,
+                out var reason));
+        Assert.Contains("contradicts", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Accepted_task_guidance_survives_event_churn_within_the_same_prompt_budget()
+    {
+        var guidance = new[] { "User guidance: Use the site's ordering control rather than another search.",
+            "Authoritative user skip guidance: Leave the optional notes unchanged." };
+        var history = guidance.Concat(Enumerable.Range(1, 30).Select(index => $"history-{index}")).ToArray();
+        var checkpoints = Enumerable.Range(1, 6).Select(index => $"verified-step-{index}").ToArray();
+        var plannerHistory = BrowserAutomationCoordinator.BuildPlannerHistory(history, checkpoints);
+        var prompt = BrowserAutomationPlanner.BuildPrompt("Complete the page task", new(), plannerHistory, []);
+        foreach (var item in guidance) Assert.Contains(item, prompt);
+        Assert.Contains("history-30", prompt);
+        Assert.Contains("verified-step-6", prompt);
+        Assert.True(plannerHistory.Count <= 8);
+        Assert.True(plannerHistory.Sum(item => item.Length) <= 4000);
+    }
+
+    [Fact]
+    public void Actual_planner_payload_preserves_recent_checkpoints_without_growing_its_history_budget()
+    {
+        var checkpoints = Enumerable.Range(1, 8)
+            .Select(index => $"verified-step-{index}: " + new string((char)('a' + index), 300)).ToArray();
+        var history = Enumerable.Range(1, 20).Select(index => $"history-{index}").ToArray();
+        var plannerHistory = BrowserAutomationCoordinator.BuildPlannerHistory(history, checkpoints);
+        var prompt = BrowserAutomationPlanner.BuildPrompt("Open the requested ordered item", new(), plannerHistory, []);
+        foreach (var index in Enumerable.Range(5, 4))
+            Assert.Contains($"verified-step-{index}:", prompt);
+        Assert.Contains("history-20", prompt);
+        Assert.True(plannerHistory.Count <= 8);
+        Assert.True(plannerHistory.Sum(item => item.Length) <= 4000);
+    }
+
+    [Fact]
+    public void Strong_verified_checkpoints_are_kept_in_every_planner_window()
+    {
+        var history = Enumerable.Range(1, 20).Select(index => $"history-{index}").ToArray();
+        var checkpoints = new[]
+        {
+            "range-start: departure date entered and verified",
+            "range-end: return date entered and verified",
+        };
+
+        var plannerHistory = BrowserAutomationCoordinator.BuildPlannerHistory(
+            history,
+            checkpoints);
+
+        Assert.Equal(8, plannerHistory.Count);
+        Assert.Contains("history-20", plannerHistory);
+        Assert.Contains(plannerHistory, item => item.Contains("range-start", StringComparison.Ordinal));
+        Assert.Contains(plannerHistory, item => item.Contains("range-end", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_new_explicit_correction_remains_authoritative_over_an_older_field_checkpoint()
+    {
+        var history = new[]
+        {
+            "Earlier field action completed.",
+            "Latest explicit user correction: change the first answer to the other option.",
+        };
+        var plannerHistory = BrowserAutomationCoordinator.BuildPlannerHistory(
+            history,
+            ["first-answer: old selection verified"]);
+
+        Assert.Contains(plannerHistory, item => item.Contains(
+            "preserve unless a newer explicit user correction", StringComparison.Ordinal));
+        Assert.StartsWith("Latest explicit user correction:", plannerHistory[^1],
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Repetition_budget_allows_a_distinct_semantic_phase_on_the_same_live_control()
+    {
+        var attempts = new Dictionary<string, int>();
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName = "1",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "calendar-state", "Set the departure date.", 1, out _));
+        Assert.False(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "calendar-state", "Set the departure date.", 1, out _));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterActionAttempt(
+            attempts, action, "calendar-state", "Set the return date.", 1, out _));
+    }
+
+    [Fact]
+    public void Semantic_repetition_budget_survives_rerenders_but_keeps_range_phases_distinct()
+    {
+        var attempts = new Dictionary<string, int>();
+        var action = new BrowserPlannerAction
+        {
+            Type = "click",
+            TargetRole = "button",
+            TargetName = "7",
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, action, "Set the departure date.", 2, out _));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts,
+            new BrowserPlannerAction
+            {
+                Type = "click",
+                TargetRole = "button",
+                TargetName = "7",
+                Text = "irrelevant planner narration must not change click identity",
+            },
+            "Set the departure date.",
+            2,
+            out _));
+        Assert.False(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, action, "Set the departure date.", 2, out _));
+        Assert.True(BrowserAutomationCoordinator.TryRegisterSemanticActionAttempt(
+            attempts, action, "Set the return date.", 2, out _));
+    }
+
+    [Theory]
+    [InlineData("Use the second result.", true)]
+    [InlineData("Don't submit yet.", true)]
+    [InlineData("I completed the login.", true)]
+    [InlineData("Switch to Chrome's fourth tab using Ctrl+4.", false)]
+    [InlineData("Open a new tab.", false)]
+    [InlineData("What time is it?", false)]
+    public void Only_explicit_corrections_are_accepted_as_active_task_guidance(
+        string utterance,
+        bool expected)
+    {
+        Assert.Equal(expected, BrowserAutomationCoordinator.IsClearlyTaskRelevantGuidance(utterance));
+    }
+
+    [Theory]
+    [InlineData("Jarvis, tell Browser Automation the email is incorrect; it is actually xyz@gmail.com.", true)]
+    [InlineData("Tell the browser task to use the second shipping address.", true)]
+    [InlineData("For the current task: keep the optional notes empty.", true)]
+    [InlineData("What is Browser Automation doing?", false)]
+    [InlineData("Why did the browser task fail?", false)]
+    [InlineData("Open Spotify.", false)]
+    public void Explicit_task_direction_is_distinct_from_status_and_unrelated_turns(
+        string utterance,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsExplicitTaskDirectedGuidance(utterance));
+    }
+
+    [Theory]
+    [InlineData("The email is incorrect; it is actually xyz@gmail.com.", true)]
+    [InlineData("Change the graduation year to 2027.", true)]
+    [InlineData("Actually, I prefer jazz music.", false)]
+    [InlineData("The weather is incorrect.", false)]
+    public void Natural_corrections_require_live_task_identity(
+        string utterance,
+        bool expected)
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                    InputType = "email",
+                },
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Graduation year",
+                },
+            ],
+        };
+
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsCorrectionGroundedInActiveTask(
+                null,
+                page,
+                utterance));
+    }
+
+    [Theory]
+    [InlineData("Email address: xyz@gmail.com", true)]
+    [InlineData("Use 2027 for the graduation year.", true)]
+    [InlineData("Open Spotify.", false)]
+    [InlineData("What is the email address field?", false)]
+    [InlineData("I like electronic music.", false)]
+    public void Natural_value_guidance_must_be_grounded_in_a_live_control(
+        string utterance,
+        bool expected)
+    {
+        var page = new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Graduation year",
+                },
+            ],
+        };
+
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsValueGuidanceGroundedInActiveTask(
+                null,
+                page,
+                utterance));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Correction_during_final_observation_prevents_stale_completion_and_remains_for_next_plan(bool corrected)
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, NotificationService.CreateForTesting((_, _, _) => { }), bridge, null);
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType("Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var taskId = (string)runtimeType.GetProperty("TaskId")!.GetValue(runtime)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Verifying);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, "Fill the current application form without submitting.");
+        var page = new BrowserPageSnapshot
+        {
+            TaskId = taskId, WindowId = 7, TabId = 42, Url = "https://example.org/form",
+            Controls = [new BrowserControl { Id = "email", Visible = true, Enabled = true, FieldLabel = "Email address" }],
+        };
+        runtimeType.GetProperty("Page")!.SetValue(runtime, page);
+        typeof(BrowserAutomationCoordinator).GetField("_active", flags)!.SetValue(coordinator, runtime);
+        var plannedRevision = (int)runtimeType.GetField("GuidanceRevision")!.GetValue(runtime)!;
+        ProcessBridgeForReconciliation(bridge, "hello");
+        var observation = bridge.ObserveAsync(taskId, 42, CancellationToken.None);
+        var command = ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command");
+        Assert.Equal("observe", command.GetProperty("type").GetString());
+        if (corrected)
+            Assert.True(coordinator.TryAddTaskGuidance("Change the email address to corrected@example.org.", out _));
+        var correctedState = runtimeType.GetProperty("State")!.GetValue(runtime);
+        ProcessBridgeForReconciliation(bridge, "command_result", command, page);
+        runtimeType.GetProperty("Page")!.SetValue(runtime, await observation);
+
+        var guardedComplete = typeof(BrowserAutomationCoordinator).GetMethod("TryCompleteWithGuidanceRevision", flags)!;
+        Assert.Equal(!corrected, (bool)guardedComplete.Invoke(coordinator,
+            [runtime, BrowserAutomationOutcome.Completed, "Old plan complete", "Old final observation", plannedRevision])!);
+        if (!corrected)
+        {
+            Assert.Equal(BrowserTaskState.Completed, runtimeType.GetProperty("State")!.GetValue(runtime));
+            ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+            return;
+        }
+        Assert.Equal(correctedState, runtimeType.GetProperty("State")!.GetValue(runtime));
+        Assert.NotEqual(BrowserTaskState.Completed, runtimeType.GetProperty("State")!.GetValue(runtime));
+        Assert.Contains("corrected@example.org", coordinator.Snapshot().Request);
+        var pending = (System.Collections.Concurrent.ConcurrentQueue<string>)runtimeType.GetProperty("PendingGuidance")!.GetValue(runtime)!;
+        Assert.Single(pending);
+        typeof(BrowserAutomationCoordinator).GetMethod("DrainPendingGuidance", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(null, [runtime]);
+        Assert.Empty(pending);
+        Assert.Contains(((List<string>)runtimeType.GetProperty("History")!.GetValue(runtime)!), entry => entry.Contains("corrected@example.org"));
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public void Running_task_accepts_a_grounded_field_correction_and_supersedes_old_work()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Executing);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, "Fill the current application form.");
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+            ],
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        Assert.True(coordinator.TryAddTaskGuidance(
+            "The email is incorrect; it is actually xyz@gmail.com.",
+            out _));
+        Assert.Contains("xyz@gmail.com", coordinator.Snapshot().Request, StringComparison.Ordinal);
+        Assert.Equal(
+            1,
+            (int)runtimeType.GetField("CorrectionRevision")!.GetValue(runtime)!);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Corrected_visual_plan_cannot_dispatch_its_stale_browser_action()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.AnalyzingImage);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, "Fill the current application form.");
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            TabId = 42,
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "email",
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+            ],
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        var visualPlanRevision = (int)runtimeType.GetField("GuidanceRevision")!.GetValue(runtime)!;
+        Assert.True(coordinator.TryAddTaskGuidance(
+            "The email is incorrect; it is actually xyz@gmail.com.", out _));
+        var executeAction = typeof(BrowserAutomationCoordinator).GetMethod(
+            "ExecutePlannerActionAsync",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var staleAction = (Task<BrowserActionReceipt>)executeAction.Invoke(
+            coordinator,
+            [runtime, new BrowserPlannerAction { Type = "click", TargetId = "email" },
+                CancellationToken.None, "Use the old answer", visualPlanRevision])!;
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => staleAction);
+        Assert.Contains("superseded by newer explicit task guidance", error.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(1, (int)runtimeType.GetField("GuidanceRevision")!.GetValue(runtime)!);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Superseded_in_flight_action_reads_the_live_page_without_replaying_the_action()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Executing);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, "Fill the current application form.");
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            TaskId = (string)runtimeType.GetProperty("TaskId")!.GetValue(runtime)!,
+            WindowId = 7,
+            TabId = 42,
+            Url = "https://example.org/form",
+            Fingerprint = "before-action",
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "email",
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+            ],
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        ProcessBridgeForReconciliation(bridge, "hello");
+        var taskId = (string)runtimeType.GetProperty("TaskId")!.GetValue(runtime)!;
+        var oldAction = bridge.ExecuteAsync(new BrowserActionRequest
+        {
+            TaskId = taskId,
+            Type = "click",
+            TabId = 42,
+            ControlId = "email",
+        }, CancellationToken.None);
+        var dispatched = ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command");
+        Assert.Equal("click", dispatched.GetProperty("type").GetString());
+        Assert.True(coordinator.TryAddTaskGuidance(
+            "The email is incorrect; it is actually corrected@example.org.", out _));
+        ProcessBridgeForReconciliation(bridge, "command_result", dispatched, new
+        {
+            taskId,
+            ok = true,
+            tabId = 42,
+            action = "click",
+        });
+        Assert.True((await oldAction).Ok);
+
+        var reconcile = typeof(BrowserAutomationCoordinator).GetMethod(
+            "ReconcileSupersededBrowserActionAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(reconcile);
+        var refresh = (Task<bool>)reconcile.Invoke(coordinator,
+            [runtime, (int?)42, CancellationToken.None])!;
+        var observation = ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command");
+        Assert.Equal("observe", observation.GetProperty("type").GetString());
+        Assert.Equal(42, observation.GetProperty("tabId").GetInt32());
+        ProcessBridgeForReconciliation(bridge, "command_result", observation, new BrowserPageSnapshot
+        {
+            TaskId = taskId,
+            WindowId = 7,
+            TabId = 42,
+            Url = "https://example.org/form",
+            Fingerprint = "after-action",
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Id = "email",
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+            ],
+        });
+        Assert.True(await refresh);
+        Assert.Equal("after-action",
+            ((BrowserPageSnapshot)runtimeType.GetProperty("Page")!.GetValue(runtime)!).Fingerprint);
+        Assert.Equal(JsonValueKind.Null,
+            ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command").ValueKind);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Superseded_action_uses_authorized_new_tab_instead_of_old_receipt_tab()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var taskId = (string)runtimeType.GetProperty("TaskId")!.GetValue(runtime)!;
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            TaskId = taskId,
+            WindowId = 7,
+            TabId = 42,
+            Url = "https://example.org/old-form",
+        });
+        runtimeType.GetProperty("AdoptFreshActiveTabOnResume")!.SetValue(runtime, true);
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        ProcessBridgeForReconciliation(bridge, "hello");
+        var reconcile = typeof(BrowserAutomationCoordinator).GetMethod(
+            "ReconcileSupersededBrowserActionAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(reconcile);
+        var refresh = (Task<bool>)reconcile.Invoke(coordinator,
+            [runtime, (int?)42, CancellationToken.None])!;
+        var handoff = ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command");
+        Assert.Equal("begin_task", handoff.GetProperty("type").GetString());
+        Assert.Equal("current", handoff.GetProperty("text").GetString());
+        ProcessBridgeForReconciliation(bridge, "command_result", handoff, new BrowserPageSnapshot
+        {
+            TaskId = taskId,
+            WindowId = 7,
+            TabId = 99,
+            Url = "https://example.org/new-form",
+            Fingerprint = "user-chosen-tab",
+        });
+        Assert.True(await refresh);
+        Assert.Equal(99, ((BrowserPageSnapshot)runtimeType.GetProperty("Page")!.GetValue(runtime)!).TabId);
+        Assert.Equal(JsonValueKind.Null,
+            ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command").ValueKind);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Cancelled_superseded_action_does_not_queue_a_reconciliation_command()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot { TabId = 42 });
+        ProcessBridgeForReconciliation(bridge, "hello");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var reconcile = typeof(BrowserAutomationCoordinator).GetMethod(
+            "ReconcileSupersededBrowserActionAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        Assert.NotNull(reconcile);
+        var refresh = (Task<bool>)reconcile.Invoke(coordinator,
+            [runtime, (int?)42, cancellation.Token])!;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => refresh);
+        Assert.Equal(JsonValueKind.Null,
+            ProcessBridgeForReconciliation(bridge, "poll").GetProperty("command").ValueKind);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    private static JsonElement ProcessBridgeForReconciliation(
+        BrowserHelperBridge bridge,
+        string type,
+        JsonElement? command = null,
+        object result = null)
+    {
+        var json = JsonSerializer.Serialize(new
+        {
+            type,
+            taskId = command?.GetProperty("taskId").GetString(),
+            commandId = command?.GetProperty("commandId").GetString(),
+            result,
+            helper = new
+            {
+                extensionId = "gojdebdikepkpapmnggeljneamjdigbh",
+                serviceWorkerVersion = "2.1.21",
+                contentScriptVersion = "2.1.21",
+                activeTabFresh = true,
+                commandChannelReady = true,
+                commandAuthoritySupported = true,
+                activeUrl = "https://example.org/form",
+                sessionId = "test-session",
+            },
+        });
+        var process = typeof(BrowserHelperBridge).GetMethod("ProcessMessage",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        return JsonDocument.Parse((string)process.Invoke(bridge, [json])!).RootElement.Clone();
+    }
+
+    [Fact]
+    public void Unrelated_direct_request_is_not_swallowed_by_a_running_task()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Executing);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, "Fill the current application form.");
+        runtimeType.GetProperty("Page")!.SetValue(runtime, new BrowserPageSnapshot
+        {
+            Controls =
+            [
+                new BrowserControl
+                {
+                    Visible = true,
+                    Enabled = true,
+                    FieldLabel = "Email address",
+                },
+            ],
+        });
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        Assert.False(coordinator.TryAddTaskGuidance("Open Spotify.", out _));
+        Assert.Equal(BrowserTaskState.Executing, coordinator.Snapshot().State);
+        Assert.Equal(
+            0,
+            (int)runtimeType.GetField("GuidanceRevision")!.GetValue(runtime)!);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Theory]
+    [InlineData(BrowserTaskState.Completed)]
+    [InlineData(BrowserTaskState.Cancelled)]
+    [InlineData(BrowserTaskState.Failed)]
+    public void Terminal_task_never_regains_guidance_authority(BrowserTaskState terminalState)
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        runtimeType.GetProperty("State")!.SetValue(runtime, terminalState);
+        runtimeType.GetProperty("LastError")!.SetValue(runtime, "Planner transport failed.");
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        Assert.False(coordinator.TryAddTaskGuidance(
+            "Tell Browser Automation to continue with the corrected value.",
+            out _));
+        Assert.Equal(terminalState, coordinator.Snapshot().State);
+        Assert.Equal("Planner transport failed.", coordinator.Snapshot().LastError);
+        Assert.Equal(
+            0,
+            (int)runtimeType.GetField("GuidanceRevision")!.GetValue(runtime)!);
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public void Task_owner_retains_only_bounded_deduplicated_terminal_diagnostics()
+    {
+        using var bridge = new BrowserHelperBridge();
+        var coordinator = new BrowserAutomationCoordinator(null, null, bridge, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var publish = typeof(BrowserAutomationCoordinator).GetMethod(
+            "Publish", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var active = typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        for (var index = 0; index < 6; index++)
+        {
+            var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+            runtimeType.GetProperty("TaskId")!.SetValue(runtime, $"task-{index}");
+            runtimeType.GetProperty("Request")!.SetValue(runtime, $"Request {index}");
+            runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Failed);
+            runtimeType.GetProperty("LastError")!.SetValue(runtime, $"Failure {index}");
+            active.SetValue(coordinator, runtime);
+            publish.Invoke(coordinator, [runtime]);
+            publish.Invoke(coordinator, [runtime]);
+            ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+        }
+
+        var outcomes = coordinator.RecentTerminalOutcomes();
+        Assert.Equal(4, outcomes.Count);
+        Assert.Equal(["task-5", "task-4", "task-3", "task-2"], outcomes.Select(item => item.TaskId));
+        Assert.Equal("Failure 5", outcomes[0].LastError);
+
+        coordinator.ClearRecentTerminalOutcomes();
+        Assert.Empty(coordinator.RecentTerminalOutcomes());
+    }
+
+    [Theory]
+    [InlineData("Use Browser Automation, go to Devpost and search RevenueCat", "devpost.com")]
+    [InlineData("Navigate to Google Drive, then open the shared folder", "drive.google.com")]
+    [InlineData("Visit https://example.org and inspect the first link", "example.org")]
+    public void Explicit_cross_site_destination_is_grounded_before_page_interaction(
+        string request,
+        string expectedHost)
+    {
+        Assert.True(BrowserAutomationCoordinator.TryResolveExplicitDestination(
+            request,
+            out _,
+            out var url));
+        Assert.Equal(expectedHost, new Uri(url).Host);
+    }
+
+    [Theory]
+    [InlineData("Use Browser Automation, go to Developer Post and search RevenueCat")]
+    [InlineData("Search this current page for RevenueCat")]
+    public void Unknown_or_current_page_text_is_not_fuzzily_substituted_as_a_destination(
+        string request) =>
+        Assert.False(BrowserAutomationCoordinator.TryResolveExplicitDestination(
+            request,
+            out _,
+            out _));
+
+    [Theory]
+    [InlineData("No, I meant devpost.com.", "devpost.com")]
+    [InlineData("Wrong website; use GitHub instead.", "github.com")]
+    public void Explicit_active_task_correction_resolves_the_positive_replacement(
+        string correction,
+        string expectedHost)
+    {
+        Assert.True(BrowserAutomationCoordinator.IsExplicitTaskCorrection(correction));
+        Assert.True(BrowserAutomationCoordinator.TryResolveTaskCorrectionDestination(
+            correction,
+            out _,
+            out var url));
+        Assert.Equal(expectedHost, new Uri(url).Host);
+    }
+
+    [Fact]
+    public void Latest_correction_becomes_the_authoritative_planner_request()
+    {
+        var corrected = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            "Use Browser Automation, go to GitHub and search for voice projects.",
+            "No, I meant devpost.com. Search for voice AI projects there instead.");
+
+        Assert.True(BrowserAutomationCoordinator.TryResolveExplicitDestination(
+            corrected,
+            out _,
+            out var destination));
+        Assert.Equal("devpost.com", new Uri(destination).Host);
+        Assert.True(BrowserAutomationCoordinator.IsNavigationToSupersededDestination(
+            new BrowserPlannerAction { Type = "navigate", Url = "https://github.com/search?q=voice" },
+            "https://devpost.com/",
+            "https://github.com/"));
+        Assert.False(BrowserAutomationCoordinator.IsNavigationToSupersededDestination(
+            new BrowserPlannerAction { Type = "navigate", Url = "https://devpost.com/hackathons" },
+            "https://devpost.com/",
+            "https://github.com/"));
+    }
+
+    [Fact]
+    public void Task_scoped_selected_source_tail_survives_repeated_form_corrections()
+    {
+        var source = new string('a', 5600) + " Final required answer: cobalt.";
+        var original = CommandRegistry.BuildBrowserTaskWithCapturedContext(
+            "Fill the current form using my selected context, without submitting.",
+            "selected text",
+            source);
+        Assert.True(original.IndexOf("Final required answer: cobalt.", StringComparison.Ordinal) > 4000);
+
+        var first = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            original,
+            "Change the first answer to amber instead.");
+        var second = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            first,
+            "Actually, set the second answer to indigo instead.");
+
+        Assert.Contains("Final required answer: cobalt.", first, StringComparison.Ordinal);
+        Assert.Contains("Final required answer: cobalt.", second, StringComparison.Ordinal);
+        Assert.Contains("Change the first answer to amber instead.", second, StringComparison.Ordinal);
+        Assert.EndsWith("Actually, set the second answer to indigo instead.", second,
+            StringComparison.Ordinal);
+        Assert.True(second.Length <= 10000);
+        Assert.Contains("Final required answer: cobalt.",
+            BrowserAutomationPlanner.BuildPrompt(second, new BrowserPageSnapshot(), [], []),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Source_tail_and_latest_guidance_win_when_the_planner_budget_is_full()
+    {
+        var original = new string('p', 3700)
+            + "\n\nAUTHORITATIVE USER-PROVIDED SELECTED TEXT (ephemeral for this task):\n"
+            + new string('s', 5900)
+            + " Final required answer: cobalt.";
+        var correction = "Change the first answer to amber instead. " + new string('c', 900);
+
+        var corrected = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            original,
+            correction);
+
+        Assert.Contains("Final required answer: cobalt.", corrected, StringComparison.Ordinal);
+        Assert.Contains(correction, corrected, StringComparison.Ordinal);
+        Assert.True(corrected.Length <= 10000);
+    }
+
+    [Fact]
+    public void Latest_destination_correction_wins_with_a_large_task_scoped_source()
+    {
+        var original = CommandRegistry.BuildBrowserTaskWithCapturedContext(
+            "Use Browser Automation, go to GitHub and fill the current form.",
+            "selected text",
+            new string('a', 5600) + " Final field: cobalt.");
+        var first = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            original,
+            "No, I meant devpost.com. Continue the form there instead.");
+        var second = BrowserAutomationCoordinator.BuildCorrectedTaskRequest(
+            first,
+            "Actually use github.com instead. Continue the form there.");
+
+        Assert.Contains("Final field: cobalt.", second, StringComparison.Ordinal);
+        Assert.True(BrowserAutomationCoordinator.TryResolveExplicitDestination(
+            second, out _, out var destination));
+        Assert.Equal("github.com", new Uri(destination).Host);
+        Assert.True(second.Length <= 10000);
+    }
+
+    [Fact]
+    public void Browser_status_never_publishes_or_retains_the_captured_source_appendix()
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var request = CommandRegistry.BuildBrowserTaskWithCapturedContext(
+            "Fill the current form using the selected text.",
+            "selected text",
+            "Private source marker: cobalt.");
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Executing);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, request);
+        runtimeType.GetProperty("SnapshotRequest")!.SetValue(runtime,
+            BrowserAutomationCoordinator.RequestWithoutCapturedContext(request));
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+        var published = new List<BrowserAutomationSnapshot>();
+        coordinator.StatusChanged += published.Add;
+        typeof(BrowserAutomationCoordinator).GetMethod(
+            "Publish", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(coordinator, [runtime]);
+
+        var active = coordinator.Snapshot();
+        Assert.Contains("Fill the current form", active.Request, StringComparison.Ordinal);
+        Assert.DoesNotContain("Private source marker", active.Request, StringComparison.Ordinal);
+        Assert.DoesNotContain("AUTHORITATIVE USER-PROVIDED", active.Request, StringComparison.Ordinal);
+        Assert.All(published, snapshot =>
+            Assert.DoesNotContain("Private source marker", snapshot.Request,
+                StringComparison.Ordinal));
+
+        typeof(BrowserAutomationCoordinator).GetMethod(
+            "SetTerminal", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(coordinator,
+            [runtime, BrowserTaskState.Completed, BrowserAutomationOutcome.Completed,
+                "Completed", "The form was filled."]);
+
+        Assert.Equal("", runtimeType.GetProperty("Request")!.GetValue(runtime));
+        Assert.DoesNotContain("Private source marker", coordinator.Snapshot().Request,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("Private source marker",
+            coordinator.RecentTerminalOutcomes().Single().Request,
+            StringComparison.Ordinal);
+        Assert.All(published, snapshot =>
+            Assert.DoesNotContain("Private source marker", snapshot.Request,
+                StringComparison.Ordinal));
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Fact]
+    public async Task Cancelling_does_not_clear_private_request_until_execution_has_unwound()
+    {
+        var coordinator = new BrowserAutomationCoordinator(null, null, null, null);
+        var runtimeType = typeof(BrowserAutomationCoordinator).GetNestedType(
+            "Runtime", System.Reflection.BindingFlags.NonPublic)!;
+        var runtime = Activator.CreateInstance(runtimeType, nonPublic: true)!;
+        var request = CommandRegistry.BuildBrowserTaskWithCapturedContext(
+            "Fill the current form from this selection.",
+            "selected text",
+            "Private source marker: cobalt.");
+        runtimeType.GetProperty("State")!.SetValue(runtime, BrowserTaskState.Executing);
+        runtimeType.GetProperty("Request")!.SetValue(runtime, request);
+        runtimeType.GetProperty("SnapshotRequest")!.SetValue(runtime,
+            BrowserAutomationCoordinator.RequestWithoutCapturedContext(request));
+        var pendingExecution = new TaskCompletionSource();
+        runtimeType.GetProperty("Execution")!.SetValue(runtime, pendingExecution.Task);
+        typeof(BrowserAutomationCoordinator).GetField(
+            "_active", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(coordinator, runtime);
+
+        typeof(BrowserAutomationCoordinator).GetMethod(
+            "SetTerminal", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(coordinator,
+            [runtime, BrowserTaskState.Cancelled, BrowserAutomationOutcome.Cancelled,
+                "Browser automation cancelled.", ""]);
+
+        Assert.Equal(request, runtimeType.GetProperty("Request")!.GetValue(runtime));
+        Assert.DoesNotContain("Private source marker", coordinator.Snapshot().Request,
+            StringComparison.Ordinal);
+
+        // A delegate that was cancelled before ExecuteAsync entered has no
+        // finally block. The bounded cancellation cleanup releases this same
+        // runtime only after its execution task is complete.
+        var finishCleanup = (Task)typeof(BrowserAutomationCoordinator).GetMethod(
+            "CompleteCancellationAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(coordinator, [runtime])!;
+        Assert.Equal(request, runtimeType.GetProperty("Request")!.GetValue(runtime));
+        pendingExecution.SetResult();
+        await finishCleanup;
+        Assert.Equal("", runtimeType.GetProperty("Request")!.GetValue(runtime));
+        ((CancellationTokenSource)runtimeType.GetProperty("Cancellation")!.GetValue(runtime)!).Dispose();
+    }
+
+    [Theory]
+    [InlineData(4, 4, false)]
+    [InlineData(4, 5, true)]
+    [InlineData(5, 4, false)]
+    public void Only_a_changed_correction_revision_supersedes_an_in_flight_result(
+        int capturedRevision,
+        int currentRevision,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.InFlightResultWasSuperseded(
+                capturedRevision,
+                currentRevision));
+    }
+
+    [Theory]
+    [InlineData("What do you think about adding a community feature?")]
+    [InlineData("Which approach would you recommend?")]
+    [InlineData("This page gave me an idea for a discussion area.")]
+    public void Unrelated_conversation_does_not_mutate_an_active_browser_task(string utterance)
+    {
+        Assert.False(BrowserAutomationCoordinator.IsExplicitTaskCorrection(utterance));
+        Assert.False(BrowserAutomationCoordinator.IsClearlyTaskRelevantGuidance(utterance));
+    }
+
+    [Theory]
+    [InlineData("Switch to the last tab.", false)]
+    [InlineData("Go to the second last tab.", false)]
+    [InlineData("Switch to the second-to-last tab.", false)]
+    [InlineData("Use August 1 to August 8.", true)]
+    public void Tab_commands_stay_out_of_the_active_page_task(
+        string utterance,
+        bool expected)
+    {
+        var accepted = BrowserAutomationCoordinator.IsClearlyTaskRelevantGuidance(utterance)
+            || BrowserAutomationCoordinator.IsRelevantManualAnswer(
+                "Tell me the required departure and return dates.",
+                utterance);
+
+        Assert.Equal(expected, accepted);
+    }
+
+    [Theory]
+    [InlineData("Use Test User as the customer name and continue.", true)]
+    [InlineData("Enter Tanush in the first-name field.", true)]
+    [InlineData("Open a new tab.", false)]
+    [InlineData("Switch to the second browser tab.", false)]
+    public void Missing_field_answers_resume_only_the_paused_task(
+        string utterance,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.IsRelevantManualAnswer(
+                "Please provide the customer name to fill in the form.",
+                utterance));
+    }
+
+    [Fact]
+    public void Named_missing_field_answer_resumes_the_same_paused_task()
+    {
+        const string request =
+            "Please provide the required missing details: Job Specialty, portfolio URL, and team description.";
+        Assert.True(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            request,
+            "The missing Job Specialty is Software Engineering. Use that answer in the same browser task and continue."));
+        Assert.False(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            request,
+            "The missing shipping address is Example Street. Continue the browser task."));
+    }
+
+    [Theory]
+    [InlineData("cancel browser automation", true)]
+    [InlineData("Cancel BA now.", true)]
+    [InlineData("Cancel B.A. immediately.", true)]
+    [InlineData("Please pause the browser task.", true)]
+    [InlineData("stop", true)]
+    [InlineData("continue", false)]
+    [InlineData("Use the second result.", false)]
+    public void Browser_stop_controls_are_not_misrouted_as_task_guidance(
+        string utterance,
+        bool expected)
+    {
+        Assert.Equal(expected, CommandRegistry.IsExplicitBrowserTaskStopOrPause(utterance));
+    }
+
+    [Theory]
+    [InlineData("Okay, cancel browser automation and try again.", true)]
+    [InlineData("Cancel Browser Automation now.", true)]
+    [InlineData("Please stop the browser task immediately.", true)]
+    [InlineData("Could you please stop the browser task?", true)]
+    [InlineData("Okay stop, cancel browser automation.", true)]
+    [InlineData("Stop; please pause the browser task.", true)]
+    [InlineData("Cancel and stop the automation task.", true)]
+    [InlineData("Stop. Then cancel the browser task.", true)]
+    [InlineData("Never mind. Cancel browser automation.", true)]
+    [InlineData("That didn't work. Please stop the browser task.", true)]
+    [InlineData("We have enough results! Pause browser automation.", true)]
+    [InlineData("She said 'Never mind. Cancel browser automation.'", false)]
+    [InlineData("Read this: \"Never mind. Cancel browser automation.\"", false)]
+    [InlineData("That didn't work. Don't cancel browser automation.", false)]
+    [InlineData("Should I say cancel browser automation?", false)]
+    [InlineData("Should I say cancel BA?", false)]
+    [InlineData("Don't cancel BA.", false)]
+    [InlineData("Stop, don't cancel browser automation.", false)]
+    [InlineData("He said: cancel browser automation.", false)]
+    [InlineData("Explain this: cancel browser automation.", false)]
+    [InlineData("Don't cancel browser automation.", false)]
+    [InlineData("I wonder whether we should cancel browser automation.", false)]
+    public void Natural_explicit_browser_cancellation_is_authoritative_without_matching_discussion(
+        string utterance,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CommandRegistry.TryParseExplicitBrowserTaskStopOrPause(
+                utterance,
+                out _,
+                out var targetsBrowserTask)
+                && targetsBrowserTask);
+    }
+
+    [Theory]
+    [InlineData(true, "User cancelled Browser Automation", true)]
+    [InlineData(true, "", false)]
+    [InlineData(false, "User cancelled Browser Automation", false)]
+    public void Late_in_flight_failure_cannot_replace_an_authoritative_cancelled_terminal_state(
+        bool cancellationRequested,
+        string reason,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationCoordinator.ShouldTreatLateFailureAsCancellation(
+                cancellationRequested,
+                reason));
+    }
+
+    [Theory]
+    [InlineData("cancel browser automation", "cancel")]
+    [InlineData("cancel BA", "cancel")]
+    [InlineData("pause B.A.", "pause")]
+    [InlineData("stop the browser task", "cancel")]
+    [InlineData("please pause browser automation", "pause")]
+    public void Explicit_browser_stop_is_resolved_locally_to_one_control(
+        string utterance,
+        string expectedAction)
+    {
+        Assert.True(CommandRegistry.TryParseExplicitBrowserTaskStopOrPause(
+            utterance,
+            out var action,
+            out var explicitlyTargetsBrowserTask));
+        Assert.Equal(expectedAction, action);
+        Assert.True(explicitlyTargetsBrowserTask);
+    }
+
+    [Theory]
+    [InlineData("stop")]
+    [InlineData("pause")]
+    [InlineData("cancel")]
+    public void Bare_stop_words_are_not_locally_forced_into_browser_task_cancellation(
+        string utterance)
+    {
+        Assert.True(CommandRegistry.TryParseExplicitBrowserTaskStopOrPause(
+            utterance,
+            out _,
+            out var explicitlyTargetsBrowserTask));
+        Assert.False(explicitlyTargetsBrowserTask);
+    }
+
+    [Theory]
+    [InlineData("cancel", "What is two plus two?", false)]
+    [InlineData("pause", "Explain why this field is required.", false)]
+    [InlineData("cancel", "stop", false)]
+    [InlineData("cancel", "cancel browser automation", true)]
+    [InlineData("cancel", "Cancel Browser Automation now.", true)]
+    [InlineData("pause", "please pause the browser task", true)]
+    [InlineData("pause", "cancel browser automation", false)]
+    public void Model_cannot_mutate_a_browser_task_without_matching_explicit_user_authority(
+        string modelAction,
+        string latestUserTurn,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CommandRegistry.IsModelBrowserTaskControlAuthorized(
+                modelAction,
+                latestUserTurn));
+    }
+
+    [Theory]
+    [InlineData("guide", "Use September 12 as the practice date.", true)]
+    [InlineData("resume", "continue", true)]
+    [InlineData("guide", "", false)]
+    [InlineData("delete", "delete it", false)]
+    public void Model_guidance_requires_a_current_raw_user_turn_and_existing_policy_remains_authoritative(
+        string modelAction,
+        string latestUserTurn,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CommandRegistry.IsModelBrowserTaskControlAuthorized(
+                modelAction,
+                latestUserTurn));
+    }
+
+    [Fact]
+    public void Planner_provider_health_is_scoped_to_one_browser_task()
+    {
+        using var planner = new BrowserAutomationPlanner();
+        planner.BeginTask("task-a");
+        planner.RecordModelFailure(
+            "gemini-3-flash",
+            new HttpRequestException("429 quota exhausted"));
+
+        Assert.Equal(1, planner.UnhealthyModelCount);
+
+        planner.BeginTask("task-b");
+
+        Assert.Equal(0, planner.UnhealthyModelCount);
+    }
+
+    [Fact]
+    public async Task A_missing_live_turn_complete_is_recoverable_for_the_next_request()
+    {
+        var stale = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Assert.False(await GeminiLiveConversationService.WaitForPriorTurnAsync(
+            stale.Task,
+            TimeSpan.FromMilliseconds(10),
+            CancellationToken.None));
+        Assert.True(await GeminiLiveConversationService.WaitForPriorTurnAsync(
+            Task.CompletedTask,
+            TimeSpan.FromSeconds(1),
+            CancellationToken.None));
+    }
+
+    [Fact]
+    public void Lifecycle_event_is_marked_as_local_status_data_not_a_new_command()
+    {
+        var text = GeminiLiveConversationService.BuildLifecycleEventText(
+            new JarvisLifecycleAnnouncement
+            {
+                Source = "browser_automation",
+                State = "Completed",
+                Detail = "The requested watch page was verified.",
+            });
+
+        Assert.StartsWith("[KEYBOARD.WTF_BACKGROUND_LIFECYCLE_EVENT]", text);
+        Assert.Contains("\"source\":\"browser_automation\"", text);
+        Assert.Contains("\"state\":\"Completed\"", text);
+        Assert.Contains("Do not call any tool", text);
+        Assert.Contains("no longer running", text);
+    }
+
+    [Fact]
+    public void Missing_date_is_requested_instead_of_invented()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "type",
+            TargetRole = "textbox",
+            TargetName = "Departure",
+            Text = "2025-08-01",
+            Replace = true,
+        };
+        var control = new BrowserControl
+        {
+            Id = "departure",
+            Role = "textbox",
+            AccessibleName = "Departure",
+            NearbyLabel = "Departure date",
+            Visible = true,
+            Enabled = true,
+            Editable = true,
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGetMissingRequiredDate(
+            "Find flights from Mumbai to Japan.",
+            "Enter the departure date.",
+            action,
+            control,
+            out var reason));
+        Assert.Contains("not provided", reason, StringComparison.OrdinalIgnoreCase);
+
+        Assert.False(BrowserAutomationCoordinator.TryGetMissingRequiredDate(
+            "Find flights from Mumbai to Japan in September 2026 for one week.",
+            "Enter the departure date.",
+            action,
+            control,
+            out _));
+    }
+
+    [Theory]
+    [InlineData("September 2026")]
+    [InlineData("2026-09-07")]
+    [InlineData("7/9/2026")]
+    [InlineData("next weekend")]
+    [InlineData("in 2 weeks")]
+    public void Natural_date_constraints_are_recognized(string guidance)
+    {
+        Assert.True(BrowserAutomationCoordinator.HasUsableDateConstraint(guidance));
+        Assert.True(BrowserAutomationCoordinator.IsRelevantManualAnswer(
+            "Tell me the required travel date or range.",
+            guidance));
+    }
+
+    [Fact]
+    public void Immediate_field_receipt_is_rejected_when_fresh_page_clears_the_value()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "type",
+            TargetId = "departure",
+            TargetName = "Departure",
+            Text = "2026-09-07",
+            Replace = true,
+        };
+        var receipt = new BrowserActionReceipt
+        {
+            Ok = true,
+            Action = "type",
+            TargetId = "departure",
+            TargetName = "Departure",
+            ValueMatches = true,
+        };
+        var cleared = new BrowserPageSnapshot
+        {
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Id = "departure",
+                    Role = "textbox",
+                    AccessibleName = "Departure",
+                    Value = "",
+                    Visible = true,
+                    Enabled = true,
+                    Editable = true,
+                },
+            },
+        };
+
+        Assert.False(BrowserAutomationCoordinator.FreshStateConfirmsPersistedValue(
+            cleared,
+            action,
+            receipt));
+
+        cleared.Controls[0].Value = "09/07/2026";
+        Assert.True(BrowserAutomationCoordinator.FreshStateConfirmsPersistedValue(
+            cleared,
+            action,
+            receipt));
+    }
+
+    [Fact]
+    public void Planner_prompt_forbids_invented_inputs_and_transient_field_success()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Find flights from Mumbai to Japan.",
+            new BrowserPageSnapshot(),
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("Never invent a required date", prompt);
+        Assert.Contains("field write is provisional", prompt);
+        Assert.Contains("do not alternate between fields", prompt);
+    }
+
+    [Fact]
+    public void Helper_keeps_dom_actions_in_the_leased_background_tab()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+
+        Assert.Contains("if (requiresForeground(command))", worker);
+        Assert.Contains("captureTaskTab", worker);
+        Assert.Contains("await chrome.tabs.update(restoreTabId, { active: true })", worker);
+        Assert.DoesNotContain(
+            "await chrome.windows.update(beforeTab.windowId, { focused: true });\n  await chrome.tabs.update(tabId, { active: true });",
+            worker);
+    }
+
+    [Fact]
+    public void Tab_selection_uses_the_exact_existing_window_without_foreground_keys()
+    {
+        var root = FindRepositoryRoot();
+        var worker = File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "service-worker.js"));
+        var start = worker.IndexOf(
+            "async function activateExistingTab(command)",
+            StringComparison.Ordinal);
+        var end = worker.IndexOf(
+            "async function navigate(command)",
+            start,
+            StringComparison.Ordinal);
+        var implementation = worker[start..end];
+
+        Assert.Contains("chrome.tabs.query({ windowId: requestedWindowId })", implementation);
+        Assert.Contains("await chrome.tabs.update(target.id, { active: true })", implementation);
+        Assert.DoesNotContain("chrome.windows.update", implementation);
+        Assert.DoesNotContain("SendKeys", implementation, StringComparison.OrdinalIgnoreCase);
+
+        var bridge = File.ReadAllText(Path.Combine(
+            root,
+            "src",
+            "Services",
+            "BrowserAutomationV2",
+            "BrowserHelperBridge.cs"));
+        Assert.Contains("IsServiceWorkerCommand(action.Type)", bridge);
+        Assert.Contains("actionType is \"activate_existing_tab\"", bridge);
+        Assert.Contains("status.Connected", bridge);
+        Assert.Contains(
+            "Service-worker-only commands such as exact tab activation remain safe",
+            worker);
+        var activationStart = worker.IndexOf("chrome.tabs.onActivated.addListener(", StringComparison.Ordinal);
+        var updateStart = worker.IndexOf("chrome.tabs.onUpdated.addListener(", activationStart, StringComparison.Ordinal);
+        Assert.True(activationStart >= 0 && updateStart > activationStart);
+        Assert.Contains("wakeBridge();", worker[activationStart..updateStart]);
+        Assert.Contains("helper_content_heartbeat", worker);
+        Assert.Contains("helper_content_heartbeat", File.ReadAllText(Path.Combine(
+            root,
+            "extensions",
+            "keyboard-wtf-browser-helper-v2",
+            "content-script.js")));
+    }
+
+    [Fact]
+    public void Planner_prompt_requires_an_editable_target_or_verified_active_cursor_for_paste()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Summarize this page and paste it into a document.",
+            new BrowserPageSnapshot { ActiveEditable = true, ActiveEditorRole = "textbox" },
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("explicitly editable", prompt);
+        Assert.Contains("active cursor", prompt);
+        Assert.Contains("task-scoped draft text", prompt);
+        Assert.Contains("activate_tab", prompt);
+        Assert.Contains("tab:<id>", prompt);
+        Assert.Contains("terminal only when the user's requested destination is the clipboard", prompt);
+        Assert.Contains("preserved checkpoint", prompt);
+        Assert.Contains("never restart the workflow", prompt);
+        Assert.Contains("A retry must change strategy", prompt);
+    }
+
+    [Fact]
+    public void Broad_noneditable_containers_are_not_used_as_editor_targets()
+    {
+        var action = new BrowserPlannerAction { Type = "click", TargetName = "document area" };
+        var container = new BrowserControl
+        {
+            Role = "div",
+            AccessibleName = "Document area",
+            Visible = true,
+            Enabled = true,
+            Editable = false,
+            Bounds = new BrowserRectangle { Width = 900, Height = 600 },
+        };
+        var realButton = new BrowserControl
+        {
+            Role = "button",
+            AccessibleName = "Open menu",
+            Visible = true,
+            Enabled = true,
+            Bounds = new BrowserRectangle { Width = 120, Height = 36 },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.IsBroadNonEditorContainerAction(action, container));
+        Assert.False(BrowserAutomationCoordinator.IsBroadNonEditorContainerAction(action, realButton));
+    }
+
+    [Fact]
+    public void Verified_editor_transfer_stops_without_waiting_for_a_redundant_planner_turn()
+    {
+        var page = new BrowserPageSnapshot
+        {
+            ActiveEditable = true,
+            ActiveEditorId = "editor",
+            Controls = new[]
+            {
+                new BrowserControl { Id = "editor", Role = "textbox", AccessibleName = "Draft editor", Editable = true },
+                new BrowserControl { Id = "search", Role = "searchbox", AccessibleName = "Search", Editable = true },
+            },
+        };
+        var request = "Summarize this page and paste the result into the Draft editor.";
+
+        Assert.True(BrowserAutomationCoordinator.IsVerifiedEditorTransferAction(
+            request,
+            new BrowserActionReceipt { Ok = true, Action = "type", TargetId = "editor", TargetName = "Draft editor", ValueMatches = true },
+            page));
+        Assert.False(BrowserAutomationCoordinator.IsVerifiedEditorTransferAction(
+            request,
+            new BrowserActionReceipt { Ok = true, Action = "type", TargetId = "search", TargetName = "Search", ValueMatches = true },
+            page));
+    }
+
+    [Theory]
+    [InlineData("Summarize this page and copy it to the clipboard.", true)]
+    [InlineData("Copy the summary into my clipboard.", true)]
+    [InlineData("Place \"preserve the original clipboard\" in this Google Doc.", false)]
+    [InlineData("Type \"copy this to clipboard\" at the current cursor.", false)]
+    [InlineData("Do not change the clipboard.", false)]
+    public void Quoted_payload_text_does_not_change_the_terminal_destination(
+        string request,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            BrowserAutomationVerifier.RequestsClipboardOutput(request));
+    }
+
+    [Fact]
+    public void Stale_or_undispatched_actions_do_not_poison_strategy_recovery()
+    {
+        Assert.False(BrowserAutomationCoordinator.CanExhaustStrategy(
+            new BrowserActionReceipt
+            {
+                Ok = false,
+                Stale = true,
+                BeforeFingerprint = "old-page",
+            }));
+        Assert.False(BrowserAutomationCoordinator.CanExhaustStrategy(
+            new BrowserActionReceipt
+            {
+                Ok = false,
+                Error = "The helper temporarily disconnected.",
+            }));
+        Assert.True(BrowserAutomationCoordinator.CanExhaustStrategy(
+            new BrowserActionReceipt
+            {
+                Ok = true,
+                NoVisibleChange = true,
+                BeforeFingerprint = "live-page",
+            }));
+    }
+
+    [Fact]
+    public void Planner_requires_collection_context_before_generic_ordering_controls()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Open the oldest item from the requested creator.",
+            new BrowserPageSnapshot(),
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("correct entity, collection, section, and local context", prompt);
+        Assert.Contains("global search Filter/Sort control is not collection ordering", prompt);
+        Assert.Contains("exact control and mechanism is exhausted", prompt);
+    }
+
+    [Fact]
+    public void Planner_must_ground_an_explicit_destination_before_using_current_page_controls()
+    {
+        var prompt = BrowserAutomationPlanner.BuildPrompt(
+            "Use browser automation, go to Devpost and search RevenueCat.",
+            new BrowserPageSnapshot
+            {
+                Url = "https://www.youtube.com/",
+                Title = "YouTube",
+                Controls = new[]
+                {
+                    new BrowserControl
+                    {
+                        Id = "search",
+                        Role = "searchbox",
+                        AccessibleName = "Search",
+                        Visible = true,
+                        Enabled = true,
+                        Editable = true,
+                    },
+                },
+            },
+            Array.Empty<string>(),
+            Array.Empty<BrowserControl>());
+
+        Assert.Contains("current page is unrelated", prompt);
+        Assert.Contains("establish that requested destination first", prompt);
+        Assert.Contains("Never use a convenient search box", prompt);
+    }
+
+    [Fact]
+    public void Enter_is_grounded_to_the_unique_search_control_for_a_search_goal()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "press_key",
+            Key = "Enter",
+        };
+        var page = new BrowserPageSnapshot
+        {
+            Controls = new[]
+            {
+                new BrowserControl
+                {
+                    Id = "search",
+                    Role = "combobox",
+                    AccessibleName = "Search",
+                    Enabled = true,
+                    Visible = true,
+                },
+                new BrowserControl
+                {
+                    Id = "message",
+                    Role = "textbox",
+                    AccessibleName = "Message",
+                    Enabled = true,
+                    Visible = true,
+                },
+            },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.TryGroundSearchEnter(
+            page,
+            action,
+            "Search for the requested channel"));
+        Assert.Equal("search", action.TargetId);
+        Assert.Equal("Search", action.TargetName);
+    }
+
+    [Fact]
+    public void Enter_is_not_regrounded_when_search_controls_are_ambiguous()
+    {
+        var action = new BrowserPlannerAction
+        {
+            Type = "press_key",
+            Key = "Enter",
+        };
+        var controls = new[]
+        {
+            new BrowserControl
+            {
+                Id = "global",
+                Role = "searchbox",
+                Enabled = true,
+                Visible = true,
+            },
+            new BrowserControl
+            {
+                Id = "local",
+                Role = "searchbox",
+                Enabled = true,
+                Visible = true,
+            },
+        };
+
+        Assert.False(BrowserAutomationCoordinator.TryGroundSearchEnter(
+            new BrowserPageSnapshot { Controls = controls },
+            action,
+            "Search for TED"));
+        Assert.Empty(action.TargetId);
+    }
+
+    [Fact]
+    public void Trusted_keyboard_input_uses_the_native_input_union_size()
+    {
+        Assert.Equal(IntPtr.Size == 8 ? 40 : 28, BrowserTrustedInput.NativeInputSize);
+    }
+
+    [Fact]
+    public void Trusted_keyboard_input_can_read_the_current_windows_thread_id()
+    {
+        Assert.NotEqual(0u, BrowserTrustedInput.CurrentThreadId);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null)
+        {
+            if ((Directory.Exists(Path.Combine(directory.FullName, ".git"))
+                    || File.Exists(Path.Combine(directory.FullName, ".git")))
+                && Directory.Exists(Path.Combine(directory.FullName, "extensions")))
+            {
+                return directory.FullName;
+            }
+            directory = directory.Parent;
+        }
+        throw new DirectoryNotFoundException("Repository root was not found.");
+    }
+}

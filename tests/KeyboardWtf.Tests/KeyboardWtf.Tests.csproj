@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <!-- Test expectations must follow the requested build, not the SUT's returned configuration. -->
+  <PropertyGroup Condition="'$(KeyboardWtfPaidProduction)' == 'true' And '$(KeyboardWtfPaidProductionCandidate)' != 'true' And '$(KeyboardWtfPersonalApiCandidate)' != 'true'">
+    <DefineConstants>$(DefineConstants);KEYBOARD_WTF_TEST_PUBLIC_PRODUCTION</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(KeyboardWtfPaidProductionCandidate)' == 'true' Or '$(KeyboardWtfPersonalApiCandidate)' == 'true'">
+    <DefineConstants>$(DefineConstants);KEYBOARD_WTF_TEST_PRIVATE_CANDIDATE</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(KeyboardWtfConnectorStagingCandidate)' == 'true'">
+    <DefineConstants>$(DefineConstants);KEYBOARD_WTF_TEST_CONNECTOR_STAGING_CANDIDATE</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(KeyboardWtfPersonalApiCandidate)' == 'true'">
+    <DefineConstants>$(DefineConstants);KEYBOARD_WTF_TEST_PERSONAL_API_CANDIDATE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(KeyboardWtfPaidProduction)' == 'true' And '$(KeyboardWtfPaidProductionCandidate)' != 'true' And '$(KeyboardWtfPersonalApiCandidate)' != 'true'">
+    <!-- Private tooling remains tested in its own build; public assembly tests
+         below prove those implementation types are actually absent. -->
+    <Compile Remove="PrivatePersonalRecordingInputTests.cs" />
+    <Compile Remove="PersonalAudioIngressDiagnosticsTests.cs" />
+    <Compile Remove="PrivateRecordingLifecycleTests.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- This isolated product has no Luma or paid desktop-AI mode; keep those
+         source-project tests out of QLOO's test compilation. -->
+    <Compile Remove="LumaLiveContractTests.cs" />
+    <Compile Remove="LumaLiveEligibilityProbeTests.cs" />
+    <Compile Remove="LumaSettingsSecurityTests.cs" />
+    <Compile Remove="LumaSettingsWireTests.cs" />
+    <Compile Remove="PaidStagingSecurityTests.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\KeyboardWtf.csproj" />
+    <ProjectReference Include="..\..\tools\KeyboardWtf.ReleaseSigner\KeyboardWtf.ReleaseSigner.csproj" />
+    <!-- Build the inert console fixture without importing its same-named assembly. -->
+    <ProjectReference Include="..\..\tools\KeyboardWtf.UpdateTestPeer\KeyboardWtf.UpdateTestPeer.csproj" ReferenceOutputAssembly="false" />
+    <!-- DPI messages require a fresh PMv2 process, separate from the SystemAware test host. -->
+    <ProjectReference Include="..\..\tools\KeyboardWtf.PopupDpiFixture\KeyboardWtf.PopupDpiFixture.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+</Project>

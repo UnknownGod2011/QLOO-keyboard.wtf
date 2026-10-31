@@ -1,0 +1,99 @@
+/* Theme only: the existing Settings layout retains its exact dimensions. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --text: #f2f2f2;
+  --text-dim: #b7b7b7;
+  --text-faint: #8c8c8c;
+  --border: #303030;
+  --border-hover: #606060;
+  --surface-soft: #111111;
+  --sidebar-bg: #090909;
+  --accent: #f2f2f2;
+  --on-accent: #000000;
+  --accent-hover: #dddddd;
+  --success: #66dba4;
+  --warning: #f5bc63;
+  --error: #ff929e;
+}
+:root:not([data-theme="dark"]) { color-scheme: light; }
+:root[data-theme="dark"] select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='%23f2f2f2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+}
+:root[data-theme="dark"] input.hotkey-recording {
+  background: #171717;
+  box-shadow: 0 0 0 2px #f5bc6324;
+}
+:root[data-theme="dark"] input.hotkey-unavailable { border-color: #a95664; }
+:root[data-theme="dark"] #paidAvatar { background: var(--accent) !important; color: var(--on-accent) !important; }
+:root[data-theme="light"] .label-hint[style*="color:#7cfc8e"] { color: #16803d !important; }
+.sidebar-brand { position: relative; }
+.luma-theme-toggle {
+  position: absolute;
+  right: 12px;
+  top: -2px;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 50%;
+}
+#luma-theme-toggle:hover:not(:disabled), #luma-theme-toggle:active:not(:disabled) { color: var(--text); background: var(--surface-soft); border-color: var(--border); }
+.luma-theme-toggle:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.luma-settings-overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-height: 0;
+  overflow: visible;
+  z-index: 80;
+  pointer-events: none;
+}
+.luma-settings-overlay .luma-shell button { height: auto; line-height: 1.4; white-space: normal; }
+.luma-settings-overlay .luma-shell .luma-body { width: 100%; height: 100%; }
+.luma-settings-overlay .luma-shell select { height: auto; line-height: 1.4; }
+/* Existing Settings primary-button hover is intentionally left unchanged.
+   Pet controls instead retain their own neutral, readable component states. */
+.luma-settings-overlay .luma-icon:hover:not(:disabled),
+.luma-settings-overlay .luma-icon[aria-pressed="true"],
+.luma-settings-overlay .luma-bubble-actions button:hover:not(:disabled),
+.luma-settings-overlay .luma-menu button:hover:not(:disabled),
+.luma-settings-overlay .luma-reopen:hover:not(:disabled),
+.luma-settings-overlay .luma-footer button:hover:not(:disabled) {
+  background: var(--luma-hover);
+  color: var(--luma-ink);
+  border-color: var(--luma-focus);
+}
+.luma-settings-overlay .luma-icon:active:not(:disabled),
+.luma-settings-overlay .luma-bubble-actions button:active:not(:disabled),
+.luma-settings-overlay .luma-menu button:active:not(:disabled),
+.luma-settings-overlay .luma-reopen:active:not(:disabled),
+.luma-settings-overlay .luma-footer button:active:not(:disabled) {
+  background: var(--luma-hover);
+  color: var(--luma-ink);
+}
+.luma-settings-overlay .luma-bubble-actions .luma-primary:hover:not(:disabled),
+.luma-settings-overlay .luma-bubble-actions .luma-primary:active:not(:disabled) {
+  background: var(--luma-ink);
+  color: var(--luma-paper);
+  border-color: var(--luma-ink);
+}
+a { text-underline-offset: 3px; }
+:root[data-theme="dark"] .main a:not(.button-link) { color: #dddddd; }
+:root[data-theme="dark"] .main a:not(.button-link):hover { color: #ffffff; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .main { scroll-behavior: auto; }
+  button, input, select, .toast { transition: none; }
+}

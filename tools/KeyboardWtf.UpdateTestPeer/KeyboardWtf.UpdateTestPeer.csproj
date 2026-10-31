@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk" TreatAsLocalProperty="BaseOutputPath;OutputPath">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <AssemblyName>keyboard.wtf</AssemblyName>
+    <!-- Restore graph identity must not collide with the real app package. -->
+    <PackageId>KeyboardWtf.UpdateTestPeer</PackageId>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- The inert fixture shares only the required filename, never app output. -->
+    <BaseOutputPath>$(MSBuildThisFileDirectory)bin\</BaseOutputPath>
+    <OutputPath>$(BaseOutputPath)$(Configuration)\net8.0-windows\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\src\Services\Updates\UpdateProcessIdentityLease.cs" Link="Protocol\UpdateProcessIdentityLease.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdatePathIdentity.cs" Link="Protocol\UpdatePathIdentity.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateInstallerInvocation.cs" Link="Protocol\UpdateInstallerInvocation.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateManifestVerifier.cs" Link="Protocol\UpdateManifestVerifier.cs" />
+    <Compile Include="..\..\src\Services\Updates\PreparedUpdateCommitCoordinator.cs" Link="Protocol\PreparedUpdateCommitCoordinator.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateWorkAdmissionGate.cs" Link="Protocol\UpdateWorkAdmissionGate.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateWorkerHandshake.cs" Link="Protocol\UpdateWorkerHandshake.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateInstallationIngressLease.cs" Link="Protocol\UpdateInstallationIngressLease.cs" />
+    <Compile Include="..\..\src\Services\Updates\UpdateProcessEntry.cs" Link="Protocol\UpdateProcessEntry.cs" />
+    <Compile Include="..\..\src\Services\Updates\ReservedUpdateWorkerAttempt.cs" Link="Protocol\ReservedUpdateWorkerAttempt.cs" />
+  </ItemGroup>
+</Project>

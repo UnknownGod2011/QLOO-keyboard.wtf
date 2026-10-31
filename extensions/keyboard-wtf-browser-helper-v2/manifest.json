@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "QLOO Jarvis Chrome Helper",
+  "description": "Lets QLOO Jarvis act in the Chrome tabs you explicitly ask it to control.",
+  "version": "2.1.28",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxc9ydQUSBsJm89dlqFZMTKy+DnKdfey8FtIw/LdX4alDVwH1pHBmIMOgkAKKKS56bsRGOfEfjGj9Zi1t7mRmJDN/UNKXG7cDuk1z3dIi68+UjxJtvpvpGHzwCS+hLbXUpRcC6qM2Y+zePDStYw2Z/o8LCXRbmdQep4xax8KVbIEO89Iq6mK8vObkVyFMjaENSCO0sS6vODrqmWevIW81CPUjFheWNAb6o7jaQkDGfEMpx1eo2nA+PYfoZFkgos1hiPHD9ezuyC9fwrJS/SDbpXo7Wetk5E3xlvM6XUiQ4PhejHY1Ubn1OaUFaOaBtgKH+9Y2HYgzXIDjvRjAqBkdgQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "alarms",
+    "webNavigation",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://keyboardwtf.com/*",
+      "https://www.keyboardwtf.com/*",
+      "https://keyboard-wtf.vercel.app/*"
+    ]
+  },
+  "action": {
+    "default_title": "QLOO Jarvis Chrome Helper",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

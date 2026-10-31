@@ -1,0 +1,272 @@
+using KeyboardWtf.Services;
+using Xunit;
+using Window = KeyboardWtf.Services.NativeWindowCloser.Window;
+
+namespace KeyboardWtf.Tests;
+
+public sealed class NativeWindowCloserTests
+{
+    [Theory]
+    [InlineData("File Explorer")]
+    [InlineData("explorer")]
+    [InlineData("Windows Explorer")]
+    [InlineData("explorer.exe")]
+    public void Explorer_identity_excludes_shell_dialogs_and_browser_titles(string target)
+    {
+        Window[] windows = [Explorer(1), Explorer(2), Make(3, "explorer", "Program Manager", "Progman"),
+            Make(4, "explorer", "Desktop", "WorkerW"), Make(5, "explorer", "Copying", "#32770"),
+            Make(6, "chrome", "File Explorer - Search"), Make(7, "msedge", "File Explorer")];
+        Assert.Equal(new long[] { 1, 2 }, NativeWindowCloser.Select(windows, target, true, null, (IntPtr)6)
+            .Select(w => w.Handle.ToInt64()));
+    }
+
+    [Fact]
+    public void Named_native_app_never_resolves_a_browser_tab_title()
+    {
+        Window[] windows = [Make(1, "chrome", "Editor"), Make(2, "editor", "notes")];
+        Assert.Equal((IntPtr)2, Assert.Single(NativeWindowCloser.Select(windows, "editor", false, null, (IntPtr)1)).Handle);
+        Assert.DoesNotContain(NativeWindowCloser.Select(windows, "Editor", false, null, (IntPtr)1), w => w.IsBrowser);
+        Assert.Empty(NativeWindowCloser.Select([windows[0]], "Editor", false, null, (IntPtr)1));
+    }
+
+    [Theory]
+    [InlineData("Word")]
+    [InlineData("Microsoft Word")]
+    public void Office_display_name_resolves_its_native_process_not_a_browser_title(string name)
+    {
+        Window[] windows = [Make(1, "winword", "Document1 - Word"), Make(2, "chrome", "Word")];
+        Assert.Equal((IntPtr)1, Assert.Single(NativeWindowCloser.Select(windows, name, false, null, (IntPtr)2)).Handle);
+    }
+
+    [Fact]
+    public void Canonical_folder_path_never_degrades_to_an_unverified_native_title()
+    {
+        Window[] windows =
+        [
+            Make(1, "explorer", "Stock Market - File Explorer", "CabinetWClass"),
+            Make(2, "chrome", "Stock Market"),
+            Make(3, "explorer", "Another Folder", "CabinetWClass"),
+        ];
+        var target = Path.Combine("C:\\", "Users", "Example", "Stock Market");
+
+        var selected = NativeWindowCloser.Select(windows, target, false, null, (IntPtr)2);
+
+        Assert.Empty(selected);
+    }
+
+    [Fact]
+    public void A_mismatched_window_id_cannot_override_the_explicit_native_app_identity()
+    {
+        Window[] windows = [Explorer(1), Make(2, "chrome", "Untouched")];
+        Assert.Empty(NativeWindowCloser.Select(windows, "File Explorer", true, "2", (IntPtr)2));
+    }
+
+    [Fact]
+    public void Exact_folder_paths_distinguish_same_titles_without_closing_unrelated_tabs_or_browsers()
+    {
+        Window[] windows = [Explorer(1), Explorer(2), Explorer(3), Make(4, "chrome", "notes"), Explorer(5)];
+        var wanted = Path.Combine(Path.GetTempPath(), "A", "notes");
+        var other = Path.Combine(Path.GetTempPath(), "B", "notes");
+        var paths = new Dictionary<IntPtr, string[]>
+        {
+            [(IntPtr)1] = [wanted], [(IntPtr)2] = [other],
+            [(IntPtr)3] = [wanted, other], [(IntPtr)4] = [wanted], [(IntPtr)5] = [wanted, ""],
+        };
+        Assert.Equal((IntPtr)1, Assert.Single(NativeWindowCloser.Select(windows, wanted, true, null, (IntPtr)4, paths)).Handle);
+        Assert.Empty(NativeWindowCloser.Select(windows, wanted, true, "2", (IntPtr)4, paths));
+        Assert.Equal(4, NativeWindowCloser.Select(windows, "File Explorer", true, null, (IntPtr)4, paths).Length);
+    }
+
+    [Theory]
+    [InlineData("C:\\One\\notes\\", "c:/One/notes")]
+    [InlineData("C:\\One\\other\\..\\notes", "C:\\One\\notes")]
+    [InlineData("\\\\server\\share\\notes\\", "\\\\server\\share\\notes")]
+    public void Folder_identity_normalizes_separators_and_trailing_slash_without_changing_scope(string target, string actual)
+    {
+        Assert.True(NativeWindowCloser.TryNormalizeFolderPath(target, out var first));
+        Assert.True(NativeWindowCloser.TryNormalizeFolderPath(actual, out var second));
+        Assert.Equal(first, second, ignoreCase: true);
+    }
+
+    [Fact]
+    public void All_requires_a_named_target_and_one_does_not_silently_choose_among_matches()
+    {
+        Window[] windows = [Explorer(1), Explorer(2)];
+        Assert.Empty(NativeWindowCloser.Select(windows, "", true, null, (IntPtr)1));
+        Assert.Equal(2, NativeWindowCloser.Select(windows, "File Explorer", false, null, (IntPtr)1).Length);
+        Assert.Equal((IntPtr)2, Assert.Single(NativeWindowCloser.Select(windows, "File Explorer", false, "2", (IntPtr)1)).Handle);
+    }
+
+    [Fact]
+    public async Task Changed_folder_remains_open_and_is_not_reported_as_closed()
+    {
+        var target = Explorer(1);
+        var sent = 0;
+        var outcome = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => target, _ => { sent++; return true; }, TimeSpan.Zero, _ => false);
+        Assert.False(outcome.Succeeded);
+        Assert.Single(outcome.Remaining);
+        Assert.Equal(0, sent);
+    }
+
+    [Fact]
+    public async Task Cancellation_during_folder_validation_prevents_the_native_close()
+    {
+        var target = Explorer(1);
+        using var cancellation = new CancellationTokenSource();
+        var sent = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => NativeWindowCloser.CloseAsync(
+            [target], cancellation.Token, _ => target, _ => { sent++; return true; }, TimeSpan.Zero,
+            _ => { cancellation.Cancel(); return true; }));
+        Assert.Equal(0, sent);
+    }
+
+    [Fact]
+    public async Task Handle_recycled_during_folder_validation_never_receives_close()
+    {
+        var target = Explorer(1);
+        var current = target;
+        var sent = 0;
+        await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => current, _ => { sent++; return true; }, TimeSpan.Zero,
+            _ => { current = Make(1, "chrome", "Replacement") with { ProcessId = 999 }; return true; });
+        Assert.Equal(0, sent);
+    }
+
+    [Fact]
+    public async Task Close_targets_only_snapshot_handles_even_when_user_switches_or_opens_windows()
+    {
+        var windows = new[] { Explorer(1), Explorer(2), Make(3, "chrome", "Untouched"), Make(4, "msedge", "Untouched") }
+            .ToDictionary(w => w.Handle);
+        var targets = NativeWindowCloser.Select(windows.Values.ToArray(), "File Explorer", true, null, (IntPtr)3);
+        var sent = new List<IntPtr>();
+        var result = await NativeWindowCloser.CloseAsync(targets, CancellationToken.None,
+            id => windows.GetValueOrDefault(id), id =>
+            {
+                sent.Add(id);
+                windows.Remove(id);
+                windows[(IntPtr)5] = Explorer(5); // New window is not owned by this request.
+                return true;
+            });
+        Assert.True(result.Succeeded);
+        Assert.Equal(new IntPtr[] { (IntPtr)1, (IntPtr)2 }, sent);
+        Assert.Equal(new long[] { 3, 4, 5 }, windows.Keys.Select(id => id.ToInt64()).Order());
+    }
+
+    [Fact]
+    public async Task Manual_close_and_recycled_handle_never_target_the_replacement()
+    {
+        var windows = new[] { Explorer(1), Explorer(2), Explorer(3) };
+        var sent = new List<IntPtr>();
+        var result = await NativeWindowCloser.CloseAsync(windows, CancellationToken.None,
+            id => id == (IntPtr)2 ? Make(2, "chrome", "Replacement") with { ProcessId = 999 } : null,
+            id => { sent.Add(id); return true; });
+        Assert.True(result.Succeeded);
+        Assert.Empty(sent);
+        Assert.Equal(0, result.Requested);
+    }
+
+    [Fact]
+    public async Task A_posted_close_is_not_reported_as_success_until_the_window_disappears()
+    {
+        var target = Explorer(1);
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => target, _ => true, TimeSpan.Zero);
+        Assert.False(result.Succeeded);
+        Assert.Equal(target, Assert.Single(result.Remaining));
+    }
+
+    [Fact]
+    public async Task Cancellation_stops_the_rest_of_the_snapshot_without_queued_closes()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var sent = new List<IntPtr>();
+        var targets = new[] { Explorer(1), Explorer(2) };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => NativeWindowCloser.CloseAsync(targets, cancellation.Token,
+            id => targets.Single(w => w.Handle == id), id => { sent.Add(id); cancellation.Cancel(); return true; }));
+        Assert.Equal((IntPtr)1, Assert.Single(sent));
+    }
+
+    [Fact]
+    public async Task Cancellation_during_identity_validation_prevents_the_native_close()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var target = Explorer(1);
+        var sent = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => NativeWindowCloser.CloseAsync(
+            [target], cancellation.Token,
+            _ => { cancellation.Cancel(); return target; },
+            _ => { sent++; return true; }));
+        Assert.Equal(0, sent);
+    }
+
+    [Fact]
+    public async Task Tray_window_hidden_after_our_close_is_verified_without_requiring_process_exit()
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        var current = target;
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => current, _ => { current = target with { IsVisible = false }; return true; },
+            TimeSpan.FromSeconds(1), hasVisibleOwnedWindow: _ => false);
+        Assert.True(result.Succeeded);
+        Assert.Equal(1, result.Requested);
+        Assert.NotNull(current); // A surviving process/HWND is allowed, not force-killed.
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task Hidden_window_requires_successful_dispatch_and_no_owned_prompt(bool dispatched, bool prompt)
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => target with { IsVisible = false }, _ => dispatched, TimeSpan.FromMilliseconds(180),
+            hasVisibleOwnedWindow: _ => prompt);
+        Assert.False(result.Succeeded);
+        Assert.Single(result.Remaining);
+    }
+
+    [Fact]
+    public async Task Briefly_hidden_window_that_reappears_is_not_reported_closed()
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        var reads = 0;
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => ++reads <= 2 ? target with { IsVisible = false } : target,
+            _ => true, TimeSpan.FromMilliseconds(180), hasVisibleOwnedWindow: _ => false);
+        Assert.False(result.Succeeded);
+    }
+
+    [Fact]
+    public async Task Hidden_window_does_not_succeed_before_the_stable_observation()
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => target with { IsVisible = false }, _ => true, TimeSpan.Zero,
+            hasVisibleOwnedWindow: _ => false);
+        Assert.False(result.Succeeded);
+    }
+
+    [Fact]
+    public async Task Minimized_or_cloaked_window_with_visible_style_remains_open()
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        var result = await NativeWindowCloser.CloseAsync([target], CancellationToken.None,
+            _ => target, _ => true, TimeSpan.Zero, hasVisibleOwnedWindow: _ => false);
+        Assert.False(result.Succeeded);
+    }
+
+    [Fact]
+    public async Task Cancellation_while_verifying_hidden_window_is_preserved()
+    {
+        var target = Make(1, "tray-app", "Workspace");
+        using var cancellation = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => NativeWindowCloser.CloseAsync(
+            [target], cancellation.Token, _ => target with { IsVisible = false }, _ => true,
+            hasVisibleOwnedWindow: _ => { cancellation.Cancel(); return false; }));
+    }
+
+    private static Window Explorer(int id) => Make(id, "explorer", $"Folder {id}", "CabinetWClass");
+    private static Window Make(int id, string process, string title, string className = "AppWindow") =>
+        new((IntPtr)id, (uint)id, (uint)id, className, process, title);
+}

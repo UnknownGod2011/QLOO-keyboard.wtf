@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RootNamespace>KeyboardWtf.Staging.Api</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\..\src\Services\Connectors\ConnectorEvidenceTraits.cs" Link="Connectors\ConnectorEvidenceTraits.cs"
+             Condition="Exists('..\..\..\src\Services\Connectors\ConnectorEvidenceTraits.cs')" />
+    <Compile Remove="Connectors\ConnectorEvidenceTraits.cs"
+             Condition="Exists('..\..\..\src\Services\Connectors\ConnectorEvidenceTraits.cs')" />
+    <PackageReference Include="FirebaseAdmin" Version="3.6.0" />
+    <PackageReference Include="Google.Apis.Auth" Version="1.75.0" />
+    <PackageReference Include="Google.Cloud.Firestore" Version="4.3.0" />
+  </ItemGroup>
+  <Target Name="RequireConnectorEvidenceSource" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('..\..\..\src\Services\Connectors\ConnectorEvidenceTraits.cs') And !Exists('Connectors\ConnectorEvidenceTraits.cs')"
+           Text="ConnectorEvidenceTraits.cs must be exported from the same reviewed source commit as this backend." />
+  </Target>
+</Project>

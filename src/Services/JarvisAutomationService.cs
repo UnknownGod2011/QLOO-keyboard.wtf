@@ -1,0 +1,6147 @@
+namespace KeyboardWtf.Services;
+
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+using KeyboardWtf.Helpers;
+using KeyboardWtf.Services.BrowserAutomationV2;
+using KeyboardWtf.Services.PaidStaging;
+
+public sealed class JarvisAutomationService : IDisposable
+{
+    private const int SwHide = 0;
+    private const int SwRestore = 9;
+    private const int SwMinimize = 6;
+    private const int SwMaximize = 3;
+    private const byte VkVolumeMute = 0xAD;
+    private const byte VkVolumeDown = 0xAE;
+    private const byte VkVolumeUp = 0xAF;
+    private static readonly IReadOnlyDictionary<string, string> KnownWebApps =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["gmail"] = "https://mail.google.com/",
+            ["google drive"] = "https://drive.google.com/",
+            ["drive"] = "https://drive.google.com/",
+            ["google calendar"] = "https://calendar.google.com/",
+            ["calendar"] = "https://calendar.google.com/",
+            ["google sheets"] = "https://docs.google.com/spreadsheets/",
+            ["sheets"] = "https://docs.google.com/spreadsheets/",
+            ["youtube"] = "https://www.youtube.com/",
+            ["github"] = "https://github.com/",
+            ["chatgpt"] = "https://chatgpt.com/",
+            ["claude"] = "https://claude.ai/",
+            ["gemini"] = "https://gemini.google.com/",
+            ["devpost"] = "https://devpost.com/",
+            ["instagram"] = "https://www.instagram.com/",
+            ["vercel"] = "https://vercel.com/",
+            ["whatsapp"] = "https://web.whatsapp.com/",
+        };
+    // Explicit web preferences only; ordinary native-first service behavior
+    // is deliberately not changed by these destinations.
+    private static readonly IReadOnlyDictionary<string, string> ExplicitWebDestinations =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["discord"] = "https://discord.com/app",
+            ["reddit"] = "https://www.reddit.com/",
+        };
+    private static readonly LearnedMappingKind[] DurablePreferenceKinds =
+    [
+        LearnedMappingKind.App,
+        LearnedMappingKind.Link,
+        LearnedMappingKind.File,
+        LearnedMappingKind.Folder,
+        LearnedMappingKind.Browser,
+    ];
+
+    private readonly NotificationService _notifications;
+    private readonly SettingsService _settings;
+    private readonly JarvisActionHistoryService _history;
+    private readonly LearnedMappingService _mappings;
+    private readonly AppResolverService _apps;
+    private readonly SmartFileSearchService _files;
+    private readonly BrowserLauncherService _browsers;
+    private readonly BrowserHelperBridge _browserHelper;
+    private readonly Func<SelectionContext> _browserTabForeground;
+    private readonly Func<string, (bool Opened, string Error)> _folderChoiceOpener;
+    private readonly Func<string, string, (bool Opened, string Message, string Browser)> _simpleUrlLauncher;
+    private readonly GeminiScreenGuidanceService _screenGuidance;
+    private readonly WebcamCaptureService _webcam = new();
+    private readonly Action _openSettings;
+    private readonly object _pendingLock = new();
+    private readonly object _conversationStateLock = new();
+    private readonly JarvisTimerService _timerService;
+    private readonly bool _ownsTimerService;
+    private readonly object _selectionLock = new();
+    private readonly FolderChoiceContinuation _folderChoices = new();
+    private readonly string _todosPath = Path.Combine(SettingsService.AppDataDir, "jarvis-todos.json");
+    private PendingJarvisAction _pending;
+    private SelectionSnapshot _lastSelection;
+    private string _latestUserTranscript = "";
+    private DateTimeOffset _latestUserTranscriptAt;
+    private string _latestOpenTarget = "";
+    private DateTimeOffset _latestOpenTargetAt;
+    private string _latestWorkflowName = "";
+    private DateTimeOffset _latestWorkflowAt;
+    private Dictionary<string, BrowserActionReceipt> _openedBrowserTabs = new();
+    private VerifiedClipboardCopy _lastVerifiedClipboardCopy;
+    private Dictionary<string, object> _lastVerifiedClipboardCopyReceipt;
+    private long _clipboardCopyContextGeneration;
+    private long _clipboardCopyAttempt;
+    private long _storedClipboardCopyAttempt;
+    private bool _executingApprovedAction;
+    private bool _disposed;
+    internal Connectors.JarvisConnectorController Connectors { get; set; }
+
+    // A verified output is a conversational referent, not a replacement for
+    // any immutable selected source. It is never persisted or sent in receipts.
+    internal sealed record VerifiedClipboardCopy(string Text, string OriginatingUserTurn, DateTimeOffset CreatedUtc);
+
+    internal VerifiedClipboardCopy LatestVerifiedClipboardCopy
+    {
+        get { lock (_conversationStateLock) return _lastVerifiedClipboardCopy; }
+    }
+
+    // The owned translation callback knows the initiating request even when
+    // unrelated speech arrived during generation. Only that exact successful
+    // copy receipt may reattribute the current immutable snapshot.
+    internal bool AttributeVerifiedCopy(
+        string text, string originatingUserTurn, Dictionary<string, object> receipt)
+    {
+        if (receipt?.GetValueOrDefault("ok") is not true
+            || receipt.GetValueOrDefault("clipboard_verified") is not true
+            || receipt.GetValueOrDefault("confirmation_required") is true)
+            return false;
+        lock (_conversationStateLock)
+        {
+            if (_lastVerifiedClipboardCopy == null
+                || !ReferenceEquals(receipt, _lastVerifiedClipboardCopyReceipt)
+                || !string.Equals(text, _lastVerifiedClipboardCopy.Text, StringComparison.Ordinal))
+                return false;
+            _lastVerifiedClipboardCopy = _lastVerifiedClipboardCopy with
+            {
+                OriginatingUserTurn = originatingUserTurn ?? "",
+            };
+            return true;
+        }
+    }
+
+    public JarvisAutomationService(
+        NotificationService notifications,
+        SettingsService settings,
+        JarvisActionHistoryService history,
+        LearnedMappingService mappings,
+        Action openSettings,
+        JarvisTimerService timerService = null)
+        : this(
+            notifications,
+            settings,
+            history,
+            mappings,
+            openSettings,
+            timerService,
+            null,
+            null)
+    {
+    }
+
+    internal JarvisAutomationService(
+        NotificationService notifications,
+        SettingsService settings,
+        JarvisActionHistoryService history,
+        LearnedMappingService mappings,
+        Action openSettings,
+        JarvisTimerService timerService,
+        PaidAccountService paidAccount = null,
+        BrowserHelperBridge browserHelper = null,
+        Func<string, (bool Opened, string Error)> folderChoiceOpener = null,
+        Func<SelectionContext> browserTabForeground = null,
+        Func<string, string, (bool Opened, string Message, string Browser)> simpleUrlLauncher = null)
+    {
+        _notifications = notifications;
+        _settings = settings;
+        _history = history;
+        _mappings = mappings;
+        _apps = new AppResolverService(mappings);
+        _files = new SmartFileSearchService(mappings);
+        _browsers = new BrowserLauncherService(_apps, settings);
+        _simpleUrlLauncher = simpleUrlLauncher ?? ((url, browser) =>
+        {
+            var opened = _browsers.TryOpen(url, browser, out var message, out var browserUsed);
+            return (opened, message, browserUsed);
+        });
+        _browserHelper = browserHelper;
+        _browserTabForeground = browserTabForeground ?? CaptureSelectionContext;
+        _folderChoiceOpener = folderChoiceOpener;
+        _screenGuidance = new GeminiScreenGuidanceService(paidAccount);
+        _openSettings = openSettings;
+        _timerService = timerService ?? new JarvisTimerService(notifications, history);
+        _ownsTimerService = timerService == null;
+    }
+
+    public async Task<Dictionary<string, object>> ExecuteAsync(
+        string toolName,
+        JsonElement args,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        toolName = (toolName ?? "").Trim();
+        if (ShouldRequestPermission(toolName, args))
+        {
+            PendingJarvisAction pending;
+            lock (_pendingLock) pending = _pending;
+            // Live may repeat the reviewed Calendar proposal after "confirm".
+            // Reuse the existing approval executor only for that exact task and
+            // payload; never replace the approval or execute changed arguments.
+            if (toolName == "connector_execute" && GetString(args, "capability_id") == "calendar_create"
+                && pending is { IsSensitive: false, ToolName: "connector_execute" }
+                && GetString(pending.Args, "task_id") == GetString(args, "task_id")
+                && GetString(pending.Args, "capability_id") == "calendar_create"
+                && SameCalendarConfirmationArguments(pending.Args, args))
+                return await ConfirmPendingActionAsync(token, pending.Id);
+            return RequestRoutinePermission(toolName, args);
+        }
+
+        var result = await ExecuteCoreAsync(toolName, args, token);
+        AttachReferentialTarget(toolName, args, result);
+        return result;
+    }
+
+    internal static void AttachReferentialTarget(
+        string toolName,
+        JsonElement args,
+        Dictionary<string, object> result)
+    {
+        if (result == null
+            || !result.TryGetValue("ok", out var okValue)
+            || okValue is not bool ok
+            || !ok)
+            return;
+        if (result.ContainsKey("referential_target"))
+            return; // A verified native/tab handle is stronger than the model argument.
+
+        string kind;
+        string target;
+        var savedFile = false;
+        // An app/path alias may resolve to a web link. Preserve the actual
+        // effect even when the shell could not supply an exact tab handle.
+        if (result.TryGetValue("url", out var actualUrl) && !string.IsNullOrWhiteSpace(actualUrl?.ToString()))
+        {
+            kind = "link";
+            target = actualUrl.ToString();
+        }
+        else switch ((toolName ?? "").Trim())
+        {
+            case "open_folder":
+                kind = "folder";
+                target = result.TryGetValue("path", out var folderPath)
+                    ? folderPath?.ToString()
+                    : GetString(args, "folder");
+                break;
+            case "open_path":
+                kind = "path";
+                target = result.TryGetValue("path", out var openedPath)
+                    ? openedPath?.ToString()
+                    : GetString(args, "path");
+                break;
+            case "open_app":
+                kind = "app";
+                target = GetString(args, "app_name");
+                break;
+            case "open_url":
+                kind = "link";
+                target = result.TryGetValue("url", out var openedUrl)
+                    ? openedUrl?.ToString()
+                    : GetString(args, "url");
+                break;
+            default:
+                // Successful file-producing tools already return the verified artifact
+                // path. Preserve that identity for follow-ups instead of making the
+                // provider rediscover its parent by a potentially ambiguous basename.
+                if (!result.TryGetValue("path", out var savedPath)
+                    || !Path.IsPathFullyQualified(savedPath?.ToString() ?? "")
+                    || !File.Exists(savedPath.ToString()))
+                    return;
+                kind = "path";
+                target = savedPath.ToString();
+                savedFile = true;
+                break;
+        }
+
+        target = (target ?? "").Trim();
+        if (target.Length == 0)
+            return;
+
+        if (kind == "path" && result.TryGetValue("target_kind", out var targetKind)
+            && string.Equals(targetKind?.ToString(), "folder", StringComparison.Ordinal)) kind = "folder";
+        var nativeWindowTitle = "";
+        if (kind == "path" && !savedFile)
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(target)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            nativeWindowTitle = Path.GetFileName(expanded);
+        }
+
+        result["referential_target"] = new Dictionary<string, object>
+        {
+            ["kind"] = kind,
+            ["target"] = target,
+            ["cardinality"] = "one",
+            ["instruction"] = kind == "link"
+                ? "The destination opened but no exact tab handle was returned. Do not infer a tab or window close from its URL; clarify the target when needed."
+                : "Use this exact target for the next compatible referential follow-up unless the user names another target.",
+        };
+        if (nativeWindowTitle.Length > 0)
+            ((Dictionary<string, object>)result["referential_target"])["native_window_title"] = nativeWindowTitle;
+        if (savedFile)
+        {
+            var reference = (Dictionary<string, object>)result["referential_target"];
+            reference["containing_folder"] = Path.GetDirectoryName(target);
+            reference["instruction"] = "This file was saved, not necessarily opened. For a follow-up about the file or where it was saved, use its exact path or containing_folder unless the user names another target. Do not search for its basename or infer an open window.";
+        }
+    }
+
+    private async Task<Dictionary<string, object>> ExecuteCoreAsync(
+        string toolName,
+        JsonElement args,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        return toolName switch
+        {
+            "connector_resolve" or "connector_execute" or "connector_control" when Connectors is not null =>
+                await Connectors.ExecuteAsync(toolName, args,
+                    _executingApprovedAction || _settings.Current.JarvisPermissionMode != JarvisPermissionMode.AlwaysAsk, token),
+            "open_app" => await OpenAppAsync(
+                GetString(args, "app_name"),
+                GetString(args, "target_kind"), token),
+            "open_url" => await OpenUrlAsync(GetString(args, "url"), GetString(args, "browser"), token),
+            "open_folder" => await OpenFolderAsync(
+                GetString(args, "folder"),
+                GetString(args, "location"),
+                token),
+            "open_path" => await OpenPathAsync(
+                GetString(args, "path"),
+                GetString(args, "location"),
+                token),
+            "window_action" => await WindowActionAsync(
+                GetString(args, "action"),
+                GetString(args, "app_name"),
+                token,
+                GetString(args, "scope"),
+                GetString(args, "window_id")),
+            "browser_action" => args.ValueKind == JsonValueKind.Object && args.TryGetProperty("target_ids", out _)
+                ? await CloseOpenedBrowserTabsAsync(args, token)
+                : args.ValueKind == JsonValueKind.Object && args.TryGetProperty("last_tab_count", out _)
+                    ? await CloseRightmostBrowserTabsFromToolAsync(args, token)
+                    : await ExecuteBrowserTabActionAsync(args, token),
+            "web_search" => await WebSearchAsync(
+                GetString(args, "query"),
+                GetString(args, "engine") ?? GetString(args, "service"),
+                GetString(args, "browser"), token),
+            "get_desktop_context" => GetDesktopContext(),
+            "get_clipboard_text" => GetClipboardText(),
+            "get_selected_text" => await GetSelectedTextAsync(token),
+            "replace_selected_text" => await ReplaceSelectedTextAsync(GetString(args, "text"), token),
+            "type_text" => await TypeTextAsync(GetString(args, "text"), token),
+            "press_key" => PressKey(GetString(args, "key"), token),
+            "search_files" => await SearchFilesAsync(
+                GetString(args, "query"),
+                GetString(args, "location"),
+                token),
+            "save_note" => SaveNote(GetString(args, "text"), GetString(args, "title")),
+            "add_todo" => AddTodo(GetString(args, "text")),
+            "list_todos" => ListTodos(),
+            "complete_todo" => CompleteTodo(GetString(args, "query")),
+            "set_timer" => SetTimer(
+                GetInt(args, "minutes"),
+                GetInt(args, "seconds"),
+                GetString(args, "label")),
+            "cancel_timer" => CancelTimer(GetString(args, "query")),
+            "list_timers" => ListTimers(),
+            "system_control" => SystemControl(GetString(args, "action"), GetInt(args, "value"), token),
+            "system_status" => SystemStatus(),
+            "play_media" => PlayMedia(GetString(args, "query"), GetString(args, "service")),
+            "open_service_page" => OpenServicePage(
+                GetString(args, "service"),
+                GetString(args, "page"),
+                GetString(args, "query")),
+            "open_camera" => OpenCamera(),
+            "take_photo" => await TakePhotoAsync(token),
+            "take_screenshot" => TakeScreenshot(),
+            "inspect_screen" => await InspectScreenAsync(GetString(args, "request"), token,
+                args.ValueKind == JsonValueKind.Object && args.TryGetProperty("screen_context_id", out _)
+                    ? GetString(args, "screen_context_id") : null),
+            "virtual_desktop_action" => VirtualDesktopAction(GetString(args, "action"), token),
+            "windows_recording_action" => WindowsRecordingAction(GetString(args, "action"), token),
+            "open_gmail_draft" => OpenGmailDraft(
+                GetString(args, "recipient"),
+                GetString(args, "subject"),
+                GetString(args, "body")),
+            "prepare_whatsapp_message" => PrepareWhatsAppMessage(
+                GetString(args, "message"),
+                GetString(args, "contact_name"),
+                GetString(args, "phone_number")),
+            "copy_text" => CopyText(GetString(args, "text")),
+            "create_workflow" => CreateWorkflow(args),
+            "remember_routine" => RememberRoutine(args),
+            "edit_workflow" => EditWorkflow(args),
+            "list_workflows" => ListWorkflows(),
+            "run_workflow" => await RunWorkflowAsync(GetString(args, "name"), token),
+            "delete_workflow" => DeleteWorkflow(GetString(args, "name")),
+            "remember_app_alias" => RememberAppAlias(
+                GetString(args, "alias"),
+                GetString(args, "app_name")),
+            "remember_path_alias" => RememberPathAlias(
+                GetString(args, "alias"),
+                GetString(args, "path"),
+                GetString(args, "kind")),
+            "remember_link_alias" => RememberLinkAlias(
+                GetString(args, "alias"),
+                GetString(args, "url")),
+            "remember_workflow_alias" => RememberWorkflowAlias(
+                GetString(args, "alias"),
+                GetString(args, "workflow_name")),
+            "list_learned_mappings" => ListLearnedMappings(),
+            "forget_learned_mapping" => ForgetLearnedMapping(
+                GetString(args, "id_or_alias"),
+                GetString(args, "kind")),
+            "set_browser_preference" => SetBrowserPreference(GetString(args, "browser")),
+            "request_sensitive_action" => await RequestSensitiveActionAsync(
+                GetString(args, "action"),
+                GetString(args, "target"), token),
+            "confirm_sensitive_action" => await ConfirmPendingActionAsync(token),
+            "cancel_sensitive_action" => CancelPendingAction(),
+            _ => Result(false, $"{toolName} is not a supported desktop action yet.", supported: false),
+        };
+    }
+
+    private bool ShouldRequestPermission(string toolName, JsonElement args)
+    {
+        if (toolName == "connector_execute")
+            return !_executingApprovedAction && Connectors?.RequiresConfirmation(args) == true
+                && _settings.Current.JarvisPermissionMode == JarvisPermissionMode.AlwaysAsk;
+        return JarvisPermissionPolicy.RequiresConfirmation(
+            toolName,
+            GetString(args, "action"),
+            toolName == "open_app" ? GetString(args, "app_name") : "",
+            _settings.Current.JarvisPermissionMode,
+            _executingApprovedAction);
+    }
+
+    private Dictionary<string, object> RequestRoutinePermission(string toolName, JsonElement args)
+    {
+        var description = toolName == "connector_execute" && Connectors is not null
+            ? Connectors.DescribeConfirmation(args) : DescribeRoutineAction(toolName, args);
+        lock (_pendingLock)
+        {
+            _pending = new PendingJarvisAction
+            {
+                ToolName = toolName,
+                Args = args.ValueKind == JsonValueKind.Undefined
+                    ? JsonSerializer.SerializeToElement(new { })
+                    : args.Clone(),
+                Action = toolName,
+                Description = description,
+            };
+        }
+
+        Models.KeyboardWtfState.SetUi(Models.VoiceUiPhase.Thinking, "Permission required", description);
+        _history.Add("permission_requested", description, true, true);
+        return Result(
+            true,
+            $"{description}. Ask the user to say confirm or cancel.",
+            confirmationRequired: true,
+            extras: new()
+            {
+                ["description"] = description,
+                ["permission_mode"] = _settings.Current.JarvisPermissionMode.ToString(),
+                ["always_requires_confirmation"] = toolName is "open_camera" or "take_photo"
+                    or "take_screenshot" or "inspect_screen"
+                    || (toolName == "virtual_desktop_action"
+                        && NormalizeWords(GetString(args, "action")) is "close" or "close desktop" or "close current desktop"),
+            });
+    }
+
+    private static string DescribeRoutineAction(string toolName, JsonElement args) => toolName switch
+    {
+        "connector_execute" => "Perform the requested connected-service action",
+        "open_app" => $"Open {GetString(args, "app_name")}",
+        "open_url" => $"Open {GetString(args, "url")}",
+        "open_folder" => $"Open the {GetString(args, "folder")} folder",
+        "open_path" => $"Open {GetString(args, "path")}",
+        "window_action" => $"{GetString(args, "action")} the requested window",
+        "browser_action" => args.ValueKind == JsonValueKind.Object && args.TryGetProperty("target_ids", out _)
+            ? "Close the requested previously opened tab set"
+            : $"{GetString(args, "action")} in the active browser",
+        "web_search" => $"Search for {GetString(args, "query")}",
+        "replace_selected_text" => "Replace the selected text",
+        "type_text" => "Type text into the active field",
+        "press_key" => $"Press {GetString(args, "key")}",
+        "save_note" => "Save a local note",
+        "add_todo" => "Add a local to-do",
+        "complete_todo" => "Complete a local to-do",
+        "set_timer" => "Start a timer",
+        "cancel_timer" => "Cancel a timer",
+        "system_control" => $"{GetString(args, "action")}",
+        "play_media" => $"Open {GetString(args, "query")} on {GetString(args, "service")}",
+        "open_service_page" => $"Open {GetString(args, "page")} on {GetString(args, "service")}",
+        "open_camera" => "Open the Windows Camera app",
+        "take_photo" => "Open Windows Camera for a manually reviewed photo",
+        "take_screenshot" => "Capture and save the current screen",
+        "inspect_screen" => args.ValueKind == JsonValueKind.Object && args.TryGetProperty("screen_context_id", out _)
+            ? "Analyze the previously approved screen image" : "Analyze the current screen once",
+        "virtual_desktop_action" => $"{GetString(args, "action")} virtual desktop",
+        "windows_recording_action" => $"{GetString(args, "action")} Windows screen recording",
+        "open_gmail_draft" => $"Prepare a Gmail draft for {GetString(args, "recipient")}",
+        "prepare_whatsapp_message" => "Prepare a WhatsApp message",
+        "copy_text" => "Copy prepared text to the clipboard",
+        "create_workflow" => "Save a Jarvis workflow",
+        "remember_routine" => $"Remember the phrase {GetString(args, "trigger")} as a routine",
+        "edit_workflow" => $"Update workflow {GetString(args, "name")}",
+        "run_workflow" => $"Run the {GetString(args, "name")} workflow",
+        "delete_workflow" => $"Delete the {GetString(args, "name")} workflow",
+        "remember_app_alias" => $"Remember {GetString(args, "alias")} as {GetString(args, "app_name")}",
+        "remember_path_alias" => $"Remember {GetString(args, "alias")} as a local path",
+        "remember_link_alias" => $"Remember {GetString(args, "alias")} as a web link",
+        "remember_workflow_alias" => $"Remember {GetString(args, "alias")} as workflow {GetString(args, "workflow_name")}",
+        "forget_learned_mapping" => $"Forget {GetString(args, "id_or_alias")}",
+        "set_browser_preference" => $"Use {GetString(args, "browser")} as the preferred browser",
+        _ => $"Run {toolName.Replace('_', ' ')}",
+    };
+
+    public void ObserveUserTranscript(string text)
+    {
+        var userTurn = (text ?? "").Trim();
+        if (userTurn.Length > 0)
+        {
+            _folderChoices.ObserveUserTurn(userTurn);
+            // A same-window selection is not evidence that its contents still
+            // match a new request. Keep the cache only for retries within the
+            // current turn; a later turn must capture the current selection or
+            // fail closed instead of silently resurrecting older text.
+            lock (_selectionLock)
+                _lastSelection = null;
+        }
+
+        PendingJarvisAction pending;
+        lock (_pendingLock)
+        {
+            _latestUserTranscript = Limit(userTurn, 1000);
+            _latestUserTranscriptAt = DateTimeOffset.UtcNow;
+            pending = _pending;
+        }
+        if (pending == null)
+            return;
+
+        var normalized = NormalizePhraseText(text);
+        if (ContainsPhrase(normalized, "cancel", "no", "nope", "do not", "don't", "stop", "never mind"))
+        {
+            lock (_pendingLock)
+                _pending = null;
+            _history.Add("confirmation_cancelled", pending.Description, true);
+            return;
+        }
+
+        if (normalized.Length <= 80
+            && ContainsPhrase(normalized, "yes", "yeah", "yep", "sure", "confirm", "go ahead", "proceed", "do it", "okay do it", "ok do it"))
+        {
+            lock (_pendingLock)
+            {
+                if (_pending?.Id == pending.Id)
+                    _pending.ConfirmedAt = DateTimeOffset.UtcNow;
+            }
+        }
+    }
+
+    public object PendingSnapshot()
+    {
+        lock (_pendingLock)
+        {
+            if (_pending == null)
+                return null;
+            return new
+            {
+                _pending.Id,
+                _pending.Action,
+                _pending.Target,
+                _pending.Description,
+                _pending.ToolName,
+                _pending.IsSensitive,
+                _pending.RequestedAt,
+                _pending.ConfirmedAt,
+            };
+        }
+    }
+
+    private async Task<Dictionary<string, object>> OpenAppAsync(string appName, string targetKind, CancellationToken token)
+    {
+        var nativeOnly = IsExplicitNativeTarget(targetKind);
+        var resolverQuery = nativeOnly ? NormalizeNativeAppQuery(appName) : appName;
+        var name = NormalizeWords(resolverQuery);
+        if (string.IsNullOrWhiteSpace(name))
+            return Result(false, "Which app should I open?", needsClarification: true);
+        RememberTransientOpenTarget(name);
+
+        if (IsWindowsSettingsTarget(name))
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "ms-settings:",
+                UseShellExecute = true,
+            });
+            return Logged("open_app", "Windows Settings", true, "Opened Windows Settings.");
+        }
+
+        if (IsKeyboardWtfSettingsTarget(name))
+        {
+            _openSettings();
+            return Logged("open_app", "keyboard.wtf settings", true, "Opened keyboard.wtf settings.");
+        }
+
+        if (!nativeOnly)
+        {
+            var learnedLink = _mappings.FindExact(LearnedMappingKind.Link, appName)
+                ?? _mappings.FindExact(LearnedMappingKind.Link, name);
+            if (learnedLink != null)
+                return await OpenUrlAsync(learnedLink.Target, "", token);
+        }
+
+        if (name is "downloads" or "download folder" or "downloads folder"
+            or "documents" or "documents folder" or "pictures" or "pictures folder")
+        {
+            var known = name.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+            return OpenKnownFolder(known);
+        }
+
+        if (!nativeOnly && KnownWebApps.TryGetValue(name, out var webUrl))
+            return await OpenUrlAsync(webUrl, "", token);
+        if (name is "camera" or "windows camera")
+            return OpenCamera();
+        var resolution = _apps.Resolve(resolverQuery);
+        if (resolution.Status == AppResolutionStatus.Found)
+        {
+            if (_apps.TryLaunch(resolution.Best, out var error))
+                return Logged(
+                    "open_app",
+                    $"{resolverQuery} -> {resolution.Best.Name} ({resolution.Best.Source})",
+                    true,
+                    $"Opened {resolution.Best.Name}.",
+                    extras: new()
+                    {
+                        ["matched_name"] = resolution.Best.Name,
+                        ["match_score"] = Math.Round(resolution.Best.Score, 3),
+                        ["source"] = resolution.Best.Source,
+                    });
+            return Logged("open_app", resolverQuery, false, $"I found {resolution.Best.Name}, but Windows could not open it: {error}", supported: false);
+        }
+
+        if (resolution.Status == AppResolutionStatus.Ambiguous)
+        {
+            return Result(
+                false,
+                $"I found several possible apps for {resolverQuery}. Ask the user to choose one by name.",
+                needsClarification: true,
+                extras: new()
+                {
+                    ["candidates"] = resolution.Candidates.Select(candidate => new
+                    {
+                        name = candidate.Name,
+                        source = candidate.Source,
+                        score = Math.Round(candidate.Score, 3),
+                    }).ToArray(),
+                    ["searched"] = resolution.SearchSummary,
+                });
+        }
+
+        if (!nativeOnly && string.Equals(
+            AppResolverService.CanonicalizeNaturalName(resolverQuery),
+            "Apple Music",
+            StringComparison.OrdinalIgnoreCase))
+        {
+            var webResult = await OpenUrlAsync("https://music.apple.com/", "", token);
+            if (Succeeded(webResult)) webResult["message"] = "Apple Music was not installed, so I opened Apple Music on the web.";
+            return webResult;
+        }
+
+        // A model can misclassify one web service in a compound request as
+        // native-only. Preserve the explicit native boundary: do not open a
+        // website here. Return the existing verified catalog alternative so
+        // the model can recover in this turn only if the user's request allows
+        // a web destination; no guessed URL or saved preference is created.
+        var hasVerifiedWebAlternative = TryGetVerifiedWebAlternative(name, nativeOnly, out var verifiedWebUrl);
+        return Logged(
+            "open_app",
+            name,
+            false,
+            nativeOnly
+                ? hasVerifiedWebAlternative
+                    ? $"I could not find an installed {resolverQuery} application. A verified website is available but was not opened. Use the verified_web_url only if the user did not specifically require a native app."
+                    : $"I could not find an installed {resolverQuery} application. I searched {resolution.SearchSummary}."
+                : $"I could not find {resolverQuery}. I searched {resolution.SearchSummary}.",
+            supported: false,
+            extras: new()
+            {
+                ["searched"] = resolution.SearchSummary,
+                ["verified_web_url"] = hasVerifiedWebAlternative ? verifiedWebUrl : null,
+            });
+    }
+
+    internal static bool TryGetVerifiedWebAlternative(
+        string normalizedName, bool nativeOnly, out string url)
+    {
+        url = null;
+        return nativeOnly && KnownWebApps.TryGetValue(normalizedName ?? "", out url);
+    }
+
+    // The user turn, not the model's chosen tool kind or guessed home page,
+    // owns an unqualified named-service open. This uses the existing web
+    // catalog only when the requested service is unambiguous. Explicit native
+    // app requests and explicit URLs keep their own authority.
+    internal bool TryResolveRequestedKnownWebOpen(
+        string userTurn, string toolName, string proposedTarget, out string url)
+    {
+        url = "";
+        if (toolName is not ("open_app" or "open_url")
+            || !Regex.IsMatch(userTurn ?? "", @"\b(?:open|visit|go\s+to)\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", @"\b(?:don't|do\s+not|never)\s+open\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", @"\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b", RegexOptions.IgnoreCase))
+            return false;
+
+        var turn = NormalizePhraseText(userTurn);
+        var requested = KnownWebApps
+            .Where(entry => ContainsPhrase(turn, entry.Key))
+            .Select(entry => entry.Key)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (toolName == "open_app")
+        {
+            var name = NormalizeWords(NormalizeNativeAppQuery(
+                NormalizeUnrequestedModelAppDecoration(turn, proposedTarget)));
+            if (!requested.Contains(name, StringComparer.OrdinalIgnoreCase)
+                || !KnownWebApps.TryGetValue(name, out url)
+                || !IsCompleteNamedOpenObjectRequested(userTurn, name)
+                || HasExactDurableOpenMapping(name)
+                || ExplicitNativeObjectRequested(turn, name))
+                return false;
+            return true;
+        }
+
+        // A model may pass the exact alias rather than the URL for a more
+        // specific saved page. The current generic object still owns this
+        // correction; resolve only an existing literal Link, never a guess.
+        var proposedLink = _mappings.FindExact(LearnedMappingKind.Link, proposedTarget);
+        if (!BrowserLauncherService.TryNormalizeUrl(proposedLink?.Target ?? proposedTarget, out var proposed))
+            return false;
+        // A model can paste a more specific saved project's URL for the
+        // generic site name. Correct only a URL that identifies an actual
+        // unrequested saved Link; ordinary same-host paths keep their owner.
+        if (TryResolveUnrequestedSavedUrlForKnownWebOpen(userTurn, turn, proposed, out url))
+            return true;
+        // A resolved saved alias may only use that narrow same-site rule;
+        // it is not a model-guessed homepage for the fallback below.
+        if (proposedLink != null) return false;
+        // Other specific pages are outside generic homepage correction.
+        if (proposed.AbsolutePath != "/" || proposed.Query.Length != 0
+            || proposed.Fragment.Length != 0 || !proposed.IsDefaultPort)
+            return false;
+
+        // In a compound request the exact name or www variant identifies one
+        // existing catalog owner without guessing a website or assigning an
+        // unrelated URL to whichever requested item happens to be missing.
+        // Always return its already-verified URL, never trust the guessed host.
+        var proposedHost = NormalizeHost(proposed.Host);
+        var proposedLabels = proposedHost.Split('.');
+        var identifiedUrls = requested
+            .Where(name => IsCompleteNamedOpenObjectRequested(userTurn, name)
+                && !HasExactDurableOpenMapping(name) && !ExplicitNativeObjectRequested(turn, name))
+            .Where(name => BrowserLauncherService.TryNormalizeUrl(KnownWebApps[name], out var known)
+                && (string.Equals(proposedHost, NormalizeHost(known.Host), StringComparison.OrdinalIgnoreCase)
+                    || (proposedLabels.Length == 2 && string.Equals(proposedLabels[0],
+                        Regex.Replace(name, @"[^a-z0-9]", ""), StringComparison.OrdinalIgnoreCase))))
+            .Select(name => KnownWebApps[name]).Distinct(StringComparer.OrdinalIgnoreCase).Take(2).ToArray();
+        if (identifiedUrls.Length == 1
+            && BrowserLauncherService.TryNormalizeUrl(identifiedUrls[0], out var identified)
+            && !string.Equals(proposed.Host, identified.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            url = identifiedUrls[0];
+            return true;
+        }
+
+        // Preserve the existing single-known-service correction. With several
+        // unrelated requested destinations there is no safe assignment.
+        var requestedUrls = requested.Select(name => KnownWebApps[name])
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (requestedUrls.Length != 1
+            || requested.Any(name => !IsCompleteNamedOpenObjectRequested(userTurn, name))
+            || requested.Any(HasExactDurableOpenMapping)
+            || requested.Any(name => ExplicitNativeObjectRequested(turn, name)))
+            return false;
+        url = requestedUrls[0];
+        if (!BrowserLauncherService.TryNormalizeUrl(url, out var canonical)
+            || string.Equals(proposed.Host, canonical.Host, StringComparison.OrdinalIgnoreCase))
+            return false;
+        return true;
+    }
+
+    private bool TryResolveUnrequestedSavedUrlForKnownWebOpen(
+        string userTurn, string normalizedTurn, Uri proposed, out string url)
+    {
+        url = "";
+        var savedLinks = _mappings.Snapshot(LearnedMappingKind.Link)
+            .Where(link => BrowserLauncherService.TryNormalizeUrl(link.Target, out var saved) && saved == proposed)
+            .ToArray();
+        if (savedLinks.Length == 0) return false;
+        var objects = RequestedNamedOpenObjects(userTurn);
+        if (savedLinks.Any(link => NormalizeSavedCommandIdentity(userTurn) == NormalizeSavedCommandIdentity(link.Alias)
+            || objects.Any(item => NormalizeSavedCommandIdentity(item) == NormalizeSavedCommandIdentity(link.Alias))))
+            return false;
+        var destinations = KnownWebApps
+            .Where(entry => IsCompleteNamedOpenObjectRequested(userTurn, entry.Key)
+                && !HasExactDurableOpenMapping(entry.Key) && !ExplicitNativeObjectRequested(normalizedTurn, entry.Key))
+            .Where(entry => BrowserLauncherService.TryNormalizeUrl(entry.Value, out var known)
+                && string.Equals(known.Host, proposed.Host, StringComparison.OrdinalIgnoreCase)
+                && known.Port == proposed.Port && known != proposed)
+            .Select(entry => entry.Value).Distinct(StringComparer.OrdinalIgnoreCase).Take(2).ToArray();
+        if (destinations.Length != 1) return false;
+        url = destinations[0];
+        return true;
+    }
+
+    private static IReadOnlyList<string> RequestedNamedOpenObjects(string userTurn)
+    {
+        var match = Regex.Match(userTurn ?? "",
+            @"^\s*(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:open|visit|go\s+to)\s+(?<items>.+?)[.!?]*\s*$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success) return [];
+        return Regex.Split(match.Groups["items"].Value, @"\s*(?:,|;|\band\b|\bthen\b)\s*", RegexOptions.IgnoreCase)
+            .Select(item => Regex.Replace(NormalizePhraseText(item), @"^(?:open|visit|go\s+to)\s+|\s+please$", ""))
+            .ToArray();
+    }
+
+    private static bool IsCompleteNamedOpenObjectRequested(string userTurn, string name)
+    {
+        // Catalog authority comes from one complete requested object. A site
+        // name inside "my site project" is part of that saved object, not an
+        // additional request for the site's homepage.
+        return RequestedNamedOpenObjects(userTurn)
+            .Any(item => item == name
+                || (KnownWebApps.TryGetValue(item, out var requestedUrl)
+                    && KnownWebApps.TryGetValue(name, out var namedUrl) && requestedUrl == namedUrl));
+    }
+
+    // A complete list of exact named web destinations is authoritative. If a
+    // model proposes a different URL or app for that closed list, fail before
+    // any browser/app effect instead of guessing which requested item it meant.
+    // Mixed or qualified requests remain with the normal tool resolver.
+    internal bool IsUnrequestedDestinationInExactWebOpen(
+        string userTurn, string toolName, string proposedTarget)
+    {
+        if (toolName is not ("open_app" or "open_url" or "open_service_page")
+            || string.IsNullOrWhiteSpace(proposedTarget))
+            return false;
+
+        var match = Regex.Match(userTurn ?? "",
+            @"^\s*(?:please\s+)?(?:open|visit)\s+(?<items>.+?)\s*[.!?]*\s*$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var items = Regex.Split(match.Groups["items"].Value,
+            @"\s*(?:,|;|\band\b)\s*", RegexOptions.IgnoreCase);
+        if (items.Length == 0)
+            return false;
+        foreach (var item in items)
+        {
+            var name = NormalizePhraseText(item.Trim().TrimEnd('.', '!', '?'));
+            if (name.Length == 0 || ExplicitNativeObjectRequested(name, name))
+                return false;
+            var link = _mappings.FindExact(LearnedMappingKind.Link, name)
+                ?? _mappings.FindExact(LearnedMappingKind.Link, "open " + name);
+            if (link == null && HasExactDurableOpenMapping(name))
+                return false;
+            var destination = link?.Target;
+            if (destination == null && !KnownWebApps.TryGetValue(name, out destination))
+                return false;
+            if (!BrowserLauncherService.TryNormalizeUrl(destination, out var parsed))
+                return false;
+            names.Add(name);
+            // The saved-Link correction above the guard may use its complete
+            // trigger ("open team portal"), while the compound list names only
+            // the object ("team portal"). Both identify this same requested
+            // mapping, not an additional destination or an unrelated alias.
+            if (link != null) names.Add(NormalizePhraseText(link.Alias));
+            hosts.Add(parsed.Host);
+        }
+
+        if (toolName == "open_url")
+        {
+            if (names.Contains(NormalizePhraseText(proposedTarget))
+                || (_mappings.FindExact(LearnedMappingKind.Link, proposedTarget) is { } link
+                    && names.Contains(NormalizePhraseText(link.Alias))))
+                return false;
+            return !BrowserLauncherService.TryNormalizeUrl(proposedTarget, out var proposed)
+                || !hosts.Contains(proposed.Host);
+        }
+
+        return !names.Contains(NormalizePhraseText(NormalizeNativeAppQuery(proposedTarget)));
+    }
+
+    internal bool IsUnrequestedSavedIdentityInNamedOpen(
+        string userTurn, string toolName, string proposedTarget)
+    {
+        // A missing/deleted name is not authority to substitute a different
+        // saved Link or routine. Restrict this check to a plain named open;
+        // referential and explicit workflow/native requests keep their existing
+        // owners. A browser qualifier changes where, not which saved object
+        // the user requested. No new memory or fuzzy matching is added.
+        var match = Regex.Match(userTurn ?? "",
+            @"^\s*(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:open|visit|use|go\s+to)\s+(?<items>.+?)[.!?]*\s*$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success) return false;
+        string WithoutBrowserQualifier(string value) => Regex.Replace(value,
+            @"\s+(?:in|using|with|through)\s+(?:chrome|edge|brave|firefox|opera|vivaldi|arc)\b", "", RegexOptions.IgnoreCase);
+        var originalItems = match.Groups["items"].Value;
+        // Browser words may be part of a literal saved identity. Preserve that
+        // owner before treating them as a qualifier; otherwise qualify each
+        // independently requested object, not the whole saved-name namespace.
+        var requestedItems = TryResolveSavedOpenObject(originalItems, out var literal) && literal.Saved
+            ? originalItems
+            : string.Join(", ", Regex.Split(originalItems, @"\s*(?:,|;|\band\b)\s*", RegexOptions.IgnoreCase)
+                .Select(item => TryResolveSavedOpenObject(item, out var saved) && saved.Saved
+                    ? item : WithoutBrowserQualifier(item)));
+        if (Regex.IsMatch(WithoutBrowserQualifier(originalItems),
+                @"\b(?:this|that|these|those|it|them|previous|last|again|selected|selection|workflow|routine|setup|app|application|native|desktop|which|where|you|for|from|with|in|on|to|then)\b",
+                RegexOptions.IgnoreCase))
+            return false;
+
+        string destination = null;
+        string workflowName = null;
+        var proposedLink = toolName == "open_url" ? FindExactSavedLink(proposedTarget) : null;
+        if (proposedLink == null && toolName == "open_url"
+            && BrowserLauncherService.TryNormalizeUrl(proposedTarget, out var savedDestination))
+        {
+            // Alias and its exact persisted URL are the same effect. A model
+            // must not bypass the saved-name authority check by supplying the
+            // URL directly after a compound/qualified set owner declined.
+            proposedLink = _mappings.Snapshot(LearnedMappingKind.Link).FirstOrDefault(entry =>
+                BrowserLauncherService.TryNormalizeUrl(entry.Target, out var target)
+                && string.Equals(target.AbsoluteUri, savedDestination.AbsoluteUri, StringComparison.Ordinal));
+        }
+        if (proposedLink != null)
+        {
+            destination = proposedLink.Target;
+        }
+        else if (toolName == "run_workflow" && FindWorkflow(proposedTarget) is { } workflow)
+        {
+            workflowName = workflow.Name;
+        }
+        else if (toolName == "open_url" && BrowserLauncherService.TryNormalizeUrl(proposedTarget, out var proposedUrl))
+        {
+            // A plain named Link is not permission to invent its URL when the
+            // name is missing (including after deletion). Keep this limited to
+            // one explicit Link/my-website object; ordinary site names, URLs,
+            // compound requests and contextual referents keep their owners.
+            var requestedObject = requestedItems.Trim();
+            if (requestedObject.IndexOfAny([',', ';']) >= 0
+                || BrowserLauncherService.TryNormalizeUrl(requestedObject, out _))
+                return false;
+            var requestedName = NormalizePhraseText(requestedObject);
+            if (!Regex.IsMatch(requestedName, @"^(?:my website|[\p{L}\p{N}][\p{L}\p{N}' -]{0,78} link)$")
+                || Regex.IsMatch(requestedName, @"\b(?:and|or)\b"))
+                return false;
+            var namedService = Regex.Replace(requestedName, @" link$", "");
+            if (KnownWebApps.TryGetValue(namedService, out var knownUrl)
+                && BrowserLauncherService.TryNormalizeUrl(knownUrl, out var known)
+                && string.Equals(proposedUrl.Host, known.Host, StringComparison.OrdinalIgnoreCase))
+                return false;
+            var requestedLink = FindExactSavedLink(requestedName);
+            if (requestedLink != null)
+                return !BrowserLauncherService.TryNormalizeUrl(requestedLink.Target, out var requestedUrl)
+                    || !string.Equals(proposedUrl.AbsoluteUri, requestedUrl.AbsoluteUri, StringComparison.Ordinal);
+            var exactWorkflow = FindExactSavedWorkflow(requestedName);
+            var workflowActions = OrderedWorkflowActions(exactWorkflow);
+            if (workflowActions.Count == 1 && workflowActions[0].Kind == "url"
+                && BrowserLauncherService.TryNormalizeUrl(workflowActions[0].Target, out var workflowUrl)
+                && string.Equals(proposedUrl.AbsoluteUri, workflowUrl.AbsoluteUri, StringComparison.Ordinal))
+                return false;
+            return true;
+        }
+        else return false;
+
+        bool ResolvesRequestedIdentity(string value) => destination != null
+            ? TryResolveSavedOpenObject(value, out var requestedAction)
+                && requestedAction.CanonicalKey == OpenUrlIdentity(destination)
+            : FindExactSavedWorkflow(value)?.Name == workflowName;
+        // An exact saved name may itself contain a conjunction or comma.
+        if (ResolvesRequestedIdentity(requestedItems))
+            return false;
+        var requested = Regex.Split(requestedItems,
+            @"\s*(?:,|;|\band\b)\s*", RegexOptions.IgnoreCase);
+        return requested.Length > 0 && !requested.Any(item =>
+            ResolvesRequestedIdentity(item)
+            || (destination != null && BrowserLauncherService.TryNormalizeUrl(item, out var explicitUrl)
+                && BrowserLauncherService.TryNormalizeUrl(destination, out var savedUrl)
+                && string.Equals(explicitUrl.AbsoluteUri, savedUrl.AbsoluteUri, StringComparison.Ordinal)));
+    }
+
+    private bool HasExactDurableOpenMapping(string name) =>
+        DurablePreferenceKinds.Any(kind =>
+            _mappings.FindExact(kind, name) != null
+            || _mappings.FindExact(kind, "open " + name) != null);
+
+    private static bool ExplicitNativeObjectRequested(string normalizedTurn, string normalizedName)
+    {
+        var name = Regex.Escape(normalizedName);
+        return Regex.IsMatch(normalizedTurn,
+            $@"\b(?:launch|start)\s+(?:the\s+)?{name}\b|\b{name}\s+(?:(?:desktop|native)\s+)?(?:app|application)\b|\b{name}\s+as\s+an?\s+(?:app|application)\b|\b{name}\s+(?:native|desktop)\b|\b(?:app|application)\s+{name}\b|\b(?:native|desktop)(?:\s+(?:app|application))?\s+{name}\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    internal static bool IsExplicitNativeTarget(string targetKind) =>
+        NormalizeWords(targetKind) is "native" or "native app" or "app" or "application";
+
+    internal static string NormalizeNativeAppQuery(string value)
+    {
+        var query = Regex.Replace(
+            (value ?? "").Trim(),
+            @"^(?:open|launch|start)\s+",
+            "",
+            RegexOptions.IgnoreCase);
+        return Regex.Replace(
+            query,
+            @"\s+(?:native\s+)?(?:app|application)$",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+    }
+
+    internal static bool IsWindowsSettingsTarget(string value) =>
+        NormalizeWords(value) is "settings" or "windows settings";
+
+    internal static bool IsKeyboardWtfSettingsTarget(string value) =>
+        NormalizeWords(value) is "keyboard.wtf settings" or "keyboard wtf settings"
+            or "jarvis settings" or "your settings";
+
+    internal static bool TryResolveKnownWebDestination(
+        string value,
+        out string label,
+        out string url)
+    {
+        label = "";
+        url = "";
+        var candidate = (value ?? "").Trim().Trim('"', '\'', '.', ',', ';', ':');
+        if (candidate.Length == 0)
+            return false;
+
+        if (TryNormalizeExplicitWebUrl(candidate, out url))
+        {
+            label = candidate;
+            return true;
+        }
+
+        candidate = Regex.Replace(
+            candidate,
+            @"^(?:the\s+)?(?:website|web\s+site|site|webpage|page)\s+|\s+(?:website|web\s+site|site|webpage|page)$",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+        var normalized = NormalizePhraseText(candidate);
+        if (KnownWebApps.TryGetValue(normalized, out url))
+        {
+            label = candidate;
+            return true;
+        }
+
+        var compact = Regex.Replace(normalized, @"[^a-z0-9]", "");
+        var exactCompact = KnownWebApps.FirstOrDefault(entry =>
+            string.Equals(
+                Regex.Replace(NormalizePhraseText(entry.Key), @"[^a-z0-9]", ""),
+                compact,
+                StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(exactCompact.Key))
+        {
+            label = candidate;
+            url = exactCompact.Value;
+            return true;
+        }
+
+        return false;
+    }
+
+    internal static bool TryResolveKnownWebDestinationMention(
+        string value,
+        out string label,
+        out string url)
+    {
+        label = "";
+        url = "";
+        var text = value ?? "";
+        var domainMatches = Regex.Matches(
+            text,
+            @"(?<![\w@])(?:https?://)?(?:www\.)?[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)+(?:/[^\s,;]*)?",
+            RegexOptions.IgnoreCase);
+        if (domainMatches.Count > 0
+            && TryResolveKnownWebDestination(
+                domainMatches[^1].Value,
+                out label,
+                out url))
+        {
+            return true;
+        }
+
+        var normalized = NormalizePhraseText(text);
+        foreach (var entry in KnownWebApps.OrderByDescending(pair => pair.Key.Length))
+        {
+            if (!ContainsPhrase(normalized, entry.Key))
+                continue;
+            label = entry.Key;
+            url = entry.Value;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryNormalizeExplicitWebUrl(string value, out string url)
+    {
+        url = "";
+        if (!BrowserLauncherService.TryNormalizeUrl(value, out var uri))
+            return false;
+        url = uri.AbsoluteUri;
+        return true;
+    }
+
+    private Dictionary<string, object> OpenKnownFolder(string folder)
+    {
+        var name = NormalizeWords(folder);
+        var path = name switch
+        {
+            "desktop" => Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+            "downloads" => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"),
+            "documents" or "my documents" => Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "pictures" or "photos" or "images" => Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            "music" => Environment.GetFolderPath(Environment.SpecialFolder.MyMusic),
+            "videos" => Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
+            "home" or "user folder" => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "onedrive" or "one drive" => Environment.GetEnvironmentVariable("OneDrive"),
+            "app data" or "keyboard data" => SettingsService.AppDataDir,
+            "voice notes" => Models.KeyboardWtfState.EffectiveVoiceNoteSavePath,
+            _ => null,
+        };
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            return null;
+        if (!SmartFileSearchService.TryOpenSafe(path, out var error))
+            return Logged("open_folder", path, false, error, supported: false);
+        return Logged("open_folder", path, true, $"Opened {Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar))}.",
+            extras: new() { ["path"] = path });
+    }
+
+    private async Task<Dictionary<string, object>> OpenFolderAsync(
+        string folder,
+        string location,
+        CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+            return Result(false, "Which folder should I open?", needsClarification: true);
+        var known = OpenKnownFolder(folder);
+        if (known != null)
+            return known;
+
+        var expanded = ExpandPath(folder);
+        if (File.Exists(expanded))
+        {
+            if (SmartFileSearchService.TryOpenContainingFolder(expanded, out var containingError))
+            {
+                return Logged(
+                    "open_folder",
+                    expanded,
+                    true,
+                    $"Opened the folder containing {Path.GetFileName(expanded)}.",
+                    extras: new() { ["path"] = Path.GetDirectoryName(expanded) });
+            }
+            return Logged("open_folder", expanded, false, containingError, supported: false);
+        }
+        if (Directory.Exists(expanded))
+        {
+            if (SmartFileSearchService.TryOpenSafe(expanded, out var error))
+                return Logged("open_folder", expanded, true, $"Opened {Path.GetFileName(expanded.TrimEnd(Path.DirectorySeparatorChar))}.",
+                    extras: new() { ["path"] = expanded });
+            return Logged("open_folder", expanded, false, error, supported: false);
+        }
+
+        var requestedLocation = ResolveRecentFileLocation(location);
+        var result = await _files.SearchAsync(
+            folder,
+            requestedLocation,
+            includeFiles: false,
+            includeFolders: true,
+            token);
+        return OpenResolvedSearchResult("open_folder", folder, result);
+    }
+
+    private async Task<Dictionary<string, object>> OpenPathAsync(
+        string path,
+        string location,
+        CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return Result(false, "Which file or folder should I open?", needsClarification: true);
+        var expanded = ExpandPath(path);
+        if (File.Exists(expanded) || Directory.Exists(expanded))
+        {
+            if (SmartFileSearchService.IsRiskyFile(expanded))
+                return Logged(
+                    "open_path",
+                    expanded,
+                    false,
+                    "Opening executable, script, installer, shortcut, or registry files by path is blocked. Ask me to open an installed app by name instead.",
+                    supported: false);
+            if (SmartFileSearchService.TryOpenSafe(expanded, out var error))
+                return Logged("open_path", expanded, true, $"Opened {Path.GetFileName(expanded.TrimEnd(Path.DirectorySeparatorChar))}.",
+                    extras: new() { ["path"] = expanded, ["target_kind"] = Directory.Exists(expanded) ? "folder" : "file" });
+            return Logged("open_path", expanded, false, error, supported: false);
+        }
+
+        var requestedLocation = ResolveRecentFileLocation(location);
+        var link = string.IsNullOrWhiteSpace(requestedLocation)
+            ? _mappings.FindExact(LearnedMappingKind.Link, path)
+            : null;
+        if (link != null)
+            return await OpenUrlAsync(link.Target, "", token);
+
+        var result = await _files.SearchAsync(
+            path,
+            requestedLocation,
+            includeFiles: true,
+            includeFolders: true,
+            token);
+        return OpenResolvedSearchResult("open_path", path, result);
+    }
+
+    private Dictionary<string, object> OpenResolvedSearchResult(
+        string action,
+        string query,
+        FileSearchResult search)
+    {
+        if (search.Status == FileResolutionStatus.Found)
+        {
+            if (SmartFileSearchService.IsRiskyFile(search.Best.Path))
+                return Logged(
+                    action,
+                    search.Best.Path,
+                    false,
+                    "I found a matching executable, script, installer, shortcut, or registry file, but automatic opening is blocked.",
+                    supported: false);
+            if (SmartFileSearchService.TryOpenSafe(search.Best.Path, out var error))
+            {
+                return Logged(
+                    action,
+                    $"{query} -> {search.Best.Path}",
+                    true,
+                    $"Opened {search.Best.Name}.",
+                    extras: new()
+                    {
+                        ["path"] = search.Best.Path,
+                        ["target_kind"] = search.Best.IsDirectory ? "folder" : "file",
+                        ["score"] = Math.Round(search.Best.Score, 3),
+                        ["searched"] = search.SearchSummary,
+                    });
+            }
+            return Logged(action, search.Best.Path, false, error, supported: false);
+        }
+
+        if (search.Status == FileResolutionStatus.Ambiguous)
+        {
+            var pluralChoiceCount = action == "open_folder" ? RememberFolderAmbiguity(search) : 0;
+            return Result(
+                false,
+                pluralChoiceCount >= 2
+                    ? $"I found {pluralChoiceCount} distinct strong folder matches for {query}. Ask the user to choose one, or they can explicitly say open both or open all next."
+                    : $"I found several plausible matches for {query}. Ask the user to choose one.",
+                needsClarification: true,
+                extras: new()
+                {
+                    ["matches"] = search.Candidates.Select(candidate => new
+                    {
+                        candidate.Name,
+                        candidate.Path,
+                        type = candidate.IsDirectory ? "folder" : "file",
+                        modified_at = candidate.ModifiedAt,
+                        score = Math.Round(candidate.Score, 3),
+                    }).ToArray(),
+                    ["searched"] = search.SearchSummary,
+                    ["scanned_entries"] = search.ScannedEntries,
+                    ["explicit_plural_followup_available"] = pluralChoiceCount >= 2,
+                });
+        }
+
+        var timeout = search.TimedOut ? " The bounded search reached its time limit." : "";
+        return Logged(
+            action,
+            query,
+            false,
+            $"No matching safe file or folder was found in {search.SearchSummary}.{timeout}",
+            supported: false,
+            extras: new()
+            {
+                ["searched"] = search.SearchSummary,
+                ["scanned_entries"] = search.ScannedEntries,
+                ["timed_out"] = search.TimedOut,
+            });
+    }
+
+    internal int RememberFolderAmbiguity(FileSearchResult search) => _folderChoices.Remember(search);
+
+    internal void CompleteUserTurnForFolderChoices() => _folderChoices.CompleteUserTurn();
+
+    internal void CompleteConnectorUserTurn(string requestIdentity)
+    {
+        if (Connectors is null) return;
+        string pendingTask;
+        lock (_pendingLock)
+            pendingTask = _pending?.ToolName == "connector_execute" ? GetString(_pending.Args, "task_id") : null;
+        Connectors.CompleteSettledUserTurn(requestIdentity, pendingTask);
+    }
+
+    internal bool TryOpenPendingFolderChoices(
+        string userTurn,
+        CancellationToken token,
+        out Dictionary<string, object> result)
+    {
+        result = null;
+        if (!_folderChoices.TryConsume(userTurn, out var paths))
+            return false;
+        token.ThrowIfCancellationRequested();
+
+        // Validate the entire retained set before any effect. A removed or
+        // replaced choice must not turn "open both" into a partial surprise.
+        if (paths.Any(path => !Directory.Exists(path)))
+        {
+            result = Result(false,
+                "One of those folders no longer exists. Ask me to search again before opening them.",
+                needsClarification: true);
+            return true;
+        }
+
+        var opener = _folderChoiceOpener ?? (path =>
+        {
+            var opened = SmartFileSearchService.TryOpenSafe(path, out var error);
+            return (opened, error);
+        });
+        var openedPaths = new List<string>();
+        var failedCount = 0;
+        foreach (var path in paths)
+        {
+            token.ThrowIfCancellationRequested();
+            var (opened, _) = opener(path);
+            _history.Add("open_folder", path, opened);
+            if (opened)
+                openedPaths.Add(path);
+            else
+                failedCount++;
+        }
+
+        AppLog.Info($"Jarvis explicit folder-choice continuation: requested={paths.Length} opened={openedPaths.Count} failed={failedCount}");
+        result = Result(
+            failedCount == 0,
+            failedCount == 0
+                ? $"Opened all {openedPaths.Count} distinct requested folders."
+                : $"Opened {openedPaths.Count} of {paths.Length} requested folders. The remaining folder actions failed; do not claim they opened.",
+            extras: new()
+            {
+                ["requested_count"] = paths.Length,
+                ["opened_count"] = openedPaths.Count,
+                ["failed_count"] = failedCount,
+                ["referential_targets"] = openedPaths.Select(path => (object)new Dictionary<string, object>
+                {
+                    ["kind"] = "folder",
+                    ["target"] = path,
+                    ["cardinality"] = "one",
+                }).ToArray(),
+            });
+        return true;
+    }
+
+    private async Task<Dictionary<string, object>> WindowActionAsync(
+        string action,
+        string appName,
+        CancellationToken token,
+        string scope = null,
+        string windowId = null)
+    {
+        var normalized = NormalizeWords(action);
+        if (normalized is "close" or "quit" or "exit")
+        {
+            var all = string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase);
+            var windows = NativeWindowCloser.Enumerate();
+            var folderPaths = NativeWindowCloser.TryNormalizeFolderPath(appName, out _)
+                ? NativeWindowCloser.ReadExplorerFolderPaths(windows, token) : null;
+            var targets = NativeWindowCloser.Select(windows, appName, all, windowId, GetForegroundWindow(), folderPaths);
+            if (targets.Length == 0 && !string.IsNullOrWhiteSpace(appName)
+                && !NativeWindowCloser.TryNormalizeFolderPath(appName, out _))
+            {
+                targets = NativeWindowCloser.SelectInstalledApp(windows, appName, _apps.Discover(), windowId);
+            }
+            if (targets.Length == 0 || (!all && targets.Length > 1))
+            {
+                // Keep private window titles and target arguments out of logs.
+                // A fingerprint plus cardinalities distinguishes a changed
+                // model target from a native-window snapshot/resolution miss.
+                var targetHash = System.Security.Cryptography.SHA256.HashData(
+                    Encoding.UTF8.GetBytes((appName ?? "").Trim().ToLowerInvariant()));
+                AppLog.Info(
+                    $"Jarvis native window unresolved: targetHash={Convert.ToHexString(targetHash.AsSpan(0, 6))} " +
+                    $"targetChars={(appName ?? "").Length} windowIdPresent={!string.IsNullOrWhiteSpace(windowId)} " +
+                    $"all={all} snapshot={windows.Length} browserWindows={windows.Count(window => window.IsBrowser)} " +
+                    $"candidates={targets.Length}");
+                return Result(false,
+                    targets.Length == 0 ? "No matching native window was found. No browser tabs or other windows were changed."
+                        : "Several windows match. Which window, or all matching windows, should I close?",
+                    needsClarification: true,
+                    extras: new() { ["windows"] = targets.Select(w => new { window_id = w.Id, w.Title, w.ProcessName }).ToArray() });
+            }
+            var outcome = await NativeWindowCloser.CloseAsync(targets, token,
+                validateTarget: folderPaths == null ? null : target =>
+                    NativeWindowCloser.Select([target], appName, all, windowId, IntPtr.Zero,
+                        NativeWindowCloser.ReadExplorerFolderPaths([target], token)).Length == 1);
+            AppLog.Info($"Jarvis native window close verified: targets={targets.Length} requested={outcome.Requested} remaining={outcome.Remaining.Length}");
+            return Logged("window_action", $"close {appName}", outcome.Succeeded,
+                outcome.Succeeded ? $"Closed the {targets.Length} requested window(s)."
+                    : $"Sent the close request to {outcome.Requested} window(s); {outcome.Remaining.Length} original window(s) still exist. They may be waiting for an application dialog or running in the background, so do not claim they fully closed.",
+                extras: new()
+                {
+                    ["requested_count"] = targets.Length,
+                    ["close_request_sent_count"] = outcome.Requested,
+                    ["closed_count"] = targets.Length - outcome.Remaining.Length,
+                    ["remaining_windows"] = outcome.Remaining.Select(w => new { window_id = w.Id, w.Title, w.ProcessName }).ToArray(),
+                });
+        }
+
+        return WindowAction(action, appName, windowId, token);
+    }
+
+    private Dictionary<string, object> WindowAction(
+        string action, string appName, string windowId, CancellationToken token)
+    {
+        var normalized = NormalizeWords(action);
+        if (normalized is "list" or "list windows")
+        {
+            var windows = NativeWindowCloser.Enumerate()
+                .Take(15)
+                .Select(w => new { window_id = w.Id, w.Title, w.ProcessName })
+                .ToArray();
+            return Result(true, windows.Length == 0 ? "No normal app windows were found." : "Open windows listed.",
+                extras: new() { ["windows"] = windows });
+        }
+
+        var handle = string.IsNullOrWhiteSpace(appName) && string.IsNullOrWhiteSpace(windowId)
+            ? GetForegroundWindow()
+            : ResolveNativeWindowTarget(NativeWindowCloser.Enumerate(), appName, windowId);
+        // Keep the previous title/partial-name lookup for windows without a
+        // native app identity. An exact ID must never fall back to another window.
+        if (handle == IntPtr.Zero
+            && !string.IsNullOrWhiteSpace(appName)
+            && string.IsNullOrWhiteSpace(windowId)
+            && !NativeWindowCloser.IsKnownAppIdentity(appName))
+            handle = FindWindowByName(appName);
+        if (handle == IntPtr.Zero)
+            return Logged("window_action", $"{action} {appName}", false, "I could not find that window.", supported: false);
+
+        switch (normalized)
+        {
+            case "switch":
+            case "focus":
+            case "activate":
+                var foregroundBeforeRequest = GetForegroundWindow();
+                // SW_RESTORE also unmaximizes an already-visible window.
+                // Only restore a minimized target; focusing must preserve its
+                // existing size and must not claim success if Windows denies it.
+                if (IsIconic(handle))
+                    ShowWindow(handle, SwRestore);
+                var focusRequestAccepted = SetForegroundWindow(handle);
+                // Windows can complete activation after SetForegroundWindow
+                // returns. An immediate read was reporting failure even when
+                // the requested window visibly came to the front. Keep exact
+                // HWND verification, but allow that bounded transition.
+                var targetProcess = GetProcessName(handle);
+                var focused = IsEquivalentForegroundProcessRequest(
+                    appName, targetProcess, GetProcessName(GetForegroundWindow()), windowId)
+                    || WaitForForegroundWindow(handle, GetForegroundWindow,
+                        TimeSpan.FromMilliseconds(250))
+                    || IsEquivalentForegroundProcessRequest(
+                        appName, targetProcess, GetProcessName(GetForegroundWindow()), windowId);
+                if (!focused && !focusRequestAccepted)
+                {
+                    var retryAttempted = TryFocusDeniedWindow(
+                        handle, targetProcess, foregroundBeforeRequest, token);
+                    if (retryAttempted)
+                    {
+                        focused = WaitForForegroundWindow(handle, GetForegroundWindow,
+                            TimeSpan.FromMilliseconds(250))
+                            || IsEquivalentForegroundProcessRequest(
+                                appName, targetProcess, GetProcessName(GetForegroundWindow()), windowId);
+                    }
+                    AppLog.Info($"Jarvis denied-focus retry: attempted={retryAttempted} verified={focused} targetProcess={targetProcess}");
+                }
+                if (!focused)
+                    AppLog.Info($"Jarvis window focus not verified: requestAccepted={focusRequestAccepted} targetProcess={GetProcessName(handle)} foregroundProcess={GetProcessName(GetForegroundWindow())}");
+                return Logged("window_action", $"focus {appName}", focused,
+                    focused ? "Switched to the window." : "Windows did not bring that window to the front.",
+                    supported: focused);
+            case "minimize":
+                ShowWindow(handle, SwMinimize);
+                return Logged("window_action", $"minimize {appName}", true, "Window minimized.");
+            case "maximize":
+                ShowWindow(handle, SwMaximize);
+                return Logged("window_action", $"maximize {appName}", true, "Window maximized.");
+            case "restore":
+                ShowWindow(handle, SwRestore);
+                return Logged("window_action", $"restore {appName}", true, "Window restored.");
+            case "close":
+            case "quit":
+            case "exit":
+                throw new InvalidOperationException("Close requests must use the verified native-window path.");
+            default:
+                return Result(false, "Supported window actions are list, switch, minimize, maximize, restore, and close.", supported: false);
+        }
+    }
+
+    internal static bool WaitForForegroundWindow(
+        IntPtr expected, Func<IntPtr> foreground, TimeSpan timeout) =>
+        expected != IntPtr.Zero
+        && foreground != null
+        && SpinWait.SpinUntil(() => foreground() == expected, timeout);
+
+    internal static IntPtr ResolveNativeWindowTarget(
+        NativeWindowCloser.Window[] windows, string appName, string windowId)
+    {
+        var knownProcess = NativeWindowCloser.KnownProcessName(appName);
+        bool MatchesKnownProcess(NativeWindowCloser.Window window) =>
+            knownProcess == "explorer" ? window.IsExplorer
+                : string.Equals(window.ProcessName, knownProcess, StringComparison.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrWhiteSpace(windowId))
+        {
+            var exact = windows.FirstOrDefault(window =>
+                window.Id.Equals(windowId.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (exact == null)
+                return IntPtr.Zero;
+            if (knownProcess != null)
+                return MatchesKnownProcess(exact) ? exact.Handle : IntPtr.Zero;
+            if (string.IsNullOrWhiteSpace(appName)
+                || NativeWindowCloser.Select([exact], appName, false, null, IntPtr.Zero).Length == 1
+                || exact.Title.Equals(appName.Trim(), StringComparison.OrdinalIgnoreCase))
+                return exact.Handle;
+            return IntPtr.Zero;
+        }
+
+        // A known app name is process identity. Do not fall through to an
+        // unrelated native window whose title happens to contain that name.
+        if (knownProcess != null)
+            return windows.FirstOrDefault(MatchesKnownProcess)?.Handle ?? IntPtr.Zero;
+
+        return NativeWindowCloser.Select(windows, appName, false, null, IntPtr.Zero)
+            .FirstOrDefault()?.Handle ?? IntPtr.Zero;
+    }
+
+    private static bool TryFocusDeniedWindow(
+        IntPtr target, string expectedProcess, IntPtr foregroundBeforeRequest, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (target == IntPtr.Zero || string.IsNullOrWhiteSpace(expectedProcess)
+            || UserModifierIsHeld())
+            return false;
+
+        var foreground = GetForegroundWindow();
+        if (foreground != foregroundBeforeRequest)
+            return false;
+        if (foreground == target)
+            return true;
+        var currentThread = GetCurrentThreadId();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out _);
+        var targetThread = GetWindowThreadProcessId(target, out _);
+        if (targetThread == 0)
+            return false;
+
+        var needsForegroundAttach = foregroundThread != 0 && foregroundThread != currentThread;
+        var needsTargetAttach = targetThread != currentThread && targetThread != foregroundThread;
+        var attachedForeground = needsForegroundAttach
+            && AttachThreadInput(currentThread, foregroundThread, true);
+        var attachedTarget = needsTargetAttach
+            && AttachThreadInput(currentThread, targetThread, true);
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            // Do not steal focus if the user changed windows during this retry.
+            if ((needsForegroundAttach && !attachedForeground)
+                || (needsTargetAttach && !attachedTarget)
+                || GetForegroundWindow() != foreground
+                || UserModifierIsHeld()
+                || !string.Equals(GetProcessName(target), expectedProcess,
+                    StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // A denied explicit focus request may need joined input queues.
+            // Never restore a visible window or synthesize an Alt/key event.
+            BringWindowToTop(target);
+            SetForegroundWindow(target);
+            return true;
+        }
+        finally
+        {
+            if (attachedTarget)
+                AttachThreadInput(currentThread, targetThread, false);
+            if (attachedForeground)
+                AttachThreadInput(currentThread, foregroundThread, false);
+        }
+    }
+
+    private static bool UserModifierIsHeld() =>
+        (GetAsyncKeyState(0x10) & 0x8000) != 0
+        || (GetAsyncKeyState(0x11) & 0x8000) != 0
+        || (GetAsyncKeyState(0x12) & 0x8000) != 0
+        || (GetAsyncKeyState(0x5B) & 0x8000) != 0
+        || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
+
+    internal static bool IsEquivalentForegroundProcessRequest(
+        string requestedName, string targetProcess, string foregroundProcess, string windowId = null) =>
+        string.IsNullOrWhiteSpace(windowId)
+        && !string.IsNullOrWhiteSpace(targetProcess)
+        && (string.Equals(NativeWindowCloser.KnownProcessName(requestedName), targetProcess, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(NormalizeWords(requestedName), NormalizeWords(targetProcess), StringComparison.OrdinalIgnoreCase))
+        && string.Equals(targetProcess, foregroundProcess, StringComparison.OrdinalIgnoreCase);
+
+    internal void ResetConversationTransientContext()
+    {
+        _screenGuidance.ClearSessionContext();
+        _folderChoices.Clear();
+        lock (_selectionLock)
+            _lastSelection = null;
+        lock (_conversationStateLock)
+        {
+            _latestOpenTarget = "";
+            _latestOpenTargetAt = default;
+            _latestWorkflowName = "";
+            _latestWorkflowAt = default;
+            _openedBrowserTabs = new();
+            _lastVerifiedClipboardCopy = null;
+            _lastVerifiedClipboardCopyReceipt = null;
+            _clipboardCopyContextGeneration++;
+        }
+    }
+
+    private void RememberTransientOpenTarget(string target)
+    {
+        var clean = Limit((target ?? "").Trim(), 120);
+        if (string.IsNullOrWhiteSpace(clean))
+            return;
+        lock (_conversationStateLock)
+        {
+            _latestOpenTarget = clean;
+            _latestOpenTargetAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private string RecentOpenTarget()
+    {
+        lock (_conversationStateLock)
+        {
+            return DateTimeOffset.UtcNow - _latestOpenTargetAt <= TimeSpan.FromMinutes(5)
+                ? _latestOpenTarget
+                : "";
+        }
+    }
+
+    private void RememberWorkflowContext(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return;
+        lock (_conversationStateLock)
+        {
+            _latestWorkflowName = name.Trim();
+            _latestWorkflowAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private string RecentWorkflowName()
+    {
+        lock (_conversationStateLock)
+        {
+            return DateTimeOffset.UtcNow - _latestWorkflowAt <= TimeSpan.FromMinutes(10)
+                ? _latestWorkflowName
+                : "";
+        }
+    }
+
+
+    internal static bool BrowserTargetMatches(string target, string title, string url)
+    {
+        var needle = NormalizeWords(target);
+        if (needle.Length < 2)
+            return false;
+        var titleWords = NormalizeWords(title);
+        if (titleWords.Contains(needle, StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!Uri.TryCreate(target, UriKind.Absolute, out var targetUri)
+            || !Uri.TryCreate(url, UriKind.Absolute, out var activeUri))
+            return NormalizeWords(url).Contains(needle, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(
+            NormalizeHost(targetUri.Host),
+            NormalizeHost(activeUri.Host),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsExplicitBrowserApplication(string value) =>
+        NormalizeWords(value) is "chrome" or "google chrome" or "browser" or "the browser"
+            or "edge" or "microsoft edge" or "brave" or "firefox" or "opera" or "vivaldi" or "arc";
+
+    private static bool IsBrowserWindow(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero)
+            return false;
+        GetWindowThreadProcessId(handle, out var processId);
+        try
+        {
+            return IsBrowserProcess(Process.GetProcessById((int)processId).ProcessName);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string NormalizeHost(string host) =>
+        (host ?? "").StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+            ? host[4..]
+            : host ?? "";
+
+    internal Dictionary<string, object> ExecuteBrowserShortcut(string action, CancellationToken token) =>
+        BrowserAction(action, token);
+
+    internal static bool IsDirectBrowserShortcutRequest(string request) =>
+        TryGetBrowserTabSelection(request, out _, out _)
+        || BrowserShortcutForAction(request) != null;
+
+    internal static bool TryGetRightmostBrowserTabCloseCount(
+        string request,
+        out int count)
+    {
+        if (TryGetPositionalBrowserTabCloseCount(request, out var fromEnd, out count) && fromEnd)
+            return true;
+        count = 0;
+        return false;
+    }
+
+    internal static bool TryGetPositionalBrowserTabCloseCount(
+        string request,
+        out bool fromEnd,
+        out int count)
+    {
+        fromEnd = false;
+        count = 0;
+        var normalized = NormalizeTabCommand(request);
+        // Courtesy and an explicit current-browser suffix do not change the
+        // requested edge. Keep the whole close instruction anchored so a
+        // negation, discussion or additional action cannot acquire this owner.
+        var match = Regex.Match(
+            normalized,
+            @"^close\s+(?:(?:the|my)\s+)?(?<edge>first|last)\s+(?<count>[2-9]|two|three|four|five|six|seven|eight|nine)\s+(?:(?:chrome|browser|open)\s+)?tabs(?:\s+(?:which|that)\s+are\s+(?:already\s+)?open)?(?:\s+(?:in|on)\s+(?:(?:the|my)\s+)?(?:chrome|browser))?(?:\s+for\s+me)?(?:\s+(?:right\s+)?now)?$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+        fromEnd = string.Equals(match.Groups["edge"].Value, "last", StringComparison.OrdinalIgnoreCase);
+        count = match.Groups["count"].Value.ToLowerInvariant() switch
+        {
+            "two" => 2,
+            "three" => 3,
+            "four" => 4,
+            "five" => 5,
+            "six" => 6,
+            "seven" => 7,
+            "eight" => 8,
+            "nine" => 9,
+            var number when int.TryParse(number, out var parsed) => parsed,
+            _ => 0,
+        };
+        return count is >= 2 and <= 9;
+    }
+
+    private static string NormalizeTabCommand(string request)
+    {
+        if (request?.Length is not (> 0 and <= 3000)) return "";
+        var text = NormalizePhraseText(request);
+        text = Regex.Replace(text, @"^(?:(?:hey\s+)?jarvis\s+)?(?:(?:okay|ok|now|then|please|pls|just)\s+|(?:(?:can|could|would|will)\s+you|i\s+want\s+you\s+to)\s+)*", "",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+        return Regex.Replace(text, @"\s+(?:please|pls)$", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+    }
+
+    // Detection is a rejection fence only. An unparsed explicit positional
+    // instruction must never authorize a contradictory model-selected edge.
+    internal static bool HasExplicitPositionalTabClose(string request) => request?.Length is > 0 and <= 3000
+        && Regex.IsMatch(request, @"\bclose\s+(?:(?:the|my)\s+)?(?:first|last)\s+(?:[2-9]|two|three|four|five|six|seven|eight|nine)\s+(?:(?:chrome|browser|open)\s+)?tabs\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking, TimeSpan.FromMilliseconds(100));
+
+    internal static bool TryGetBrowserTabReopenCount(string request, out int count)
+    {
+        count = 0;
+        var match = Regex.Match(NormalizeTabCommand(request),
+            @"^reopen\s+(?:the\s+)?(?:last\s+)?(?<count>[2-9]|two|three|four|five|six|seven|eight|nine)\s+(?:closed\s+)?tabs$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+        if (!match.Success) return false;
+        count = match.Groups["count"].Value switch
+        {
+            "two" => 2, "three" => 3, "four" => 4, "five" => 5,
+            "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9,
+            var number when int.TryParse(number, out var parsed) => parsed, _ => 0
+        };
+        return count is >= 2 and <= 9;
+    }
+
+    internal Dictionary<string, object> ReopenBrowserTabs(int count, CancellationToken token)
+    {
+        IntPtr window = IntPtr.Zero;
+        return RepeatBrowserReopen(count, cancellation =>
+        {
+            if (window != IntPtr.Zero && window != GetForegroundWindow())
+                return Result(false, "The browser window changed. Remaining reopen shortcuts were not sent.");
+            var receipt = BrowserAction("reopen tab", cancellation);
+            if (receipt.GetValueOrDefault("shortcut_sent") is true) window = GetForegroundWindow();
+            return receipt;
+        }, token);
+    }
+
+    internal static Dictionary<string, object> RepeatBrowserReopen(int count,
+        Func<CancellationToken, Dictionary<string, object>> send, CancellationToken token)
+    {
+        if (count is < 2 or > 9) return Result(false, "Choose between two and nine tabs.");
+        var sent = 0;
+        for (var index = 0; index < count; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            var receipt = send(token);
+            if (receipt.GetValueOrDefault("ok") is not true || receipt.GetValueOrDefault("shortcut_sent") is not true) break;
+            sent++;
+        }
+        return Result(sent == count, $"Sent {sent} of {count} reopen-tab shortcuts.", extras: new()
+        { ["shortcut_sent_count"] = sent, ["requested_count"] = count, ["verified_browser_state"] = false });
+    }
+
+    internal Task<Dictionary<string, object>> CloseRightmostBrowserTabsAsync(
+        int count,
+        CancellationToken token) =>
+        ClosePositionalBrowserTabsAsync(count, fromEnd: true, token);
+
+    internal Task<Dictionary<string, object>> ClosePositionalBrowserTabsAsync(
+        int count,
+        bool fromEnd,
+        CancellationToken token)
+    {
+        if (count is < 2 or > 9)
+            return Task.FromResult(Result(false, $"Choose between two and nine {(fromEnd ? "rightmost" : "leftmost")} Chrome tabs.", supported: false));
+        var references = fromEnd
+            ? Enumerable.Range(1, count).Reverse().Select(position => $"from_end:{position}").ToArray()
+            : Enumerable.Range(1, count).Select(position => $"index:{position}").ToArray();
+        return CloseBrowserTabReferencesAsync(
+            references,
+            $"close exact {(fromEnd ? "rightmost" : "leftmost")} {count} tab set", token);
+    }
+
+    internal Task<Dictionary<string, object>> CloseBrowserTabReferenceAsync(
+        string reference, CancellationToken token)
+    {
+        if (reference == "current")
+            return Task.FromResult(BrowserAction("close tab", token));
+        if (reference != "previous"
+            && !Regex.IsMatch(reference ?? "", @"^(?:index|from_end):[1-9]\d*$"))
+            return Task.FromResult(Result(false, "The requested tab reference is invalid. No tab was closed.", supported: false));
+        var foreground = _browserTabForeground();
+        if (!CanResolveForegroundBrowserTabReference(foreground, _browserHelper?.Status))
+            return Task.FromResult(Result(false,
+                "The current browser window could not be verified. Bring it to the foreground and try again. No tab was closed.",
+                supported: false));
+        return CloseBrowserTabReferencesAsync([reference], "close exact referenced tab", token,
+            () => SameForegroundBrowserWindow(foreground, _browserTabForeground()));
+    }
+
+    private Task<Dictionary<string, object>> CloseOrdinalBrowserTabsAsync(
+        IReadOnlyList<string> references, CancellationToken token)
+    {
+        if (references.Count is < 2 or > 9
+            || references.Any(reference => !Regex.IsMatch(reference ?? "", @"^index:[1-9]$"))
+            || references.Distinct(StringComparer.Ordinal).Count() != references.Count)
+            return Task.FromResult(Result(false, "The requested tab positions are invalid. No tab was closed.", supported: false));
+        var foreground = _browserTabForeground();
+        if (!CanResolveForegroundBrowserTabReference(foreground, _browserHelper?.Status))
+            return Task.FromResult(Result(false,
+                "The current browser window could not be verified. Bring it to the foreground and try again. No tab was closed.",
+                supported: false));
+        return CloseBrowserTabReferencesAsync(references, "close exact numbered tab set", token,
+            () => SameForegroundBrowserWindow(foreground, _browserTabForeground()));
+    }
+
+    internal static bool CanResolveForegroundBrowserTabReference(
+        SelectionContext foreground, BrowserHelperStatus helper) =>
+        foreground != null && foreground.Handle != IntPtr.Zero
+        && string.Equals(foreground.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase)
+        && helper?.Connected == true && helper.CommandAuthoritySupported
+        // Exact tab commands use the service worker's tabs API, not the page
+        // content script. Keep actual foreground/title and subsequent exact-ID
+        // checks; accept missing DOM status only from a fresh authorized worker.
+        && (helper.ActiveTabFresh || helper.ActiveTabIsDisposableProtectedOrBlank
+            || helper.LastHeartbeatUtc is DateTime heartbeat && DateTime.UtcNow - heartbeat is var age
+                && age >= TimeSpan.Zero && age <= TimeSpan.FromSeconds(4)
+                && !helper.MultipleHelpersDetected && BrowserHelperProtocol.IsAllowedExtensionId(helper.ExtensionId)
+                && string.Equals(helper.ServiceWorkerVersion, BrowserHelperProtocol.Version, StringComparison.Ordinal)
+                && !string.IsNullOrWhiteSpace(helper.SessionId))
+        && helper.WindowId is > 0 && helper.TabId is > 0
+        && BrowserTitleMatchesForeground(helper.ActiveTitle, foreground.WindowTitle);
+
+    private static bool SameForegroundBrowserWindow(SelectionContext expected, SelectionContext current) =>
+        current != null && expected.Handle == current.Handle
+        && string.Equals(current.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<Dictionary<string, object>> ExecuteBrowserTabActionAsync(
+        JsonElement args, CancellationToken token)
+    {
+        if (args.ValueKind == JsonValueKind.Object
+            && (args.TryGetProperty("tab_index", out _) || args.TryGetProperty("tab_from_end", out _)
+                || args.TryGetProperty("tab_reference", out _)))
+        {
+            if (!TryGetStructuredBrowserTabClose(args, out var structuredReference, out _))
+                return Result(false,
+                    "Close one tab using one valid tab position or relative reference, not a conflicting target set. No tab was closed.",
+                    supported: false);
+            return await CloseBrowserTabReferenceAsync(structuredReference, token);
+        }
+        if (TryGetOrdinalBrowserTabCloseReferences(GetString(args, "action"), out var references))
+            return await CloseOrdinalBrowserTabsAsync(references, token);
+        if (TryGetBrowserTabCloseReference(GetString(args, "action"), out var reference, out _))
+            return await CloseBrowserTabReferenceAsync(reference, token);
+        return BrowserAction(GetString(args, "action"), token);
+    }
+
+    internal static bool TryGetStructuredBrowserTabClose(
+        JsonElement args, out string reference, out string description)
+    {
+        reference = "";
+        description = "";
+        if (args.ValueKind != JsonValueKind.Object
+            || NormalizeWords(GetString(args, "action")) != "close tab"
+            || args.TryGetProperty("target_ids", out _) || args.TryGetProperty("last_tab_count", out _))
+            return false;
+        var hasIndex = args.TryGetProperty("tab_index", out var index);
+        var hasFromEnd = args.TryGetProperty("tab_from_end", out var fromEnd);
+        var hasRelative = args.TryGetProperty("tab_reference", out var relative);
+        if ((hasIndex ? 1 : 0) + (hasFromEnd ? 1 : 0) + (hasRelative ? 1 : 0) != 1)
+            return false;
+        if (hasRelative)
+        {
+            if (relative.ValueKind != JsonValueKind.String
+                || NormalizeWords(relative.GetString()) is not ("current" or "previous"))
+                return false;
+            reference = NormalizeWords(relative.GetString());
+            description = $"the {reference} tab";
+            return true;
+        }
+        var value = hasIndex ? index : fromEnd;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var position) || position < 1)
+            return false;
+        reference = hasIndex ? $"index:{position}" : $"from_end:{position}";
+        description = hasIndex ? $"tab {position}" : position == 1 ? "the last tab" : $"tab {position} from the right";
+        return true;
+    }
+
+    private async Task<Dictionary<string, object>> CloseBrowserTabReferencesAsync(
+        IReadOnlyList<string> references, string actionDescription, CancellationToken token,
+        Func<bool> foregroundStillOwnsWindow = null)
+    {
+        var count = references.Count;
+        var helper = _browserHelper;
+        var initial = helper?.Status;
+        if (helper == null || initial?.Connected != true
+            || !initial.CommandAuthoritySupported
+            || !string.Equals(initial.ServiceWorkerVersion, BrowserHelperProtocol.Version, StringComparison.Ordinal)
+            || initial.WindowId is not int windowId
+            || string.IsNullOrWhiteSpace(initial.SessionId))
+        {
+            return Result(
+                false,
+                string.IsNullOrWhiteSpace(initial?.LastError)
+                    ? "The Chrome Helper cannot resolve an exact tab set. No tab was closed."
+                    : $"{initial.LastError} No tab was closed.",
+                supported: false);
+        }
+
+        var sessionId = initial.SessionId;
+        var targets = new List<BrowserActionReceipt>(count);
+        foreach (var reference in references)
+        {
+            token.ThrowIfCancellationRequested();
+            BrowserActionReceipt target;
+            try
+            {
+                target = await helper.ActivateExistingTabAsync(
+                    windowId,
+                    reference,
+                    token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                return Result(
+                    false,
+                    $"Chrome could not resolve all {count} requested tabs ({ex.Message}). No tab was closed.",
+                    supported: false);
+            }
+            if (!target.Ok
+                || target.WindowId != windowId
+                || target.TabId is not int tabId
+                || target.TabCount < count
+                || targets.Any(existing => existing.TabId == tabId))
+            {
+                return Result(
+                    false,
+                    $"Chrome did not return {count} distinct requested tab IDs. No tab was closed.",
+                    supported: false,
+                    needsClarification: true);
+            }
+            targets.Add(target);
+        }
+
+        var beforeClose = helper.Status;
+        if (foregroundStillOwnsWindow?.Invoke() == false)
+            return Result(false, "The foreground browser window changed while resolving the requested tab. No tab was closed.", supported: false);
+        if (!beforeClose.Connected
+            || beforeClose.WindowId != windowId
+            || !string.Equals(beforeClose.SessionId, sessionId, StringComparison.Ordinal))
+        {
+            return Result(
+                false,
+                "The Chrome Helper session changed while resolving the requested tab set. No tab was closed.",
+                supported: false);
+        }
+
+        var results = new List<object>(count);
+        var closed = 0;
+        var alreadyClosed = 0;
+        foreach (var target in targets.AsEnumerable().Reverse())
+        {
+            token.ThrowIfCancellationRequested();
+            var current = helper.Status;
+            if (!current.Connected
+                || current.WindowId != windowId
+                || !string.Equals(current.SessionId, sessionId, StringComparison.Ordinal)
+                || foregroundStillOwnsWindow?.Invoke() == false)
+            {
+                results.Add(new { tab_id = target.TabId, ok = false, already_closed = false,
+                    error = "The Chrome Helper session or foreground window changed before this exact tab could be closed." });
+                break;
+            }
+
+            BrowserActionReceipt receipt;
+            try
+            {
+                receipt = await helper.ExecuteAsync(new BrowserActionRequest
+                {
+                    TaskId = "direct-close-rightmost-" + Guid.NewGuid().ToString("N"),
+                    Type = "close_direct_tab",
+                    TabId = target.TabId,
+                    WindowId = windowId,
+                    ExpectedSessionId = sessionId,
+                }, token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                receipt = new BrowserActionReceipt { Error = ex.Message };
+            }
+            if (receipt.Ok
+                && (receipt.TabId != target.TabId
+                    || receipt.WindowId != windowId
+                    || !string.Equals(receipt.SessionId, sessionId, StringComparison.Ordinal)))
+            {
+                receipt = new BrowserActionReceipt
+                {
+                    Error = "Chrome's close receipt did not match the exact resolved tab."
+                };
+            }
+            if (receipt.Ok)
+            {
+                if (receipt.AlreadyClosed) alreadyClosed++; else closed++;
+            }
+            results.Add(new
+            {
+                tab_id = target.TabId,
+                ok = receipt.Ok,
+                already_closed = receipt.AlreadyClosed,
+                error = receipt.Error,
+            });
+            if (!receipt.Ok)
+                break;
+        }
+
+        var completed = closed + alreadyClosed == targets.Count;
+        return Logged(
+            "browser_action",
+            actionDescription,
+            completed,
+            completed
+                ? $"Closed {closed} requested Chrome tab(s); {alreadyClosed} were already closed."
+                : $"Verified {closed} requested Chrome tab(s) closed and {alreadyClosed} already closed. Chrome did not confirm the remaining exact tab(s); they may also have closed. Check Chrome before retrying.",
+            extras: new()
+            {
+                ["closed_count"] = closed,
+                ["already_closed_count"] = alreadyClosed,
+                ["target_count"] = targets.Count,
+                ["resolved_before_mutation"] = true,
+                ["action_results"] = results.ToArray(),
+            });
+    }
+
+    private Task<Dictionary<string, object>> CloseRightmostBrowserTabsFromToolAsync(
+        JsonElement args,
+        CancellationToken token)
+    {
+        var action = NormalizeWords(GetString(args, "action"));
+        var count = GetInt(args, "last_tab_count");
+        if (action != "close tabs" || count is < 2 or > 9
+            || args.TryGetProperty("tab_index", out _) || args.TryGetProperty("tab_from_end", out _)
+            || args.TryGetProperty("tab_reference", out _))
+            return Task.FromResult(Result(false,
+                "To close a rightmost tab set, specify close tabs and a count from two to nine, without a tab selection. No tab was closed.",
+                supported: false));
+        return CloseRightmostBrowserTabsAsync(count, token);
+    }
+
+    internal static bool TryGetOrdinalBrowserTabCloseReferences(string request, out string[] references)
+    {
+        references = [];
+        if (request?.Length is not (> 0 and <= 3000)
+            || !request.Contains("close", StringComparison.OrdinalIgnoreCase)) return false;
+        // Speech can render an ordinal set as a numeric range. Expand only
+        // bounded ascending positions before the existing whole-request parser;
+        // the existing executor still resolves every exact ID before closing.
+        var range = Regex.Match(request, @"\b(?<start>\d+)(?:st|nd|rd|th)?\s*[-–—]\s*(?<end>\d+)(?:st|nd|rd|th)?\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking, TimeSpan.FromMilliseconds(100));
+        if (range.Success)
+        {
+            if (!int.TryParse(range.Groups["start"].Value, out var first)
+                || !int.TryParse(range.Groups["end"].Value, out var last)
+                || first < 1 || last > 9 || first >= last) return false;
+            var expandedPositions = string.Join(" and ", Enumerable.Range(first, last - first + 1)
+                .Select(index => index + (index == 1 ? "st" : index == 2 ? "nd" : index == 3 ? "rd" : "th")));
+            request = request[..range.Index] + expandedPositions + request[(range.Index + range.Length)..];
+        }
+        if (!request.Contains("and", StringComparison.OrdinalIgnoreCase)) return false;
+        var normalized = NormalizeTabCommand(request);
+        if (!Regex.IsMatch(normalized, @"\btabs?\b", RegexOptions.CultureInvariant,
+                TimeSpan.FromMilliseconds(100))) return false;
+        const string ordinal = @"(?:[1-9]|1st|2nd|3rd|[4-9]th|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)";
+        const string noun = @"(?:\s+(?:(?:chrome|browser|open)\s+)?tabs?)?";
+        var match = Regex.Match(normalized,
+            @"^close\s+(?:(?:the|my)\s+)?(?:tabs?\s+)?(?<positions>" + ordinal + noun
+                + @"(?:\s+and\s+(?:the\s+)?" + ordinal + noun + @")+)"
+                + @"(?:\s+from\s+(?:the\s+)?left)?"
+                + @"(?:\s+(?:in|on)\s+(?:(?:the|my)\s+)?(?:chrome|browser))?(?:\s+for\s+me)?(?:\s+(?:right\s+)?now)?$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+        if (!match.Success) return false;
+        var positions = Regex.Split(match.Groups["positions"].Value, @"\s+and\s+(?:the\s+)?",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+        if (positions.Length is < 2 or > 9) return false;
+        var resolved = new List<string>(positions.Length);
+        foreach (var position in positions)
+        {
+            var index = Regex.Replace(position, @"\s+(?:(?:chrome|browser|open)\s+)?tabs?$", "",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+            if (!TryGetBrowserTabSelection(index + " tab", out var reference, out _)
+                || !reference.StartsWith("index:", StringComparison.Ordinal)
+                || resolved.Contains(reference)) return false;
+            resolved.Add(reference);
+        }
+        references = resolved.ToArray();
+        return true;
+    }
+
+    internal static bool HasExplicitOrdinalTabSetClose(string request) => request?.Length is > 0 and <= 3000
+        && Regex.IsMatch(request,
+            @"\bclose\s+(?:(?:the|my)\s+)?(?:tabs?\s+)?(?:(?:[1-9]\d*(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)(?:\s+(?:(?:chrome|browser|open)\s+)?tabs?)?\s+and\s+(?:the\s+)?(?:[1-9]\d*(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)|\d+(?:st|nd|rd|th)?\s*[-–—]\s*\d+(?:st|nd|rd|th)?)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking,
+            TimeSpan.FromMilliseconds(100));
+
+    internal static bool TryGetBrowserTabCloseReference(
+        string request, out string reference, out string description)
+    {
+        reference = "";
+        description = "";
+        var normalized = NormalizePhraseText(request);
+        if (normalized.StartsWith("please ", StringComparison.Ordinal))
+            normalized = normalized["please ".Length..];
+        if (!normalized.StartsWith("close ", StringComparison.Ordinal))
+            return false;
+        var target = normalized["close ".Length..];
+        if (Regex.IsMatch(target, @"^(?:tab|(?:this|current|active|the current|the active)\s+(?:browser\s+)?tab)$"))
+        {
+            reference = "current";
+            description = "the current tab";
+            return true;
+        }
+        if (target.StartsWith("the ", StringComparison.Ordinal))
+            target = target["the ".Length..];
+        return TryGetBrowserTabSelection(target, out reference, out description)
+            && reference != "next";
+    }
+
+    internal static bool TryGetBrowserTabSelection(
+        string request,
+        out string selection,
+        out string description)
+    {
+        selection = "";
+        description = "";
+        var normalized = NormalizePhraseText(request);
+        if (normalized.StartsWith("please ", StringComparison.Ordinal))
+            normalized = normalized["please ".Length..];
+
+        var numberedTab = Regex.Match(
+            normalized,
+            @"^(?:(?:switch|go|change|open|navigate)\s+)?(?:to\s+)?(?:chrome(?:'s)?\s+)?(?:the\s+)?(?<tab>1|2|3|4|5|6|7|8|9|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)(?:st|nd|rd|th)?\s+(?:(?:chrome|browser)\s+)?tab(?:\s+using\s+(?:ctrl|control)\s*[1-9])?$",
+            RegexOptions.IgnoreCase);
+        if (numberedTab.Success)
+        {
+            var index = numberedTab.Groups["tab"].Value.ToLowerInvariant() switch
+            {
+                "first" => 1,
+                "second" => 2,
+                "third" => 3,
+                "fourth" => 4,
+                "fifth" => 5,
+                "sixth" => 6,
+                "seventh" => 7,
+                "eighth" => 8,
+                "ninth" => 9,
+                var number when int.TryParse(number, out var parsed) => parsed,
+                _ => 0,
+            };
+            if (index > 0)
+            {
+                selection = $"index:{index}";
+                description = $"tab {index}";
+                return true;
+            }
+        }
+
+        if (Regex.IsMatch(
+            normalized,
+            @"^(?:(?:switch|go|change|open|navigate)\s+(?:to\s+)?)?(?:chrome(?:'s)?\s+)?(?:the\s+)?second(?:\s+to)?\s+last\s+(?:(?:chrome|browser)\s+)?tab$",
+            RegexOptions.IgnoreCase))
+        {
+            selection = "from_end:2";
+            description = "the second-last tab";
+            return true;
+        }
+
+        if (Regex.IsMatch(
+            normalized,
+            @"^(?:(?:switch|go|change|open|navigate)\s+(?:to\s+)?)?(?:chrome(?:'s)?\s+)?(?:the\s+)?last\s+(?:(?:chrome|browser)\s+)?tab$",
+            RegexOptions.IgnoreCase))
+        {
+            selection = "from_end:1";
+            description = "the last tab";
+            return true;
+        }
+
+        if (normalized is "next tab" or "go to next tab" or "go to the next tab"
+            or "switch to next tab" or "switch to the next tab" or "change tab" or "switch tab")
+        {
+            selection = "next";
+            description = "the next tab";
+            return true;
+        }
+
+        if (normalized is "previous tab" or "go to previous tab" or "go to the previous tab"
+            or "switch to previous tab" or "switch to the previous tab")
+        {
+            selection = "previous";
+            description = "the previous tab";
+            return true;
+        }
+
+        return false;
+    }
+
+    private Dictionary<string, object> BrowserAction(string action, CancellationToken token)
+    {
+        var keys = BrowserShortcutForAction(action);
+        if (keys == null)
+            return Result(false, "That browser action is not supported yet.", supported: false);
+
+        var activeWindow = GetForegroundWindow();
+        var activeProcess = GetProcessName(activeWindow);
+        var foregroundedBrowser = false;
+        if (!IsBrowserProcess(activeProcess))
+        {
+            var browser = EnumerateWindows()
+                .FirstOrDefault(window => IsBrowserProcess(window.ProcessName));
+            if (browser == null)
+            {
+                return Result(
+                    false,
+                    "I could not find an open supported browser window.",
+                    supported: false,
+                    needsClarification: true,
+                    extras: new() { ["active_process"] = activeProcess });
+            }
+
+            if (string.Equals(
+                browser.ProcessName,
+                "chrome",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    BrowserTrustedInput.FocusChromeWindowForAutomation(browser.Title, token);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return Result(
+                        false,
+                        ex.Message,
+                        supported: false,
+                        needsClarification: true,
+                        extras: new() { ["active_process"] = activeProcess });
+                }
+            }
+            else
+            {
+                BrowserTrustedInput.EnsureNoUserModifierIsHeld(token);
+                token.ThrowIfCancellationRequested();
+                ShowWindow(browser.Handle, SwRestore);
+                token.ThrowIfCancellationRequested();
+                SetForegroundWindow(browser.Handle);
+            }
+            if (token.WaitHandle.WaitOne(120))
+                token.ThrowIfCancellationRequested();
+            activeWindow = browser.Handle;
+            activeProcess = GetProcessName(activeWindow);
+            foregroundedBrowser = GetForegroundWindow() == activeWindow && IsBrowserProcess(activeProcess);
+            if (!foregroundedBrowser)
+            {
+                return Result(
+                    false,
+                    "Windows did not allow me to focus the open browser for that shortcut.",
+                    supported: false,
+                    needsClarification: true,
+                    extras: new() { ["active_process"] = activeProcess });
+            }
+        }
+
+        try
+        {
+            SendKeysOnUiThread(keys, token, activeWindow);
+        }
+        catch (Exception ex)
+        {
+            return Result(
+                false,
+                $"The browser shortcut could not be sent: {ex.Message}",
+                supported: false);
+        }
+        return Logged(
+            "browser_action",
+            action,
+            true,
+            $"Sent the browser shortcut for {action}.",
+            extras: new()
+            {
+                ["shortcut_sent"] = true,
+                ["foregrounded_browser"] = foregroundedBrowser,
+                ["verified_browser_state"] = false,
+            });
+    }
+
+    public static string BrowserShortcutForAction(string action)
+    {
+        var normalized = NormalizePhraseText(action);
+        if (normalized.StartsWith("please ", StringComparison.Ordinal))
+            normalized = normalized["please ".Length..];
+        if (TryGetBrowserTabSelection(normalized, out _, out _))
+            return null;
+        if (TryGetBrowserTabCloseReference(normalized, out var closeReference, out _)
+            && closeReference == "current")
+            return "^w";
+
+        return normalized switch
+        {
+            "new tab" => "^t",
+            "close tab" or "close this tab" or "close website" or "close this website" => "^w",
+            "reopen tab" or "reopen closed tab" => "^+t",
+            "refresh" or "reload" => "^r",
+            "back" => "%{LEFT}",
+            "forward" => "%{RIGHT}",
+            "focus address" or "address bar" => "^l",
+            "find" or "find on page" => "^f",
+            "downloads" => "^j",
+            "history" => "^h",
+            _ => null,
+        };
+    }
+
+    private async Task<Dictionary<string, object>> WebSearchAsync(string query, string engine, string browser, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return Result(false, "What should I search for?", needsClarification: true);
+        return await OpenUrlAsync(BrowserLauncherService.BuildSearchUrl(query, engine), browser, token);
+    }
+
+    private Dictionary<string, object> GetDesktopContext()
+    {
+        var handle = GetForegroundWindow();
+        var title = GetWindowTitle(handle);
+        var processName = GetProcessName(handle);
+        var clipboard = Limit(ClipboardHelper.GetText(), 2500);
+        return Result(true, "Desktop context captured.", extras: new()
+        {
+            ["active_window_title"] = title,
+            ["active_process"] = processName,
+            ["clipboard_text"] = clipboard,
+            ["clipboard_truncated"] = clipboard.Length >= 2500,
+        });
+    }
+
+    private Dictionary<string, object> GetClipboardText()
+    {
+        return BuildClipboardTextResult(ClipboardHelper.GetText());
+    }
+
+    // This is an ephemeral, explicitly requested read. Report partial reads
+    // truthfully so a browser task cannot infer that omitted answers were
+    // absent from the user's original clipboard content.
+    internal const int ClipboardContextCharacterLimit = 8000;
+
+    internal static Dictionary<string, object> BuildClipboardTextResult(string clipboardText)
+    {
+        var original = clipboardText ?? "";
+        var truncated = original.Length > ClipboardContextCharacterLimit;
+        var text = Limit(original, ClipboardContextCharacterLimit);
+        if (truncated && text.Length > 0 && char.IsHighSurrogate(text[^1]))
+            text = text[..^1];
+        return Result(
+            true,
+            string.IsNullOrWhiteSpace(text)
+                ? "Clipboard is empty."
+                : truncated
+                    ? "Clipboard text captured partially; only the first 8,000 characters are available. Ask for a narrower source if the whole text matters."
+                    : "Clipboard text captured.",
+            extras: new()
+            {
+                ["text"] = text,
+                ["source"] = "clipboard_text",
+                ["truncated"] = truncated,
+                ["original_character_count"] = original.Length,
+            });
+    }
+
+    private async Task<Dictionary<string, object>> GetSelectedTextAsync(CancellationToken token)
+    {
+        var context = CaptureSelectionContext();
+        var captureStarted = Stopwatch.GetTimestamp();
+        foreach (var delayMs in SelectionCaptureRetryDelaysMs)
+        {
+            token.ThrowIfCancellationRequested();
+            var previous = ClipboardHelper.Capture();
+            if (previous is null)
+                continue;
+            var marker = $"keyboard-wtf-{Guid.NewGuid():N}";
+            var selected = "";
+            var expectedClipboardText = marker;
+            var sequenceBeforeWrite = ClipboardHelper.GetSequenceNumber();
+            var ownedSequence = 0u;
+            var markerSet = false;
+            var copied = false;
+            try
+            {
+                markerSet = ClipboardHelper.SetOwnedText(marker);
+                ownedSequence = ClipboardHelper.GetSequenceNumber();
+                if (!ClipboardPayloadIsReady(markerSet, marker, ClipboardHelper.GetText))
+                {
+                    AppLog.Warning("Native selected-text marker could not be verified; copy was not sent");
+                    continue;
+                }
+                SendKeysOnUiThread("^c", token, context.Handle);
+                await Task.Delay(delayMs, token);
+                selected = ClipboardHelper.GetText();
+                var copiedSequence = ClipboardHelper.GetSequenceNumber();
+                expectedClipboardText = selected;
+                if (ownedSequence != 0 && copiedSequence == ownedSequence)
+                    continue;
+                ownedSequence = copiedSequence;
+                copied = true;
+            }
+            finally
+            {
+                var currentSequence = ClipboardHelper.GetSequenceNumber();
+                var currentText = ClipboardHelper.GetText();
+                if (markerSet
+                    && (ownedSequence == 0 || currentSequence == ownedSequence)
+                    && string.Equals(currentText, expectedClipboardText, StringComparison.Ordinal)
+                    && !ClipboardHelper.Restore(previous))
+                    AppLog.Warning("Native selected-text capture could not restore the prior clipboard");
+                else if (FailedClipboardWriteMayHaveClearedPrior(
+                    markerSet, sequenceBeforeWrite, ownedSequence, currentSequence, currentText,
+                    ClipboardHelper.IsCurrentProcessOwner())
+                    && !ClipboardHelper.Restore(previous))
+                    AppLog.Warning("Native selected-text marker failure could not restore the prior clipboard");
+            }
+            if (!copied)
+                continue;
+            var currentContext = CaptureSelectionContext();
+            if (selected != marker
+                && !string.IsNullOrWhiteSpace(selected)
+                && SelectionContextsAreCompatible(context, currentContext))
+            {
+                AppLog.Info($"Native selected-text capture: elapsedMs={Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds:F0} characters={selected.Length} clipboardSequence={ownedSequence}");
+                var snapshot = new SelectionSnapshot(
+                    selected,
+                    DateTimeOffset.UtcNow,
+                    currentContext.Handle,
+                    currentContext.ProcessName,
+                    currentContext.WindowTitle,
+                    false);
+                lock (_selectionLock)
+                    _lastSelection = snapshot;
+                return FreshSelectionResult(snapshot.Text, currentContext);
+            }
+        }
+
+        // Some Chromium pages expose a genuine DOM selection but do not
+        // publish it through Ctrl+C. The optional Helper read is confined to
+        // the same currently focused Chrome tab; it never starts a BA task,
+        // changes the clipboard, or substitutes page text for a selection.
+        AppLog.Info($"Native selected-text capture unavailable: elapsedMs={Stopwatch.GetElapsedTime(captureStarted).TotalMilliseconds:F0} chrome={string.Equals(context.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase)} foregroundSame={SelectionContextsAreCompatible(context, CaptureSelectionContext())}");
+        var browserSelection = await TryReadBrowserSelectionAsync(context, token);
+        if (browserSelection != null)
+            return browserSelection;
+
+        // A failed foreground capture is not permission to process cached text.
+        // Deliberate original-source recall belongs to the conversation owner.
+        return Result(
+            false,
+            "I couldn't read the current selection. Reselect it and try once more.",
+            supported: false);
+    }
+
+    internal static Dictionary<string, object> SelectionResult(string text, bool fresh, bool truncated = false, int? totalLength = null)
+    {
+        text ??= "";
+        var incomplete = truncated || totalLength > text.Length;
+        return Result(!string.IsNullOrWhiteSpace(text), incomplete
+            ? "The selection capture is incomplete. The captured text is available; it does not cover the entire selection."
+            : fresh ? "Selected text captured." : "Used the recent selection from this same window.", extras: new()
+        {
+            ["text"] = text,
+            ["source"] = "current_selection",
+            ["content_role"] = "user_selected_source_content",
+            ["truncated"] = incomplete,
+            ["fresh"] = fresh,
+            ["captured_character_count"] = text.Length,
+            ["original_character_count"] = totalLength ?? text.Length,
+        });
+    }
+
+    private async Task<Dictionary<string, object>> TryReadBrowserSelectionAsync(
+        SelectionContext expected, CancellationToken token)
+    {
+        var helper = _browserHelper;
+        var status = helper?.Status;
+        if (!CanTryBrowserSelectionFallback(expected, status))
+        {
+            AppLog.Info($"Browser selected-text fallback unavailable: chrome={string.Equals(expected.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase)} helperReady={status?.CommandChannelReady == true} selectionSupported={status?.SelectionReadSupported == true} tabFresh={status?.ActiveTabFresh == true} tabKnown={status?.WindowId.HasValue == true && status?.TabId.HasValue == true} sessionKnown={!string.IsNullOrWhiteSpace(status?.SessionId)}");
+            return null;
+        }
+
+        try
+        {
+            var readStarted = Stopwatch.GetTimestamp();
+            var receipt = await helper.ReadSelectionAsync(
+                status.WindowId.Value, status.TabId.Value, status.SessionId, token);
+            if (!BrowserSelectionReceiptIsOwned(
+                receipt, status, expected, CaptureSelectionContext()))
+            {
+                AppLog.Info($"Browser selected-text fallback rejected: elapsedMs={Stopwatch.GetElapsedTime(readStarted).TotalMilliseconds:F0} reason={SelectionReadFailureKind(receipt)} receiptOwned={receipt?.Ok == true && receipt.WindowId == status.WindowId && receipt.TabId == status.TabId && string.Equals(receipt.SessionId, status.SessionId, StringComparison.Ordinal)} foregroundSame={SelectionContextsAreCompatible(expected, CaptureSelectionContext())}");
+                return null;
+            }
+
+            if (receipt.Truncated || receipt.TotalLength != receipt.Text?.Length)
+            {
+                lock (_selectionLock) _lastSelection = null;
+                return SelectionResult(receipt.Text, fresh: true, truncated: true, totalLength: receipt.TotalLength);
+            }
+            var snapshot = new SelectionSnapshot(
+                receipt.Text, DateTimeOffset.UtcNow, expected.Handle,
+                expected.ProcessName, expected.WindowTitle, receipt.Truncated);
+            lock (_selectionLock)
+                _lastSelection = snapshot;
+            AppLog.Info($"Browser selected-text fallback captured: elapsedMs={Stopwatch.GetElapsedTime(readStarted).TotalMilliseconds:F0} characters={receipt.TotalLength} truncated={receipt.Truncated}");
+            return FreshSelectionResult(snapshot.Text, expected);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            AppLog.Info($"Foreground browser selection read unavailable: {ex.GetType().Name}");
+            return null;
+        }
+    }
+
+    internal static string SelectionReadFailureKind(BrowserSelectionReceipt receipt)
+    {
+        if (receipt is null) return "no_receipt";
+        if (receipt.Ok) return string.IsNullOrWhiteSpace(receipt.Text) ? "empty_result" : "ownership_mismatch";
+        var error = receipt.Error ?? "";
+        if (error.Contains("browser task", StringComparison.OrdinalIgnoreCase)) return "active_task";
+        if (error.Contains("foreground", StringComparison.OrdinalIgnoreCase)) return "focus_changed";
+        if (error.Contains("selected tab", StringComparison.OrdinalIgnoreCase)) return "tab_changed";
+        if (error.Contains("no readable selection", StringComparison.OrdinalIgnoreCase)) return "empty_dom_selection";
+        if (error.Contains("command", StringComparison.OrdinalIgnoreCase)) return "command_expired";
+        return "other";
+    }
+
+    internal static bool CanTryBrowserSelectionFallback(
+        SelectionContext expected, BrowserHelperStatus status) =>
+        expected?.Handle != IntPtr.Zero
+        && string.Equals(expected.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase)
+        && status?.CommandChannelReady == true
+        && status.SelectionReadSupported
+        && status.ActiveTabFresh
+        && status.WindowId.HasValue && status.TabId.HasValue
+        && !string.IsNullOrWhiteSpace(status.SessionId)
+        && BrowserTitleMatchesForeground(status.ActiveTitle, expected.WindowTitle);
+
+    internal static bool BrowserSelectionReceiptIsOwned(
+        BrowserSelectionReceipt receipt, BrowserHelperStatus status,
+        SelectionContext expected, SelectionContext current) =>
+        receipt?.Ok == true && CanTryBrowserSelectionFallback(expected, status)
+        && (!string.IsNullOrWhiteSpace(receipt.Text) || receipt.Truncated)
+        && receipt.TotalLength > 0
+        && receipt.WindowId == status.WindowId && receipt.TabId == status.TabId
+        && string.Equals(receipt.SessionId, status.SessionId, StringComparison.Ordinal)
+        && SelectionContextsAreCompatible(expected, current);
+
+    private static SelectionContext CaptureSelectionContext()
+    {
+        var handle = GetForegroundWindow();
+        return new SelectionContext(handle, GetProcessName(handle), GetWindowTitle(handle));
+    }
+
+    private Dictionary<string, object> FreshSelectionResult(string text, SelectionContext context)
+    {
+        var result = SelectionResult(text, fresh: true);
+        result["source_context_id"] = SelectionSourceContextId(context, _browserHelper?.Status);
+        result["capture_id"] = Guid.NewGuid().ToString("N");
+        // Provenance accompanies the immutable user source in session context;
+        // it is not logged or saved as durable memory. Never label a native
+        // foreground selection with a background browser's document.
+        result["source_title"] = context.WindowTitle;
+        result["source_app"] = context.ProcessName;
+        var helper = _browserHelper?.Status;
+        if (CanTryBrowserSelectionFallback(context, helper)
+            && Uri.TryCreate(helper.ActiveUrl, UriKind.Absolute, out var page))
+            result["source_origin"] = page.GetLeftPart(UriPartial.Authority);
+        AppLog.Info($"Selected source accepted: capture={result["capture_id"]} context={result["source_context_id"]} characters={text.Length}");
+        return result;
+    }
+
+    internal string CurrentSelectionContextId() =>
+        SelectionSourceContextId(CaptureSelectionContext(), _browserHelper?.Status);
+
+    internal static string SelectionSourceContextId(SelectionContext context, BrowserHelperStatus helper)
+    {
+        if (context is null || context.Handle == IntPtr.Zero
+            || string.IsNullOrWhiteSpace(context.ProcessName) || string.IsNullOrWhiteSpace(context.WindowTitle))
+            return "";
+        var identity = $"{context.Handle}\n{context.ProcessName.ToLowerInvariant()}\n{context.WindowTitle}";
+        if (string.Equals(context.ProcessName, "chrome", StringComparison.OrdinalIgnoreCase))
+        {
+            // Native capture still succeeds without the Helper, but implicit
+            // recall cannot claim browser document identity without fresh evidence.
+            if (helper?.CommandChannelReady != true || !helper.ActiveTabFresh
+                || !helper.WindowId.HasValue || !helper.TabId.HasValue
+                || string.IsNullOrWhiteSpace(helper.SessionId) || string.IsNullOrWhiteSpace(helper.ActiveUrl)
+                || !BrowserTitleMatchesForeground(helper.ActiveTitle, context.WindowTitle))
+                return "";
+            identity += $"\n{helper.SessionId}\n{helper.WindowId}\n{helper.TabId}\n{helper.ActiveUrl}\n{helper.DomEpoch}";
+        }
+        // Keep window titles/URLs (including private page parameters) local.
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
+    }
+
+    internal static bool BrowserTitleMatchesForeground(string tabTitle, string windowTitle) =>
+        !string.IsNullOrWhiteSpace(tabTitle)
+        && (string.Equals(tabTitle, windowTitle, StringComparison.Ordinal)
+            || string.Equals(tabTitle + " - Google Chrome", windowTitle, StringComparison.Ordinal));
+
+    internal static readonly int[] SelectionCaptureRetryDelaysMs = [160, 260];
+    internal static readonly TimeSpan SelectionCacheMaximumAge = TimeSpan.FromSeconds(90);
+
+    internal static bool CanUseCachedSelection(
+        SelectionSnapshot snapshot,
+        SelectionContext current,
+        DateTimeOffset now) =>
+        snapshot is not null
+        && !string.IsNullOrWhiteSpace(snapshot.Text)
+        && now - snapshot.CapturedAt <= SelectionCacheMaximumAge
+        && SelectionContextsAreCompatible(
+            new SelectionContext(snapshot.Handle, snapshot.ProcessName, snapshot.WindowTitle),
+            current);
+
+    internal static bool SelectionContextsAreCompatible(SelectionContext expected, SelectionContext current) =>
+        expected is not null
+        && current is not null
+        && expected.Handle != IntPtr.Zero
+        && expected.Handle == current.Handle
+        && string.Equals(expected.ProcessName, current.ProcessName, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(expected.WindowTitle, current.WindowTitle, StringComparison.Ordinal);
+
+    internal enum ClipboardPasteOutcome
+    {
+        Pasted,
+        SnapshotUnavailable,
+        WriteFailed,
+        VerificationFailed,
+        InputNotSubmitted,
+        InputSubmitted,
+    }
+
+    internal static bool ClipboardPayloadIsReady(
+        bool writeSucceeded, string expected, Func<string> read) =>
+        writeSucceeded && string.Equals(read(), expected, StringComparison.Ordinal);
+
+    // A failed write can still have emptied the clipboard. Compensate only if
+    // its observed sequence is still current and no newer text owner appeared.
+    internal static bool FailedClipboardWriteMayHaveClearedPrior(
+        bool writeSucceeded, uint sequenceBeforeWrite, uint sequenceAfterWrite,
+        uint currentSequence, string currentText, bool isCurrentProcessOwner) =>
+        !writeSucceeded
+        && isCurrentProcessOwner
+        && sequenceBeforeWrite != 0
+        && sequenceAfterWrite != 0
+        && sequenceAfterWrite != sequenceBeforeWrite
+        && currentSequence == sequenceAfterWrite
+        && string.IsNullOrEmpty(currentText);
+
+    internal static async Task<ClipboardPasteOutcome> PasteTextWithClipboardAsync(
+        string text,
+        CancellationToken token,
+        Func<ClipboardHelper.Snapshot> capture,
+        Func<string, bool> setText,
+        Func<string> getText,
+        Func<uint> getSequence,
+        Func<ClipboardHelper.Snapshot, bool> restore,
+        Action<CancellationToken> sendPaste,
+        Func<int, CancellationToken, Task> delay,
+        Func<bool> isCurrentProcessOwner = null)
+    {
+        token.ThrowIfCancellationRequested();
+        var started = Stopwatch.GetTimestamp();
+        var previous = capture();
+        if (previous is null)
+        {
+            AppLog.Info($"Jarvis clipboard paste: outcome={ClipboardPasteOutcome.SnapshotUnavailable} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0}");
+            return ClipboardPasteOutcome.SnapshotUnavailable;
+        }
+
+        var wrote = false;
+        var sequenceBeforeWrite = getSequence();
+        var ownedSequence = 0u;
+        var preparedMs = -1d;
+        var inputSubmittedMs = -1d;
+        var outcome = ClipboardPasteOutcome.WriteFailed;
+        var restoration = "not_owned";
+        try
+        {
+            wrote = setText(text);
+            ownedSequence = getSequence();
+            if (!wrote)
+                return ClipboardPasteOutcome.WriteFailed;
+            if (!ClipboardPayloadIsReady(wrote, text, getText)
+                || (ownedSequence != 0 && getSequence() != ownedSequence))
+            {
+                outcome = ClipboardPasteOutcome.VerificationFailed;
+                return ClipboardPasteOutcome.VerificationFailed;
+            }
+
+            preparedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            outcome = ClipboardPasteOutcome.InputNotSubmitted;
+            token.ThrowIfCancellationRequested();
+            sendPaste(token);
+            inputSubmittedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            outcome = ClipboardPasteOutcome.InputSubmitted;
+            // Input is already submitted. Cancellation must not restore the
+            // previous clipboard before the target consumes the paste event.
+            await delay(220, CancellationToken.None);
+            outcome = ClipboardPasteOutcome.Pasted;
+            return ClipboardPasteOutcome.Pasted;
+        }
+        finally
+        {
+            var currentSequence = getSequence();
+            var currentText = getText();
+            if (wrote
+                && (ownedSequence == 0 || currentSequence == ownedSequence)
+                && string.Equals(currentText, text, StringComparison.Ordinal))
+            {
+                restoration = restore(previous) ? "restored" : "failed";
+                if (restoration == "failed")
+                    AppLog.Warning("Jarvis paste could not restore the prior clipboard");
+            }
+            else if (FailedClipboardWriteMayHaveClearedPrior(
+                wrote, sequenceBeforeWrite, ownedSequence, currentSequence, currentText,
+                isCurrentProcessOwner?.Invoke() == true))
+            {
+                restoration = restore(previous) ? "restored_after_failed_write" : "failed_after_failed_write";
+                if (restoration == "failed_after_failed_write")
+                    AppLog.Warning("Jarvis failed clipboard write could not restore the prior clipboard");
+            }
+            else if (wrote && ownedSequence != 0 && currentSequence != ownedSequence)
+                restoration = "skipped_newer_sequence";
+            AppLog.Info($"Jarvis clipboard paste: outcome={outcome} characters={text.Length} preparedMs={preparedMs:F0} inputSubmittedMs={inputSubmittedMs:F0} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0} sequenceAfterWrite={ownedSequence} sequenceBeforeRestore={currentSequence} restoration={restoration}");
+        }
+    }
+
+    private Task<ClipboardPasteOutcome> PasteTextWithClipboardAsync(
+        string text, IntPtr target, CancellationToken token) =>
+        PasteTextWithClipboardAsync(
+            text,
+            token,
+            ClipboardHelper.Capture,
+            ClipboardHelper.SetOwnedText,
+            ClipboardHelper.GetText,
+            ClipboardHelper.GetSequenceNumber,
+            ClipboardHelper.Restore,
+            pasteToken => SendKeysOnUiThread("^v", pasteToken, target),
+            (milliseconds, delayToken) => Task.Delay(milliseconds, delayToken),
+            ClipboardHelper.IsCurrentProcessOwner);
+
+    private async Task<Dictionary<string, object>> ReplaceSelectedTextAsync(string text, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Result(false, "What text should replace the selection?", needsClarification: true);
+        var target = GetForegroundWindow();
+        var outcome = await PasteTextWithClipboardAsync(text, target, token);
+        if (outcome != ClipboardPasteOutcome.Pasted)
+            return Logged("replace_selected_text", "clipboard_precondition", false,
+                $"The replacement was not pasted because the clipboard was not ready ({outcome}).");
+        return Logged("replace_selected_text", Limit(text, 120), true, "Replaced the selected text.");
+    }
+
+    private async Task<Dictionary<string, object>> TypeTextAsync(string text, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Result(false, "What should I type?", needsClarification: true);
+        var target = GetForegroundWindow();
+        var outcome = await PasteTextWithClipboardAsync(text, target, token);
+        if (outcome != ClipboardPasteOutcome.Pasted)
+            return Logged("type_text", "clipboard_precondition", false,
+                $"Text was not pasted because the clipboard was not ready ({outcome}).");
+        return Logged("type_text", Limit(text, 120), true, "Typed the text into the active field.");
+    }
+
+    private Dictionary<string, object> PressKey(string key, CancellationToken token)
+    {
+        var sequence = NormalizeWords(key) switch
+        {
+            "tab" => "{TAB}",
+            "escape" or "esc" => "{ESC}",
+            "up" => "{UP}",
+            "down" => "{DOWN}",
+            "left" => "{LEFT}",
+            "right" => "{RIGHT}",
+            "page up" => "{PGUP}",
+            "page down" => "{PGDN}",
+            "home" => "{HOME}",
+            "end" => "{END}",
+            _ => null,
+        };
+        if (sequence == null)
+            return Result(false, "That key is not supported.", supported: false);
+        SendKeysOnUiThread(sequence, token);
+        return Logged("press_key", key, true, $"Pressed {key}.");
+    }
+
+    private async Task<Dictionary<string, object>> SearchFilesAsync(
+        string query,
+        string location,
+        CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return Result(false, "What file or folder should I search for?", needsClarification: true);
+
+        location = ResolveRecentFileLocation(location);
+        var search = await _files.SearchAsync(
+            query,
+            location,
+            includeFiles: true,
+            includeFolders: true,
+            token,
+            maxResults: 15);
+        var success = search.Status is FileResolutionStatus.Found or FileResolutionStatus.Ambiguous;
+        _history.Add("search_files", $"{query} in {location}", success);
+        return Result(
+            success,
+            search.Candidates.Count == 0
+                ? $"No matching files or folders were found in {search.SearchSummary}."
+                : $"Found {search.Candidates.Count} ranked matches.",
+            extras: new()
+            {
+                ["matches"] = search.Candidates.Select(candidate => new
+                {
+                    candidate.Name,
+                    candidate.Path,
+                    containing_folder = candidate.IsDirectory
+                        ? candidate.Path
+                        : Path.GetDirectoryName(candidate.Path),
+                    type = candidate.IsDirectory ? "folder" : "file",
+                    modified_at = candidate.ModifiedAt,
+                    score = Math.Round(candidate.Score, 3),
+                    risky = SmartFileSearchService.IsRiskyFile(candidate.Path),
+                }).ToArray(),
+                ["searched"] = search.SearchSummary,
+                ["scanned_entries"] = search.ScannedEntries,
+                ["timed_out"] = search.TimedOut,
+            });
+    }
+
+    private string ResolveRecentFileLocation(string explicitLocation)
+    {
+        string recentTranscript;
+        DateTimeOffset observedAt;
+        lock (_pendingLock)
+        {
+            recentTranscript = _latestUserTranscript;
+            observedAt = _latestUserTranscriptAt;
+        }
+        if (DateTimeOffset.UtcNow - observedAt > TimeSpan.FromSeconds(30))
+            recentTranscript = "";
+        return SmartFileSearchService.ResolveRequestedLocation(
+            recentTranscript,
+            explicitLocation);
+    }
+
+    private Dictionary<string, object> SaveNote(string text, string title)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Result(false, "What should I save in the note?", needsClarification: true);
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), QlooProduct.Name);
+        Directory.CreateDirectory(folder);
+        var path = Path.Combine(folder, "Jarvis Notes.md");
+        var heading = string.IsNullOrWhiteSpace(title) ? "Quick note" : title.Trim();
+        File.AppendAllText(path, $"{Environment.NewLine}## {heading} - {DateTime.Now:g}{Environment.NewLine}{text.Trim()}{Environment.NewLine}");
+        return Logged("save_note", path, true, "Saved the note.", extras: new() { ["path"] = path });
+    }
+
+    private Dictionary<string, object> AddTodo(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Result(false, "What should I add to the to-do list?", needsClarification: true);
+        var todos = LoadTodos();
+        todos.Add(new JarvisTodo { Text = Limit(text, 240) });
+        SaveTodos(todos);
+        return Logged("add_todo", text, true, "Added to the to-do list.");
+    }
+
+    private Dictionary<string, object> ListTodos()
+    {
+        var todos = LoadTodos();
+        return Result(true, todos.Count == 0 ? "The to-do list is empty." : "To-do list loaded.", extras: new()
+        {
+            ["todos"] = todos.Select(t => new { t.Id, t.Text, t.Completed, t.CreatedAt }).ToArray(),
+        });
+    }
+
+    private Dictionary<string, object> CompleteTodo(string query)
+    {
+        var todos = LoadTodos();
+        var todo = todos.FirstOrDefault(t =>
+            !t.Completed && t.Text.Contains(query ?? "", StringComparison.OrdinalIgnoreCase));
+        if (todo == null)
+            return Result(false, "I could not find a matching unfinished to-do.", supported: false);
+        todo.Completed = true;
+        SaveTodos(todos);
+        return Logged("complete_todo", todo.Text, true, "Marked the to-do complete.");
+    }
+
+    private Dictionary<string, object> SetTimer(int minutes, int seconds, string label)
+    {
+        var duration = seconds > 0
+            ? TimeSpan.FromSeconds(seconds)
+            : TimeSpan.FromMinutes(Math.Clamp(minutes, 1, 1440));
+        var timer = _timerService.Start(duration, label);
+        return Result(
+            true,
+            $"Timer set for {FormatTimerDuration(duration)}.",
+            extras: new()
+            {
+                ["timer_id"] = timer.Id,
+                ["label"] = timer.Label,
+                ["due_at"] = timer.DueAt.ToString("O"),
+            });
+    }
+
+    private Dictionary<string, object> CancelTimer(string query)
+    {
+        var count = _timerService.Cancel(query);
+        return Result(
+            count > 0,
+            count switch
+            {
+                0 => "I could not find a matching active timer.",
+                1 => "Timer cancelled.",
+                _ => $"{count} timers cancelled.",
+            },
+            supported: count > 0,
+            needsClarification: count == 0);
+    }
+
+    private Dictionary<string, object> ListTimers()
+    {
+        var timers = _timerService.ActiveTimers;
+        return Result(
+            true,
+            timers.Count == 0
+                ? "There are no active timers."
+                : timers.Count == 1
+                    ? "There is 1 active timer."
+                    : $"There are {timers.Count} active timers.",
+            extras: new()
+            {
+                ["timers"] = timers.Select(timer => new
+                {
+                    timer.Id,
+                    timer.Label,
+                    due_at = timer.DueAt,
+                    remaining_seconds = Math.Max(0, (int)Math.Ceiling(timer.Remaining.TotalSeconds)),
+                }).ToArray(),
+            });
+    }
+
+    private static string FormatTimerDuration(TimeSpan duration)
+    {
+        if (duration.TotalMinutes >= 1 && duration.TotalSeconds % 60 == 0)
+        {
+            var minutes = (int)duration.TotalMinutes;
+            return $"{minutes} minute{(minutes == 1 ? "" : "s")}";
+        }
+        var seconds = Math.Max(1, (int)Math.Round(duration.TotalSeconds));
+        return $"{seconds} second{(seconds == 1 ? "" : "s")}";
+    }
+
+    private Dictionary<string, object> SystemControl(string action, int value, CancellationToken token)
+    {
+        var normalized = NormalizeWords(action);
+        switch (normalized)
+        {
+            case "volume up":
+                PressMediaKey(VkVolumeUp, Math.Clamp(value <= 0 ? 2 : value, 1, 20), token);
+                return Logged("system_control", action, true, "Volume increased.");
+            case "volume down":
+                PressMediaKey(VkVolumeDown, Math.Clamp(value <= 0 ? 2 : value, 1, 20), token);
+                return Logged("system_control", action, true, "Volume decreased.");
+            case "mute":
+            case "toggle mute":
+                PressMediaKey(VkVolumeMute, 1, token);
+                return Logged("system_control", action, true, "Mute toggled.");
+            case "bluetooth settings":
+                return OpenUrl("ms-settings:bluetooth");
+            case "wifi settings":
+                return OpenUrl("ms-settings:network-wifi");
+            case "display settings":
+                return OpenUrl("ms-settings:display");
+            case "sound settings":
+                return OpenUrl("ms-settings:sound");
+            default:
+                return Result(false, "Supported direct controls are volume, mute, and opening Wi-Fi, Bluetooth, display, or sound settings.", supported: false);
+        }
+    }
+
+    private Dictionary<string, object> SystemStatus()
+    {
+        var power = SystemInformation.PowerStatus;
+        var batteryPercent = power.BatteryLifePercent < 0
+            ? (int?)null
+            : (int)Math.Round(power.BatteryLifePercent * 100);
+        return Result(true, "System status captured.", extras: new()
+        {
+            ["battery_percent"] = batteryPercent,
+            ["plugged_in"] = power.PowerLineStatus == PowerLineStatus.Online,
+            ["uptime_minutes"] = (long)TimeSpan.FromMilliseconds(Environment.TickCount64).TotalMinutes,
+            ["machine_name"] = Environment.MachineName,
+            ["user_name"] = Environment.UserName,
+            ["os"] = Environment.OSVersion.VersionString,
+        });
+    }
+
+    private Dictionary<string, object> PlayMedia(string query, string service)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return Result(false, "What should I play?", needsClarification: true);
+
+        var cleanQuery = query.Trim();
+        var normalizedService = NormalizeWords(service);
+        if (string.IsNullOrWhiteSpace(normalizedService))
+            normalizedService = "spotify";
+
+        if (normalizedService is "spotify" or "spotify app")
+        {
+            var encoded = Uri.EscapeDataString(cleanQuery);
+            if (TryStart($"spotify:search:{encoded}"))
+            {
+                return Logged(
+                    "play_media",
+                    $"Spotify: {cleanQuery}",
+                    true,
+                    $"Opened Spotify search for {cleanQuery}. Select the result and press Play.",
+                    extras: new()
+                    {
+                        ["service"] = "spotify",
+                        ["direct_playback"] = false,
+                        ["requires_spotify_oauth"] = true,
+                    });
+            }
+
+            var result = OpenUrl($"https://open.spotify.com/search/{encoded}");
+            result["direct_playback"] = false;
+            result["requires_spotify_oauth"] = true;
+            result["message"] = $"Opened Spotify search for {cleanQuery}. Select the result and press Play.";
+            return result;
+        }
+
+        if (normalizedService is "youtube" or "youtube music")
+            return OpenUrl($"https://www.youtube.com/results?search_query={Uri.EscapeDataString(cleanQuery)}");
+
+        return Result(false, "Supported media services are Spotify and YouTube.", supported: false);
+    }
+
+    private Dictionary<string, object> OpenServicePage(string service, string page, string query)
+    {
+        var normalizedService = NormalizeWords(service);
+        var normalizedPage = NormalizeWords(page);
+        var encoded = Uri.EscapeDataString(query?.Trim() ?? "");
+
+        if (normalizedService is "amazon" or "amazon india" or "amazon.in")
+        {
+            if (normalizedPage is not ("search" or "products"))
+                return Result(
+                    false,
+                    "Amazon cart changes are not supported safely yet. I can open a product search for manual review.",
+                    supported: false);
+            if (string.IsNullOrWhiteSpace(query))
+                return Result(false, "What should I search for on Amazon?", needsClarification: true);
+            return OpenUrl($"https://www.amazon.in/s?k={encoded}");
+        }
+
+        if (normalizedService is "youtube")
+        {
+            if (normalizedPage is "liked videos" or "liked playlist" or "likes")
+                return OpenUrl("https://www.youtube.com/playlist?list=LL");
+            if (normalizedPage is "subscriptions")
+                return OpenUrl("https://www.youtube.com/feed/subscriptions");
+            if (normalizedPage is "history")
+                return OpenUrl("https://www.youtube.com/feed/history");
+            return Result(
+                false,
+                "Bulk unlike and account-changing YouTube actions are not supported safely. I can open Liked Videos, Subscriptions, or History.",
+                supported: false);
+        }
+
+        if (normalizedService is "spotify")
+        {
+            if (normalizedPage is "liked songs" or "liked music" or "library")
+            {
+                if (TryStart("spotify:collection:tracks"))
+                    return Logged("open_service_page", "Spotify liked songs", true, "Opened Spotify Liked Songs.");
+                return OpenUrl("https://open.spotify.com/collection/tracks");
+            }
+            return Result(false, "Supported Spotify pages are Liked Songs and media search.", supported: false);
+        }
+
+        if (normalizedService is "discord")
+        {
+            if (normalizedPage is "home" or "app" or "friends")
+            {
+                if (TryStart("discord://"))
+                    return Logged("open_service_page", "Discord", true, "Opened Discord.");
+                return OpenUrl("https://discord.com/app");
+            }
+            return Result(
+                false,
+                "Discord messaging is not configured in this build. It requires a registered Discord app, OAuth permission, and a stable recipient ID; personal-account UI automation is intentionally blocked.",
+                supported: false);
+        }
+
+        return Result(false, "That service page is not supported yet.", supported: false);
+    }
+
+    private Dictionary<string, object> OpenCamera()
+    {
+        var resolution = _apps.Resolve("Camera", refresh: true);
+        var opened = resolution.Status == AppResolutionStatus.Found
+            && _apps.TryLaunch(resolution.Best, out _);
+        if (!opened)
+            opened = TryStart("microsoft.windows.camera:");
+        if (!opened)
+        {
+            return Logged(
+                "open_camera",
+                "",
+                false,
+                "Windows Camera could not be opened. Check that the Camera app is installed and camera access is enabled under Windows Settings > Privacy & security > Camera.",
+                supported: false,
+                extras: new() { ["settings_uri"] = "ms-settings:privacy-webcam" });
+        }
+
+        return Logged(
+            "open_camera",
+            "Windows Camera",
+            true,
+            "Opened Windows Camera.",
+            extras: new() { ["automatic_capture"] = true });
+    }
+
+    public Dictionary<string, object> OpenCameraFromSettings() => OpenCamera();
+
+    private Dictionary<string, object> TakeScreenshot()
+    {
+        var bounds = SystemInformation.VirtualScreen;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return Logged("take_screenshot", "", false, "The screen could not be captured.", supported: false);
+
+        var folder = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            QlooProduct.Name,
+            "Screenshots");
+        Directory.CreateDirectory(folder);
+        var path = Path.Combine(folder, $"screenshot-{DateTime.Now:yyyyMMdd-HHmmss}.png");
+
+        using var bitmap = new Bitmap(bounds.Width, bounds.Height);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size);
+        bitmap.Save(path, ImageFormat.Png);
+        return Logged(
+            "take_screenshot",
+            path,
+            true,
+            "Screenshot saved.",
+            extras: new() { ["path"] = path });
+    }
+
+    private async Task<Dictionary<string, object>> InspectScreenAsync(
+        string request, CancellationToken token, string screenContextId = null, bool retainForSession = true)
+    {
+        try
+        {
+            var analysis = retainForSession
+                ? await _screenGuidance.InspectSessionAsync(request, screenContextId, token)
+                : null;
+            var guidance = retainForSession ? analysis.Guidance : await _screenGuidance.InspectAsync(request, token);
+            return Logged(
+                "inspect_screen",
+                Limit(request, 180),
+                true,
+                guidance,
+                extras: new()
+                {
+                    ["guidance"] = guidance,
+                    ["capture_persisted"] = false,
+                    ["capture_scope"] = analysis?.Reused == true ? "previous approved screen image" : "one approved screen image",
+                    ["screen_context_id"] = analysis?.ContextId ?? "",
+                    ["screen_captured_utc"] = analysis?.CapturedUtc.ToString("O") ?? "",
+                    ["screen_reused"] = analysis?.Reused == true,
+                    ["automation_performed"] = false,
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, "Screen guidance failed");
+            return Logged(
+                "inspect_screen",
+                Limit(request, 180),
+                false,
+                $"I could not analyze the approved screen capture: {ex.Message}",
+                supported: false,
+                extras: new() { ["capture_persisted"] = false });
+        }
+    }
+
+    public Task<Dictionary<string, object>> InspectScreenFromSettingsAsync(
+        string request,
+        CancellationToken token) =>
+        InspectScreenAsync(request, token, retainForSession: false);
+
+    private async Task<Dictionary<string, object>> TakePhotoAsync(CancellationToken token)
+    {
+        var result = await _webcam.CapturePhotoAsync(token);
+        if (!result.Success)
+        {
+            Models.KeyboardWtfState.SetUi(Models.VoiceUiPhase.Error, "Camera unavailable", result.Message);
+            return Logged(
+                "take_photo",
+                "",
+                false,
+                result.Message,
+                supported: false,
+                extras: new()
+                {
+                    ["automatic_capture"] = true,
+                    ["photo_saved"] = false,
+                    ["settings_uri"] = "ms-settings:privacy-webcam",
+                });
+        }
+
+        return Logged(
+            "take_photo",
+            result.Path,
+            true,
+            result.Message,
+            extras: new()
+            {
+                ["automatic_capture"] = true,
+                ["photo_saved"] = true,
+                ["path"] = result.Path,
+                ["camera_index"] = result.CameraIndex,
+                ["backend"] = result.Backend,
+            });
+    }
+
+    public Task<Dictionary<string, object>> CapturePhotoFromSettingsAsync(CancellationToken token) =>
+        TakePhotoAsync(token);
+
+    private Dictionary<string, object> VirtualDesktopAction(string action, CancellationToken token)
+    {
+        var normalized = NormalizeWords(action);
+        var key = VirtualDesktopKeyForAction(normalized);
+        if (key == 0)
+            return Result(false, "Supported virtual desktop actions are create, next, previous, and close.", supported: false);
+
+        SendChord([0x5B, 0x11, key], token);
+        var message = key switch
+        {
+            0x44 => "Requested a new virtual desktop.",
+            0x27 => "Requested the next virtual desktop.",
+            0x25 => "Requested the previous virtual desktop.",
+            0x73 => "Requested closing the current virtual desktop.",
+            _ => "Virtual desktop shortcut sent.",
+        };
+        return Logged(
+            "virtual_desktop_action",
+            normalized,
+            true,
+            message,
+            extras: new() { ["shortcut_sent"] = true, ["verified_state"] = false });
+    }
+
+    public static byte VirtualDesktopKeyForAction(string action)
+    {
+        return NormalizeWords(action) switch
+        {
+            "create" or "new" or "new desktop" or "create desktop" or "create new desktop" or "create a new desktop" => (byte)0x44,
+            "next" or "next desktop" or "switch next" or "switch to next desktop" or "move to next desktop" => (byte)0x27,
+            "previous" or "previous desktop" or "switch previous" or "switch to previous desktop" => (byte)0x25,
+            "close" or "close desktop" or "close current desktop" => (byte)0x73,
+            _ => (byte)0,
+        };
+    }
+
+    private Dictionary<string, object> WindowsRecordingAction(string action, CancellationToken token)
+    {
+        var normalized = NormalizeWords(action);
+        var shortcut = WindowsRecordingShortcutForAction(normalized);
+        if (shortcut == null)
+        {
+            return Result(
+                false,
+                "Supported recording actions are start, stop, toggle, open Game Bar, and select a recording region.",
+                supported: false);
+        }
+
+        SendChord(shortcut, token);
+        var regionCapture = shortcut.SequenceEqual(new byte[] { 0x5B, 0x10, 0x52 });
+        var message = regionCapture
+            ? "Opened the Windows screen-region recording picker. Windows controls the selected area and save result."
+            : normalized is "open" or "open game bar" or "game bar"
+                ? "Opened Xbox Game Bar."
+                : "Recording shortcut sent. Xbox Game Bar controls whether recording actually starts or stops.";
+        return Logged(
+            "windows_recording_action",
+            normalized,
+            true,
+            message,
+            extras: new()
+            {
+                ["shortcut_sent"] = true,
+                ["verified_recording_state"] = false,
+                ["shortcut"] = regionCapture ? "Win+Shift+R" : shortcut.Length == 2 ? "Win+G" : "Win+Alt+R",
+            });
+    }
+
+    public static byte[] WindowsRecordingShortcutForAction(string action)
+    {
+        return NormalizeWords(action) switch
+        {
+            "start" or "stop" or "toggle" or "record" or "start recording" or "stop recording"
+                or "toggle recording" or "start screen recording" or "record my screen"
+                or "start windows recording" or "use game bar recording" => [0x5B, 0x12, 0x52],
+            "open" or "open game bar" or "game bar" => [0x5B, 0x47],
+            "region" or "record region" or "select region" or "record screen region"
+                or "snipping tool recording" => [0x5B, 0x10, 0x52],
+            _ => null,
+        };
+    }
+
+    private Dictionary<string, object> RememberAppAlias(string alias, string appName)
+    {
+        if (string.IsNullOrWhiteSpace(alias) || string.IsNullOrWhiteSpace(appName))
+            return Result(false, "Provide both the phrase to remember and the installed app name.", needsClarification: true);
+        var resolution = _apps.Resolve(appName, refresh: true);
+        if (resolution.Status != AppResolutionStatus.Found)
+        {
+            return Result(
+                false,
+                resolution.Status == AppResolutionStatus.Ambiguous
+                    ? $"Several installed apps match {appName}. Ask the user to choose the exact app name first."
+                    : $"I could not find an installed app matching {appName}.",
+                supported: false,
+                needsClarification: resolution.Status == AppResolutionStatus.Ambiguous,
+                extras: new()
+                {
+                    ["candidates"] = resolution.Candidates.Select(candidate => candidate.Name).ToArray(),
+                });
+        }
+
+        var entry = _mappings.RememberExclusive(
+            LearnedMappingKind.App,
+            alias,
+            resolution.Best.LaunchTarget,
+            resolution.Best.Name,
+            DurablePreferenceKinds);
+        var persisted = _mappings.FindExact(LearnedMappingKind.App, alias);
+        if (!MappingRecordsMatch(entry, persisted))
+            return Result(false, "The app preference could not be read back, so I did not mark it as remembered.");
+        return Logged(
+            "remember_app_alias",
+            $"{entry.Alias} -> {entry.DisplayName}",
+            true,
+            $"I will use {entry.DisplayName} when you say {entry.Alias}.",
+            extras: new()
+            {
+                ["mapping"] = PublicMapping(persisted),
+                ["persistence_verified"] = true,
+            });
+    }
+
+    private Dictionary<string, object> RememberPathAlias(string alias, string path, string kind)
+    {
+        var expanded = ExpandPath(path);
+        var isFolder = Directory.Exists(expanded);
+        var isFile = File.Exists(expanded);
+        if (!isFolder && !isFile)
+            return Result(false, "That local file or folder does not exist.", supported: false);
+        if (isFile && SmartFileSearchService.IsRiskyFile(expanded))
+            return Result(false, "Executable, script, installer, shortcut, and registry files cannot be saved as openable aliases.", supported: false);
+        var mappingKind = NormalizeWords(kind) == "folder" || isFolder
+            ? LearnedMappingKind.Folder
+            : LearnedMappingKind.File;
+        var entry = _mappings.RememberExclusive(
+            mappingKind,
+            alias,
+            expanded,
+            Path.GetFileName(expanded.TrimEnd(Path.DirectorySeparatorChar)),
+            DurablePreferenceKinds);
+        var persisted = _mappings.FindExact(mappingKind, alias);
+        if (!MappingRecordsMatch(entry, persisted))
+            return Result(false, "The path preference could not be read back, so I did not mark it as remembered.");
+        return Logged(
+            "remember_path_alias",
+            $"{entry.Alias} -> {entry.Target}",
+            true,
+            $"Remembered {entry.Alias}.",
+            extras: new()
+            {
+                ["mapping"] = PublicMapping(persisted),
+                ["persistence_verified"] = true,
+            });
+    }
+
+    private Dictionary<string, object> RememberLinkAlias(string alias, string url)
+    {
+        if (!BrowserLauncherService.TryNormalizeUrl(url, out var normalizedUrl))
+            return Result(false, "The link mapping needs one valid web URL or hostname.", supported: false);
+        // An edit expressed without the old polite wrapper updates the same
+        // durable record that invocation resolves. Do not create two targets
+        // for one command identity or rewrite unrelated saved object words.
+        alias = FindExactSavedLink(alias)?.Alias ?? alias;
+        var canonicalUrl = normalizedUrl.AbsoluteUri;
+        var entry = _mappings.RememberExclusive(
+            LearnedMappingKind.Link,
+            alias,
+            canonicalUrl,
+            canonicalUrl,
+            DurablePreferenceKinds);
+        var persisted = _mappings.FindExact(LearnedMappingKind.Link, alias);
+        if (!MappingRecordsMatch(entry, persisted))
+            return Result(false, "The web preference could not be read back, so I did not mark it as remembered.");
+        return Logged(
+            "remember_link_alias",
+            $"{entry.Alias} -> {entry.Target}",
+            true,
+            $"Remembered the link {entry.Alias}.",
+            extras: new()
+            {
+                ["mapping"] = PublicMapping(persisted),
+                ["persistence_verified"] = true,
+            });
+    }
+
+    internal bool TryApplyDurablePreferenceFromTranscript(
+        string text,
+        out string toolName,
+        out Dictionary<string, object> result)
+    {
+        toolName = "";
+        result = null;
+        var request = Regex.Replace((text ?? "").Trim(), @"\s+", " ");
+        var linkEdit = Regex.Match(request,
+            @"^(?:please\s+)?(?:change|update|replace)\s+(?:(?:my|the)\s+)?saved\s+link\s+(?<alias>.+?)\s+(?:to|with)\s+(?<url>.+?)[.!?]*$",
+            RegexOptions.IgnoreCase);
+        if (linkEdit.Success)
+        {
+            // An explicit edit belongs to the existing Link, even if the model
+            // proposes a workflow tool. Missing/ambiguous names cannot create
+            // replacement records or remove another kind of saved object.
+            toolName = "remember_link_alias";
+            if (Regex.IsMatch(request,
+                @"\b(?:this\s+time|just\s+(?:this\s+)?once|for\s+now|temporarily|only\s+today)\b", RegexOptions.IgnoreCase))
+            {
+                result = Result(false, "A temporary instruction does not update a saved link. Nothing was changed.", supported: false);
+                return true;
+            }
+            var link = FindExactSavedLink(linkEdit.Groups["alias"].Value);
+            var destination = linkEdit.Groups["url"].Value.TrimEnd('.', '!', '?');
+            result = link == null
+                ? Result(false, "I couldn't identify one existing saved link to update. Nothing was changed.", needsClarification: true)
+                : destination.Any(char.IsWhiteSpace) || !BrowserLauncherService.TryNormalizeUrl(destination, out var url)
+                    ? Result(false, "The replacement needs one valid web URL. Nothing was changed.", supported: false)
+                    : RememberLinkAlias(link.Alias, url.AbsoluteUri);
+            return true;
+        }
+        if (TryParseTriggeredLinkPreference(request, out var triggeredAlias, out var triggeredUrl))
+        {
+            result = RememberLinkAlias(triggeredAlias, triggeredUrl);
+            toolName = "remember_link_alias";
+            return true;
+        }
+
+        if (!IsExplicitDurablePreferenceRequest(request))
+            return false;
+
+        var forget = Regex.Match(
+            request,
+            @"^(?:please\s+)?(?:forget|delete|remove|clear|stop\s+remembering)(?:\s+my|\s+the)?(?:\s+saved)?\s+(?:preference|correction|mapping)\s+(?:for|about)\s+(?<alias>.+?)[.!?]*$",
+            RegexOptions.IgnoreCase);
+        if (forget.Success)
+        {
+            var alias = CleanPreferenceAlias(forget.Groups["alias"].Value);
+            var removed = _mappings.ForgetAcrossKinds(alias, DurablePreferenceKinds);
+            result = Logged(
+                "forget_learned_mapping",
+                alias,
+                removed > 0 && !DurablePreferenceKinds.Any(kind =>
+                    _mappings.FindExact(kind, alias) != null),
+                removed > 0
+                    ? $"Forgot the saved preference for {alias}."
+                    : $"No saved preference for {alias} was found.",
+                extras: new() { ["removed_count"] = removed });
+            toolName = "forget_learned_mapping";
+            return true;
+        }
+
+        var explicitLink = Regex.Match(
+            request,
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward|remember(?:\s+that|\s+to)?))\s+(?:open|use)\s+(?<url>\S+)\s+(?:(?:when|whenever)\s+i\s+say|for)\s+(?<alias>.+?)[.!?]*$",
+            RegexOptions.IgnoreCase);
+        if (explicitLink.Success)
+        {
+            var alias = CleanPreferenceAlias(explicitLink.Groups["alias"].Value);
+            var rawUrl = explicitLink.Groups["url"].Value.TrimEnd('.', '!', '?');
+            if (!BrowserLauncherService.TryNormalizeUrl(rawUrl, out var normalizedUrl))
+                return false;
+            result = RememberLinkAlias(alias, normalizedUrl.AbsoluteUri);
+            toolName = "remember_link_alias";
+            return true;
+        }
+
+        if (TryParseWebPreference(request, out var webAlias))
+        {
+            if (!TryResolvePreferenceUrl(webAlias, out var webUrl))
+            {
+                result = Result(
+                    false,
+                    $"I need the exact website URL to remember a web preference for {webAlias}.",
+                    needsClarification: true);
+                toolName = "remember_link_alias";
+                return true;
+            }
+            result = RememberLinkAlias(webAlias, webUrl);
+            toolName = "remember_link_alias";
+            return true;
+        }
+
+        if (TryParseNativePreference(request, out var nativeAlias))
+        {
+            result = RememberAppAlias(nativeAlias, nativeAlias);
+            toolName = "remember_app_alias";
+            return true;
+        }
+
+        var browser = Regex.Match(
+            request,
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward|remember(?:\s+that)?\s+i))\s+(?:use|open\s+links\s+in)\s+(?<browser>chrome|edge|brave|firefox|opera|vivaldi|arc)(?:\s+browser)?[.!?]*$",
+            RegexOptions.IgnoreCase);
+        if (browser.Success)
+        {
+            result = SetBrowserPreference(browser.Groups["browser"].Value);
+            toolName = "set_browser_preference";
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryParseTriggeredLinkPreference(
+        string request,
+        out string alias,
+        out string url)
+    {
+        alias = "";
+        url = "";
+        if (string.IsNullOrWhiteSpace(request)
+            || Regex.IsMatch(
+                request,
+                @"\b(?:this\s+time|just\s+(?:this\s+)?once|for\s+now|temporarily|only\s+today)\b",
+                RegexOptions.IgnoreCase)
+            || !Regex.IsMatch(
+                request,
+                @"(?:\b(?:always|remember|save|persist)\b|\b(?:from\s+now\s+on|going\s+forward)\b|\b(?:create|add|set)\s+(?:a\s+)?(?:mapping|alias|preference)\b)",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        var trigger = Regex.Match(
+            request,
+            @"(?:^|\b)(?:whenever|when)\s+i\s+say\s+(?<alias>.+?)[,;:]\s*(?<action>.+)$",
+            RegexOptions.IgnoreCase);
+        if (!trigger.Success)
+            return false;
+
+        var action = trigger.Groups["action"].Value.Trim();
+        var destination = Regex.Match(
+            action,
+            "^(?:please\\s+)?(?:open|use|launch|visit|go\\s+to|navigate\\s+to)\\s+(?:exact(?:ly)?\\s+)?(?<url>[^\\s<>'\"]+)",
+            RegexOptions.IgnoreCase);
+        if (!destination.Success)
+            return false;
+
+        var remainder = action[destination.Length..];
+        if (Regex.IsMatch(
+            remainder,
+            @"(?:[,;]|\b(?:and\s+then|then|and)\b)\s*(?:please\s+)?(?:open|use|launch|start|visit|go\s+to|navigate\s+to|click|fill|type|select)\b",
+            RegexOptions.IgnoreCase))
+        {
+            // A sequence remains a workflow. This parser owns only a single
+            // durable trigger-to-destination preference.
+            return false;
+        }
+
+        alias = CleanPreferenceAlias(trigger.Groups["alias"].Value);
+        var rawUrl = destination.Groups["url"].Value.TrimEnd('.', ',', ';', '!', '?');
+        if (string.IsNullOrWhiteSpace(alias)
+            || Regex.IsMatch(alias, @"https?://", RegexOptions.IgnoreCase)
+            || !BrowserLauncherService.TryNormalizeUrl(rawUrl, out var parsed))
+        {
+            alias = "";
+            return false;
+        }
+
+        url = parsed.AbsoluteUri;
+        return true;
+    }
+
+    internal static bool TryParseSelectedLinkPreference(string text, out string alias)
+    {
+        alias = "";
+        var request = Regex.Replace((text ?? "").Trim(), @"\s+", " ")
+            .Trim(' ', '.', '!', '?');
+        if (request.Length == 0
+            || Regex.IsMatch(
+                request,
+                @"\b(?:this\s+time|just\s+(?:this\s+)?once|for\s+now|temporarily|only\s+today)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return false;
+        }
+
+        const string Selection =
+            @"(?:(?:this|that)(?:\s+(?:selected\s+)?(?:link|url|website|site|destination|text))?|(?:the\s+)?selected\s+(?:link|url|website|site|destination|text))";
+        // A complete future trigger is itself explicit persistence intent;
+        // it does not need an additional "remember this" suffix. Keep this
+        // anchored to one selected destination so multi-step routines stay routines.
+        var selectedTrigger = Regex.Match(request,
+            @"^(?:please\s+)?(?:whenever|when)\s+i\s+say\s+(?<alias>.+?)[,;:]\s*"
+            + @"(?:please\s+)?(?:open|use|launch|visit|go\s+to|navigate\s+to)\s+" + Selection
+            + @"(?:[.!?]?\s+(?:please\s+)?(?:remember|save|persist)\s+(?:this|that)(?:\s+(?:mapping|alias|preference))?)?$",
+            RegexOptions.IgnoreCase);
+        var targetFirst = Regex.Match(
+            request,
+            @"^(?:please\s+)?(?:remember|save|persist)(?:\s+that|\s+to)?\s+"
+            + @"(?:(?:open|use|launch|visit|go\s+to|navigate\s+to)\s+)?"
+            + Selection
+            + @"\s+(?:(?:whenever|when)\s+i\s+say|(?:under|as|for)\s+(?:the\s+)?(?:phrase|trigger|alias))\s+(?<alias>.+?)$",
+            RegexOptions.IgnoreCase);
+        var triggerFirst = targetFirst.Success
+            ? Match.Empty
+            : Regex.Match(
+                request,
+                @"^(?:(?:please\s+)?(?:remember|save|persist)|(?:please\s+)?(?:create|add|set)\s+(?:(?:a|an)\s+)?(?:mapping|alias|preference))"
+                + @"(?:\s+(?:this|that)(?:\s+(?:mapping|alias|preference))?)?\s*[:,-]?\s*"
+                + @"(?:whenever|when)\s+i\s+say\s+(?<alias>.+?)[,;:]\s*"
+                + @"(?:please\s+)?(?:open|use|launch|visit|go\s+to|navigate\s+to)\s+"
+                + Selection
+                + @"$",
+                RegexOptions.IgnoreCase);
+        var namedSelection = targetFirst.Success || triggerFirst.Success
+            ? Match.Empty
+            : Regex.Match(
+                request,
+                @"^(?:please\s+)?(?:remember\s+(?:this|that)|(?:remember|save|persist)\s+"
+                + @"(?:(?:this|that)(?:\s+selected)?|(?:the\s+)?selected)\s+(?:link|url|website|site|destination))"
+                + @"\s+as\s+(?<alias>.+?)$",
+                RegexOptions.IgnoreCase);
+        var match = selectedTrigger.Success ? selectedTrigger
+            : targetFirst.Success ? targetFirst : triggerFirst.Success ? triggerFirst : namedSelection;
+        if (!match.Success)
+            return false;
+
+        alias = CleanPreferenceAlias(match.Groups["alias"].Value);
+        if (string.IsNullOrWhiteSpace(alias)
+            || alias.Length > 160
+            || Regex.IsMatch(alias, @"https?://", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(alias,
+                @"(?:[,;]|\b(?:and\s+then|then|and)\b)\s*(?:please\s+)?(?:open|use|launch|start|visit|go\s+to|navigate\s+to|click|fill|type|select)\b",
+                RegexOptions.IgnoreCase))
+        {
+            alias = "";
+            return false;
+        }
+        return true;
+    }
+
+    internal sealed record SavedOpenAction(
+        string RequestedName, string ToolName, JsonElement Arguments, string CanonicalKey, bool Saved);
+
+    internal sealed record SavedOpenPlan(
+        IReadOnlyList<SavedOpenAction> Actions, IReadOnlyList<string> UnresolvedNames, int RequestedCount);
+
+    // Resolve the user's complete named set before interpreting individual
+    // model proposals. This is a transient view of the existing stores, not
+    // another persisted index. Execution remains with the tool dispatcher.
+    internal bool TryResolveSavedOpenSet(string text, out SavedOpenPlan plan)
+    {
+        plan = null;
+        var request = MatchPlainNamedOpen(text);
+        if (!request.Success) return false;
+        var items = request.Groups["items"].Value.Trim();
+        // A saved object's literal name may itself contain commas or "and".
+        // Keep its established single-action owner, and decline a larger list
+        // whose separators could split one existing saved object's name.
+        if (TryResolveSavedOpenObject(items, out var whole) && whole.Saved) return false;
+        var savedNames = _mappings.Snapshot().Select(entry => entry.Alias)
+            .Concat((_settings.Current.JarvisWorkflows ?? []).SelectMany(workflow =>
+                (workflow.Aliases ?? []).Prepend(workflow.Name)));
+        if (savedNames.Any(name =>
+        {
+            var spoken = MatchPlainNamedOpen(name);
+            var savedObject = spoken.Success ? spoken.Groups["items"].Value : name;
+            return Regex.IsMatch(savedObject, @"[,;]|\band\b", RegexOptions.IgnoreCase)
+                && ContainsPhrase(NormalizePhraseText(items), savedObject);
+        })) return false;
+
+        var requested = Regex.Split(items, @"\s*(?:,|;|\band\b)\s*", RegexOptions.IgnoreCase)
+            .Select(item => item.Trim()).Where(item => item.Length > 0).ToArray();
+        if (requested.Length is < 2 or > 16) return false;
+        var actions = new List<SavedOpenAction>();
+        var unresolved = new List<string>();
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        var hasSavedObject = false;
+        foreach (var raw in requested)
+        {
+            var repeatedOpen = MatchPlainNamedOpen(raw);
+            var item = repeatedOpen.Success ? repeatedOpen.Groups["items"].Value.Trim() : raw;
+            var normalized = NormalizePhraseText(item);
+            // Qualified page/native/browser intent and additional action
+            // clauses retain their existing owners. A closed named-open set
+            // cannot turn those clauses into missing aliases or skip them.
+            if (Regex.IsMatch(normalized,
+                    @"\b(?:then|also|instead|except|but|not|never|don't|this|that|these|those|it|them|selected|selection|workflow|routine|app|application|native|desktop|browser)\b|^(?:click|fill|type|write|submit|select|search|find|close|run|execute|change|save|remember|delete|remove|translate|copy)\b",
+                    RegexOptions.IgnoreCase)
+                || Regex.IsMatch(normalized, @"\b(?:in|using|with|through)\s+(?:chrome|edge|brave|firefox|opera|vivaldi|arc)\b")) return false;
+            if (TryResolveSavedOpenObject(item, out var action))
+            {
+                hasSavedObject |= action.Saved;
+                if (identities.Add(action.CanonicalKey)) actions.Add(action);
+            }
+            else
+            {
+                var serviceObject = Regex.Replace(normalized, @"^(?:my|the)\s+", "");
+                if (AppResolverService.IsKnownNativeAppName(item)
+                    || KnownWebApps.Keys.Any(name => serviceObject.StartsWith(name + " ", StringComparison.Ordinal))
+                    || Regex.IsMatch(item, @"https?://|\b[\p{L}\p{N}-]+\.[\p{L}\p{N}.-]+\b", RegexOptions.IgnoreCase))
+                    return false;
+                // An unknown bare product could still be an installed custom
+                // app. Retain the ordinary resolver for that mixed request;
+                // only an explicitly named saved-object reference is missing.
+                if (!Regex.IsMatch(normalized, @"\b(?:link|project|website|portal|file|folder)$")) return false;
+                unresolved.Add(item);
+            }
+        }
+        if (!hasSavedObject) return false;
+        plan = new(Array.AsReadOnly(actions.ToArray()), Array.AsReadOnly(unresolved.ToArray()), requested.Length);
+        return true;
+    }
+
+    private static Match MatchPlainNamedOpen(string text) => Regex.Match(text ?? "",
+        @"^\s*(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:open|visit|use|go\s+to)\s+(?<items>.+?)[.!?]*\s*$",
+        RegexOptions.IgnoreCase);
+
+    // A navigation-only human request cannot authorize connected data access.
+    // This is a cheap negative admission boundary, not a replacement intent router.
+    internal static bool IsOrdinaryNavigationRequest(string text)
+    {
+        if (text is null || text.Length is 0 or > 3000) return false;
+        // Focus and destination navigation can share a human request. This
+        // negative connector boundary grants no window or URL execution.
+        const string browser = @"(?:(?:the|my)\s+)?(?:chrome|edge|firefox|browser)(?:\s+(?:browser|window))?";
+        const string courtesy = @"(?:(?:please|pls)\s+|(?:can|could|would|will)\s+you\s+)*";
+        var clauses = Regex.Split(text.Trim(), @"\s*(?:,?\s+and(?:\s+then)?|,?\s+then)\s+",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (clauses.Length >= 2)
+        {
+            bool Focus(string clause) => Regex.IsMatch(clause,
+                @"^\s*" + courtesy + @"(?:bring\s+" + browser + @"\s+to\s+(?:the\s+)?(?:foreground|front)|(?:focus|activate)\s+" + browser + @"|switch\s+to\s+" + browser + @")[.!?]*\s*$",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+            if (Focus(clauses[0])) text = string.Join(" and ", clauses[1..]);
+            else if (Focus(clauses[^1])) text = string.Join(" and ", clauses[..^1]);
+        }
+        var match = MatchPlainNamedOpen(text);
+        if (!match.Success || Regex.IsMatch(text, @"\buse\b", RegexOptions.IgnoreCase)) return false;
+        var items = Regex.Replace(match.Groups["items"].Value, @"https?://[^\s,;]+", " destination ", RegexOptions.IgnoreCase);
+        return !Regex.IsMatch(items,
+            @"\b(?:check|find|search|read|summari[sz]e|tell|send|reply|draft|create|edit|delete|get|show|list|what|who|when|whether|if|emails?|messages?|threads?|conversations?|documents?|files?|issues?|pull\s+requests?|meetings?|events?|comments?|attachments?|notifications?)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    internal bool HasExactSavedOpenAuthority(string text) =>
+        FindExactSavedWorkflow(text) is { } workflow && OrderedWorkflowActions(workflow).Count > 0
+        || MatchPlainNamedOpen(text) is { Success: true } match
+            && TryResolveSavedOpenObject(match.Groups["items"].Value, out var action) && action.Saved;
+
+    private bool TryResolveSavedOpenObject(string item, out SavedOpenAction action)
+    {
+        action = null;
+        if (FindExactSavedLink(item) is { } link)
+        {
+            action = new(item, "open_url", JsonSerializer.SerializeToElement(new { url = link.Target }), OpenUrlIdentity(link.Target), true);
+            return true;
+        }
+        var candidates = new[] { item, "open " + item };
+        foreach (var kind in new[] { LearnedMappingKind.App, LearnedMappingKind.File, LearnedMappingKind.Folder })
+        {
+            var mapping = candidates.Select(name => _mappings.FindExact(kind, name)).FirstOrDefault(entry => entry != null);
+            if (mapping == null) continue;
+            var tool = kind == LearnedMappingKind.App ? "open_app" : kind == LearnedMappingKind.File ? "open_path" : "open_folder";
+            var arguments = kind == LearnedMappingKind.App
+                ? JsonSerializer.SerializeToElement(new { app_name = mapping.Alias, target_kind = "native" })
+                : kind == LearnedMappingKind.File ? JsonSerializer.SerializeToElement(new { path = mapping.Target })
+                : JsonSerializer.SerializeToElement(new { folder = mapping.Target });
+            action = new(item, tool, arguments, (kind == LearnedMappingKind.App ? "app:" : "path:") + mapping.Target.ToUpperInvariant(), true);
+            return true;
+        }
+        if (FindExactSavedWorkflow(item) is { } workflow && OrderedWorkflowActions(workflow).Count > 0)
+        {
+            action = new(item, "run_workflow", JsonSerializer.SerializeToElement(new { name = workflow.Name }), SavedWorkflowOpenIdentity(workflow), true);
+            return true;
+        }
+        if (!KnownWebApps.TryGetValue(NormalizePhraseText(item), out var url)) return false;
+        action = new(item, "open_url", JsonSerializer.SerializeToElement(new { url }), OpenUrlIdentity(url), false);
+        return true;
+    }
+
+    internal string ResolvedOpenActionIdentity(string toolName, JsonElement arguments)
+    {
+        var target = toolName switch
+        {
+            "open_app" => GetString(arguments, "app_name"), "open_url" => GetString(arguments, "url"),
+            "open_path" => GetString(arguments, "path"), "open_folder" => GetString(arguments, "folder"),
+            "run_workflow" => GetString(arguments, "name"), _ => "",
+        };
+        if (toolName == "run_workflow")
+            return FindExactSavedWorkflow(target) is { } workflow ? SavedWorkflowOpenIdentity(workflow) : null;
+        if (toolName is "open_app" or "open_url" && _mappings.FindExact(LearnedMappingKind.Link, target) is { } link)
+            return OpenUrlIdentity(link.Target);
+        if (toolName == "open_url") return OpenUrlIdentity(target);
+        if (toolName is "open_path" or "open_folder") return "path:" + target.ToUpperInvariant();
+        if (toolName == "open_app" && _mappings.FindExact(LearnedMappingKind.App, target) is { } app)
+            return "app:" + app.Target.ToUpperInvariant();
+        return null;
+    }
+
+    private static string OpenUrlIdentity(string target) => BrowserLauncherService.TryNormalizeUrl(target, out var url)
+        ? "url:" + url.AbsoluteUri : "url:" + target;
+
+    private static string SavedWorkflowOpenIdentity(JarvisWorkflowSettings workflow)
+    {
+        var actions = OrderedWorkflowActions(workflow);
+        if (actions.Count == 1 && actions[0].Kind == "url") return OpenUrlIdentity(actions[0].Target);
+        if (actions.Count == 1 && actions[0].Kind == "auto" && TryGetTypedWorkflowUrl(actions[0].Target, out var url)) return OpenUrlIdentity(url);
+        return "workflow:" + NormalizePhraseText(workflow.Name);
+    }
+
+    internal string SavedOpenRejectionDiagnostics(string userTurn, string toolName, string proposedTarget)
+    {
+        var request = MatchPlainNamedOpen(userTurn);
+        var requested = request.Success ? Regex.Split(request.Groups["items"].Value, @"\s*(?:,|;|\band\b)\s*", RegexOptions.IgnoreCase)
+            .Where(item => !string.IsNullOrWhiteSpace(item)).ToArray() : [];
+        var savedMatches = requested.Count(item => TryResolveSavedOpenObject(item, out var action) && action.Saved);
+        var proposedSaved = toolName == "run_workflow" ? FindExactSavedWorkflow(proposedTarget) != null
+            : _mappings.FindExact(LearnedMappingKind.Link, proposedTarget) != null;
+        var proposedUrl = BrowserLauncherService.TryNormalizeUrl(proposedTarget, out var parsed);
+        var urlMatches = proposedUrl ? requested.Count(item => FindExactSavedLink(item) is { } link
+            && BrowserLauncherService.TryNormalizeUrl(link.Target, out var target) && target == parsed) : 0;
+        return $"turnChars={(userTurn ?? "").Length} grammarMatched={request.Success} requestedCount={requested.Length} "
+            + $"requestedSavedMatchCount={savedMatches} proposedSavedMatch={proposedSaved} urlMatches={urlMatches} "
+            + $"reason={(proposedSaved ? "saved_identity_not_requested" : proposedUrl ? "url_not_requested" : "unresolved_identity")}";
+    }
+
+    internal bool TryResolveDurableOpenPreference(
+        string text,
+        out string toolName,
+        out JsonElement arguments)
+    {
+        toolName = "";
+        arguments = default;
+        var request = Regex.Replace((text ?? "").Trim(), @"\s+", " ");
+        var match = Regex.Match(
+            request,
+            @"^(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?<verb>open|use)\s+(?<alias>.+?)[.!?]*$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+
+        var alias = CleanPreferenceAlias(match.Groups["alias"].Value);
+        if (string.IsNullOrWhiteSpace(alias))
+            return false;
+
+        // Learned mappings may intentionally use either the named object
+        // ("portal") or the complete spoken trigger ("open portal"). Resolve
+        // both exact normalized forms, in that order, so creation and lookup
+        // share one durable command identity without introducing fuzzy action
+        // execution or a second memory system.
+        var spokenAlias = CleanPreferenceAlias(
+            $"{match.Groups["verb"].Value} {match.Groups["alias"].Value}");
+        var candidates = new[] { alias, spokenAlias }
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var link = candidates
+            .Select(FindExactSavedLink)
+            .FirstOrDefault(entry => entry != null);
+        if (link != null)
+        {
+            toolName = "open_app";
+            arguments = JsonSerializer.SerializeToElement(new
+            {
+                app_name = link.Alias,
+                target_kind = "auto",
+            });
+            return true;
+        }
+
+        var app = candidates
+            .Select(candidate => _mappings.FindExact(LearnedMappingKind.App, candidate))
+            .FirstOrDefault(entry => entry != null);
+        if (app != null)
+        {
+            toolName = "open_app";
+            arguments = JsonSerializer.SerializeToElement(new
+            {
+                // Resolve the verified learned candidate by its durable alias;
+                // its stored launch target is not a human app-search query.
+                app_name = app.Alias,
+                target_kind = "native",
+            });
+            return true;
+        }
+
+        var file = candidates
+            .Select(candidate => _mappings.FindExact(LearnedMappingKind.File, candidate))
+            .FirstOrDefault(entry => entry != null);
+        if (file != null)
+        {
+            toolName = "open_path";
+            arguments = JsonSerializer.SerializeToElement(new { path = file.Target });
+            return true;
+        }
+
+        var folder = candidates
+            .Select(candidate => _mappings.FindExact(LearnedMappingKind.Folder, candidate))
+            .FirstOrDefault(entry => entry != null);
+        if (folder != null)
+        {
+            toolName = "open_folder";
+            arguments = JsonSerializer.SerializeToElement(new { folder = folder.Target });
+            return true;
+        }
+
+        return false;
+    }
+
+    internal bool TryGetUnresolvedRequestedLinkAlias(
+        string userTurn,
+        string proposedUrl,
+        out string alias)
+    {
+        alias = "";
+        var normalizedTurn = NormalizePhraseText(userTurn);
+        var requestedLinks = _mappings.Snapshot(LearnedMappingKind.Link)
+            .Where(link => ContainsPhrase(normalizedTurn, link.Alias))
+            .ToArray();
+        if (requestedLinks.Length == 0
+            || _mappings.FindExact(LearnedMappingKind.Link, proposedUrl) != null)
+            return false;
+
+        if (!BrowserLauncherService.TryNormalizeUrl(proposedUrl, out var proposed))
+            return false;
+        if (requestedLinks.Any(link =>
+                BrowserLauncherService.TryNormalizeUrl(link.Target, out var target)
+                && Uri.Compare(proposed, target, UriComponents.HttpRequestUrl,
+                    UriFormat.Unescaped, StringComparison.OrdinalIgnoreCase) == 0)
+            || (userTurn ?? "").Contains(proposed.Host, StringComparison.OrdinalIgnoreCase)
+            || HostLabelRequestedOutsideSavedAliases(normalizedTurn, requestedLinks, proposed.Host)
+            || KnownWebApps.Any(entry =>
+                ContainsPhrase(normalizedTurn, entry.Key)
+                && BrowserLauncherService.TryNormalizeUrl(entry.Value, out var known)
+                && string.Equals(proposed.Host, known.Host, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        // The model's URL is neither an exact requested destination nor a
+        // known named service in this turn. Do not let a guessed URL stand in
+        // for a durable Link; ask for an exact alias tool call instead.
+        alias = requestedLinks.Length == 1 ? requestedLinks[0].Alias : "";
+        return true;
+    }
+
+    internal bool TryResolveRequestedSavedLinkForOpenTool(
+        string userTurn,
+        string proposedName,
+        out string alias)
+    {
+        alias = "";
+        if (TryResolveRequestedSavedLinkHomepage(userTurn, proposedName, out alias))
+            return true;
+        var turn = NormalizePhraseText(userTurn);
+        var name = NormalizePhraseText(proposedName);
+        if (turn.Length == 0 || name.Length == 0)
+            return false;
+
+        // A model can strip the spoken verb and label an exact saved Link as
+        // an app/service. Only the user's complete, unmodified alias has
+        // authority to override that model-selected tool kind. A following
+        // object modifier (especially "app") remains an explicit new target.
+        var matches = _mappings.Snapshot(LearnedMappingKind.Link)
+            .Where(link =>
+            {
+                var spoken = NormalizePhraseText(link.Alias);
+                if (spoken != name && !spoken.EndsWith(" " + name, StringComparison.Ordinal))
+                    return false;
+                var padded = " " + turn + " ";
+                var needle = " " + spoken + " ";
+                var index = padded.IndexOf(needle, StringComparison.Ordinal);
+                if (index < 0)
+                    return false;
+                var preceding = padded[..index].Trim();
+                if (preceding.Length != 0
+                    && preceding is not ("please" or "can you" or "could you" or "would you"
+                        or "can you please" or "could you please" or "would you please"
+                        or "i want to" or "i need you to")
+                    && !preceding.EndsWith(" and", StringComparison.Ordinal)
+                    && !preceding.EndsWith(" then", StringComparison.Ordinal)
+                    && !preceding.EndsWith(" also", StringComparison.Ordinal))
+                    return false;
+                var following = padded[(index + needle.Length)..].Trim();
+                return following.Length == 0
+                    || following.StartsWith("and ", StringComparison.Ordinal)
+                    || following.StartsWith("then ", StringComparison.Ordinal)
+                    || following.StartsWith("also ", StringComparison.Ordinal);
+            })
+            .Take(2)
+            .ToArray();
+        if (matches.Length != 1)
+            return false;
+        alias = matches[0].Alias;
+        return true;
+    }
+
+    private bool TryResolveRequestedSavedLinkHomepage(string userTurn, string proposedUrl, out string alias)
+    {
+        alias = "";
+        // A model-proposed generic home URL is not a user override of a saved
+        // destination on that same host. Specific URLs/pages remain untouched.
+        if (!BrowserLauncherService.TryNormalizeUrl(proposedUrl, out var proposed)
+            || proposed.AbsolutePath != "/" || proposed.Query.Length != 0 || proposed.Fragment.Length != 0
+            || Regex.IsMatch(userTurn ?? "",
+                $@"(?<![a-z0-9.-]){Regex.Escape(proposed.Host)}(?![a-z0-9.-])", RegexOptions.IgnoreCase))
+            return false;
+
+        var matches = new List<string>();
+        foreach (var link in _mappings.Snapshot(LearnedMappingKind.Link))
+        {
+            if (!BrowserLauncherService.TryNormalizeUrl(link.Target, out var saved)
+                || !string.Equals(proposed.Host, saved.Host, StringComparison.OrdinalIgnoreCase)
+                || proposed.Port != saved.Port)
+                continue;
+            var name = Regex.Replace(NormalizePhraseText(link.Alias), @"^(?:open|visit|go\s+to)\s+", "");
+            // A qualifier after the name (friends/settings/home page/etc.) is
+            // new user intent, not an unqualified invocation of the Link.
+            if (name.Length == 0 || !Regex.IsMatch(userTurn ?? "",
+                    $@"\b{Regex.Escape(name)}\s*(?=[,;.!?]|$|\b(?:and|then|also|please)\b)", RegexOptions.IgnoreCase)
+                || !TryResolveNamedSavedLinkInCompoundOpen(userTurn, name, out var requestedAlias)
+                || !string.Equals(requestedAlias, link.Alias, StringComparison.OrdinalIgnoreCase))
+                continue;
+            matches.Add(link.Alias);
+        }
+        if (matches.Count != 1) return false;
+        alias = matches[0];
+        return true;
+    }
+
+    internal bool TryResolveNamedSavedLinkInCompoundOpen(
+        string userTurn, string proposedName, out string alias,
+        string proposedPage = null)
+    {
+        alias = "";
+        var turn = NormalizePhraseText(userTurn);
+        var name = NormalizeUnrequestedModelAppDecoration(turn, proposedName);
+        var strippedModelKind = name != NormalizePhraseText(proposedName);
+        if (name.Length == 0 || !ContainsPhrase(turn, name)
+            || !Regex.IsMatch(userTurn ?? "", @"\b(?:open|visit|go\s+to)\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", @"\b(?:don't|do\s+not|never)\s+open\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", $@"\b{Regex.Escape(name)}\.[a-z0-9-]+\b", RegexOptions.IgnoreCase)
+            || ExplicitServicePageRequested(turn, name, proposedPage)
+            || ExplicitNativeObjectRequested(turn, name))
+            return false;
+
+        // The model already identified this exact object as its tool target.
+        // Preserve the user's durable Link choice even if it marked that one
+        // target native in a larger list. Do not fuzzy-match a different Link.
+        var link = (strippedModelKind ? null : FindExactSavedLink(proposedName))
+            ?? FindExactSavedLink(name);
+        if (link == null)
+            return false;
+        alias = link.Alias;
+        return true;
+    }
+
+    internal bool TryResolveNamedSavedActionForOpenTool(
+        string userTurn, string proposedName, string proposedPage, out SavedOpenAction action)
+    {
+        action = null;
+        var turn = NormalizePhraseText(userTurn);
+        var name = NormalizeUnrequestedModelAppDecoration(turn, proposedName);
+        if (name.Length == 0 || !ContainsPhrase(turn, name)
+            || !Regex.IsMatch(userTurn ?? "", @"\b(?:open|visit|go\s+to)\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", @"\b(?:don't|do\s+not|never)\s+open\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(userTurn ?? "", $@"\b{Regex.Escape(name)}\.[a-z0-9-]+\b", RegexOptions.IgnoreCase)
+            || ExplicitServicePageRequested(turn, name, proposedPage)
+            || ExplicitNativeObjectRequested(turn, name)
+            || Regex.IsMatch(turn, $@"\b{Regex.Escape(name)}\s+(?:website|web\s+version|in\s+(?:the\s+)?browser)\b", RegexOptions.IgnoreCase))
+            return false;
+        return TryResolveSavedOpenObject(name, out action) && action.Saved;
+    }
+
+    private static string NormalizeUnrequestedModelAppDecoration(string normalizedTurn, string proposedName)
+    {
+        var name = NormalizePhraseText(proposedName);
+        // Treat app/native/desktop decorations as model wording only when
+        // the exact undecorated object occurs in this user turn. This does
+        // not infer a website, fuzzy-match a brand, or override native intent.
+        var plain = Regex.Replace(name,
+            @"^(?:native|desktop)\s+(?:(?:app|application)\s+)?|\s+(?:(?:native|desktop)\s+)?(?:app|application)$", "").Trim();
+        return plain.Length != 0 && plain != name
+            && !ContainsPhrase(normalizedTurn, name)
+            && ContainsPhrase(normalizedTurn, plain)
+                ? plain : name;
+    }
+
+    private static bool ExplicitServicePageRequested(
+        string normalizedTurn,
+        string normalizedService,
+        string proposedPage)
+    {
+        var page = NormalizePhraseText(proposedPage);
+        if (page.Length == 0)
+            return false;
+        var servicePattern = Regex.Escape(normalizedService);
+        var pagePattern = page == "home"
+            ? @"home(?:\s*page)?"
+            : Regex.Escape(page) + @"(?:\s+page)?";
+        // Only a modifier beside this service is authoritative. A page named
+        // for another item in the compound request must not defeat its Link.
+        return Regex.IsMatch(normalizedTurn,
+            $@"\b{servicePattern}(?:'s)?\b(?:\s+(?:on|the|to|its|in|at|my)){{0,3}}\s+{pagePattern}\b"
+            + $@"|\b{pagePattern}\s+(?:on|in|at|of|for)\s+(?:the\s+)?{servicePattern}\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static bool HostLabelRequestedOutsideSavedAliases(
+        string normalizedTurn,
+        IReadOnlyList<LearnedMappingEntry> requestedLinks,
+        string host)
+    {
+        var remaining = $" {normalizedTurn} ";
+        foreach (var link in requestedLinks.OrderByDescending(entry => entry.Alias.Length))
+            remaining = remaining.Replace(
+                $" {NormalizePhraseText(link.Alias)} ", " ", StringComparison.OrdinalIgnoreCase);
+        var labels = (host ?? "").Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var domainIndex = labels.Length - 2;
+        if (domainIndex > 0 && labels[domainIndex] is "co" or "com" or "org" or "net" or "gov" or "ac")
+            domainIndex--;
+        var label = domainIndex >= 0 ? labels[domainIndex] : "";
+        return !string.IsNullOrWhiteSpace(label)
+            && ContainsPhrase(NormalizeWords(remaining), label);
+    }
+
+    internal static bool IsExplicitDurablePreferenceRequest(string text)
+    {
+        var request = (text ?? "").Trim();
+        if (request.Length == 0
+            || Regex.IsMatch(
+                request,
+                @"\b(?:this\s+time|just\s+(?:this\s+)?once|for\s+now|temporarily|only\s+today)\b",
+                RegexOptions.IgnoreCase))
+            return false;
+        return Regex.IsMatch(
+            request,
+            @"\b(?:always|from\s+now\s+on|going\s+forward|remember\s+(?:that|to)|(?:forget|delete|remove|clear)\s+(?:my\s+|the\s+)?(?:saved\s+)?(?:preference|correction|mapping)|stop\s+remembering)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private bool TryParseWebPreference(string request, out string alias)
+    {
+        alias = "";
+        var patterns = new[]
+        {
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward))\s+(?:open|use|launch)\s+(?<alias>.+?)\s+(?:on|in|using)\s+(?:the\s+)?(?:web|browser|web\s+version)(?:\s+instead)?(?:\s+from\s+now\s+on)?[.!?]*$",
+            @"^remember\s+that\s+i\s+(?:use|open)\s+(?<alias>.+?)\s+(?:on|in|using)\s+(?:the\s+)?(?:web|browser|web\s+version)[.!?]*$",
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward))\s+(?:use|open)\s+(?:the\s+)?(?:web|browser|web\s+version)(?:\s+instead)?\s+(?:for|of)\s+(?<alias>.+?)(?:\s+from\s+now\s+on)?[.!?]*$",
+            @"^(?:change|update)\s+(?:my\s+|the\s+)?(?:saved\s+)?preference\s+for\s+(?<alias>.+?)\s+to\s+(?:the\s+)?(?:web|browser|web\s+version)[.!?]*$",
+        };
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(request, pattern, RegexOptions.IgnoreCase);
+            if (!match.Success)
+                continue;
+            alias = CleanPreferenceAlias(match.Groups["alias"].Value);
+            return !string.IsNullOrWhiteSpace(alias);
+        }
+
+        if (!Regex.IsMatch(
+                request,
+                @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward))\s+(?:use|open)\s+(?:it\s+)?(?:(?:on|in)\s+)?(?:the\s+)?(?:web|browser|web\s+version)(?:\s+instead)?(?:\s+from\s+now\s+on)?[.!?]*$",
+                RegexOptions.IgnoreCase))
+            return false;
+        alias = RecentOpenTarget();
+        return !string.IsNullOrWhiteSpace(alias);
+    }
+
+    private bool TryParseNativePreference(string request, out string alias)
+    {
+        alias = "";
+        var patterns = new[]
+        {
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward))\s+(?:open|use|launch)\s+(?<alias>.+?)\s+as\s+(?:an?\s+)?(?:native\s+)?(?:app|application)(?:\s+from\s+now\s+on)?[.!?]*$",
+            @"^(?:(?:please\s+)?(?:always|from\s+now\s+on|going\s+forward))\s+(?:use|open)\s+(?:the\s+)?(?:native\s+)?(?:app|application)\s+(?:for|of)\s+(?<alias>.+?)(?:\s+from\s+now\s+on)?[.!?]*$",
+            @"^(?:change|update)\s+(?:my\s+|the\s+)?(?:saved\s+)?preference\s+for\s+(?<alias>.+?)\s+to\s+(?:the\s+)?(?:native\s+)?(?:app|application)[.!?]*$",
+        };
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(request, pattern, RegexOptions.IgnoreCase);
+            if (!match.Success)
+                continue;
+            alias = CleanPreferenceAlias(match.Groups["alias"].Value);
+            return !string.IsNullOrWhiteSpace(alias);
+        }
+        return false;
+    }
+
+    private static string CleanPreferenceAlias(string value) =>
+        Regex.Replace(
+            (value ?? "").Trim().Trim(' ', '\'', '"', '.', '!', '?'),
+            @"^(?:the\s+)",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+
+    private static bool TryResolvePreferenceUrl(string alias, out string url)
+    {
+        url = "";
+        var clean = CleanPreferenceAlias(alias);
+        if (BrowserLauncherService.TryNormalizeUrl(clean, out var absolute))
+        {
+            url = absolute.AbsoluteUri;
+            return true;
+        }
+        var normalized = NormalizeWords(clean);
+        if (KnownWebApps.TryGetValue(normalized, out url))
+            return true;
+        return ExplicitWebDestinations.TryGetValue(normalized, out url);
+    }
+
+    private Dictionary<string, object> RememberWorkflowAlias(string alias, string workflowName)
+    {
+        var workflow = FindWorkflow(workflowName);
+        if (workflow == null)
+            return Result(false, $"Workflow {workflowName} was not found.", supported: false);
+        var entry = _mappings.Remember(
+            LearnedMappingKind.Workflow,
+            alias,
+            workflow.Name,
+            workflow.Name);
+        return Logged(
+            "remember_workflow_alias",
+            $"{entry.Alias} -> {entry.Target}",
+            true,
+            $"I will use workflow {entry.Target} when you say {entry.Alias}.",
+            extras: new() { ["mapping"] = PublicMapping(entry) });
+    }
+
+    private Dictionary<string, object> ListLearnedMappings()
+    {
+        var entries = _mappings.Snapshot();
+        return Result(
+            true,
+            entries.Count == 0 ? "No learned mappings are saved." : $"Loaded {entries.Count} learned mappings.",
+            extras: new() { ["mappings"] = entries.Select(PublicMapping).ToArray() });
+    }
+
+    private Dictionary<string, object> ForgetLearnedMapping(string idOrAlias, string kind)
+    {
+        LearnedMappingKind? parsedKind = Enum.TryParse<LearnedMappingKind>(kind, true, out var value)
+            ? value
+            : null;
+        var removed = _mappings.Forget(idOrAlias, parsedKind);
+        if (!removed && (parsedKind == null || parsedKind == LearnedMappingKind.Link)
+            && FindExactSavedLink(idOrAlias) is { } link)
+            removed = _mappings.Forget(link.Id, LearnedMappingKind.Link);
+        return Logged(
+            "forget_learned_mapping",
+            idOrAlias,
+            removed,
+            removed ? "Learned mapping forgotten." : "No matching learned mapping was found.");
+    }
+
+    private Dictionary<string, object> SetBrowserPreference(string browser)
+    {
+        var normalized = BrowserLauncherService.NormalizeBrowser(browser);
+        if (!string.IsNullOrWhiteSpace(normalized) && _browsers.FindBrowserExecutable(normalized) == null)
+            return Result(false, $"{browser} is not installed, so the browser preference was not changed.", supported: false);
+        _settings.SavePreferredBrowser(normalized);
+        var persisted = _settings.ReadPersistedPreferredBrowser();
+        if (!string.Equals(normalized, persisted, StringComparison.OrdinalIgnoreCase))
+            return Result(false, "The browser preference could not be read back, so I did not confirm it.");
+        return Logged(
+            "set_browser_preference",
+            normalized,
+            true,
+            string.IsNullOrWhiteSpace(normalized)
+                ? "Future links will use the Windows default browser."
+                : $"Future links will use {browser} unless you name another browser.",
+            extras: new() { ["persistence_verified"] = true });
+    }
+
+    private Dictionary<string, object> OpenGmailDraft(string recipient, string subject, string body)
+    {
+        if (string.IsNullOrWhiteSpace(recipient))
+            return Result(false, "Who should I address the email to?", needsClarification: true);
+        if (string.IsNullOrWhiteSpace(body))
+            return Result(false, "What should the email say?", needsClarification: true);
+
+        var query = new List<string> { "view=cm", "fs=1" };
+        query.Add($"to={Uri.EscapeDataString(recipient.Trim())}");
+        if (!string.IsNullOrWhiteSpace(subject))
+            query.Add($"su={Uri.EscapeDataString(subject.Trim())}");
+        query.Add($"body={Uri.EscapeDataString(body.Trim())}");
+        ClipboardHelper.SetText(body.Trim());
+
+        var result = OpenUrl("https://mail.google.com/mail/?" + string.Join("&", query));
+        result["message"] = "Gmail draft opened. Review it before sending.";
+        result["manual_send_required"] = true;
+        return result;
+    }
+
+    private Dictionary<string, object> PrepareWhatsAppMessage(string message, string contactName, string phoneNumber)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return Result(false, "What should the WhatsApp message say?", needsClarification: true);
+
+        ClipboardHelper.SetText(message.Trim());
+        if (!string.IsNullOrWhiteSpace(phoneNumber))
+        {
+            var digits = new string(phoneNumber.Where(char.IsDigit).ToArray());
+            if (digits.Length < 7)
+                return Result(false, "That phone number does not look usable.", needsClarification: true);
+
+            var encoded = Uri.EscapeDataString(message.Trim());
+            if (!TryStart($"whatsapp://send?phone={digits}&text={encoded}"))
+                OpenUrl($"https://wa.me/{digits}?text={encoded}");
+            return Logged(
+                "prepare_whatsapp_message",
+                digits,
+                true,
+                "WhatsApp message prepared. Review it before sending.",
+                extras: new() { ["manual_send_required"] = true });
+        }
+
+        if (!TryStart("whatsapp://"))
+            OpenUrl("https://web.whatsapp.com/");
+        var contact = string.IsNullOrWhiteSpace(contactName) ? "that contact" : contactName.Trim();
+        return Logged(
+            "prepare_whatsapp_message",
+            contact,
+            false,
+            $"I cannot reliably select {contact} by name yet. I copied the message and opened WhatsApp.",
+            supported: false,
+            extras: new() { ["contact_lookup_supported"] = false });
+    }
+
+    private Dictionary<string, object> CopyText(string text) =>
+        CopyText(text, ClipboardHelper.SetText, ClipboardHelper.GetText);
+
+    internal Dictionary<string, object> CopyText(string text, Func<string, bool> write, Func<string> read)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return Result(false, "What should I copy?", needsClarification: true);
+        string originatingUserTurn;
+        lock (_pendingLock) originatingUserTurn = _latestUserTranscript;
+        long contextGeneration;
+        long attempt;
+        lock (_conversationStateLock)
+        {
+            contextGeneration = _clipboardCopyContextGeneration;
+            attempt = ++_clipboardCopyAttempt;
+        }
+        var started = Stopwatch.GetTimestamp();
+        var verified = ClipboardPayloadIsReady(write(text), text, read);
+        AppLog.Info($"Jarvis clipboard copy: characters={text.Length} verified={verified} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F0}");
+        if (!verified)
+            return Result(false, "I couldn't verify that the text reached the clipboard. Nothing was pasted.");
+        var result = Logged("copy_text", Limit(text, 120), true, "Copied to clipboard.",
+            extras: new() { ["clipboard_verified"] = true, ["character_count"] = text.Length });
+        lock (_conversationStateLock)
+        {
+            // Session cleanup and a newer successful copy cannot be undone by
+            // an older callback. Retain the full verified output, never an excerpt.
+            if (contextGeneration == _clipboardCopyContextGeneration && attempt >= _storedClipboardCopyAttempt)
+            {
+                _storedClipboardCopyAttempt = attempt;
+                _lastVerifiedClipboardCopy = new(text, originatingUserTurn, DateTimeOffset.UtcNow);
+                _lastVerifiedClipboardCopyReceipt = _lastVerifiedClipboardCopy != null ? result : null;
+            }
+        }
+        return result;
+    }
+
+    private Dictionary<string, object> CreateWorkflow(JsonElement args)
+    {
+        try
+        {
+            var workflow = _settings.SaveWorkflow(
+                GetString(args, "name"),
+                [GetString(args, "name")],
+                ParseWorkflowActions(args));
+            return Logged("create_workflow", workflow.Name, true, $"Saved workflow {workflow.Name}.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Result(false, ex.Message, needsClarification: true);
+        }
+    }
+
+    private Dictionary<string, object> RememberRoutine(JsonElement args)
+    {
+        var trigger = CleanRoutineTrigger(GetString(args, "trigger") ?? GetString(args, "name"));
+        if (string.IsNullOrWhiteSpace(trigger))
+            return Result(false, "What phrase should trigger the routine?", needsClarification: true);
+
+        return SaveVerifiedRoutine(trigger, ParseWorkflowActions(args));
+    }
+
+    private Dictionary<string, object> EditWorkflow(JsonElement args) =>
+        ApplyWorkflowEdit(
+            GetString(args, "name"),
+            GetString(args, "operation"),
+            GetString(args, "target"),
+            GetString(args, "replacement") ?? GetString(args, "new_value"));
+
+    internal bool TryEditWorkflowFromTranscript(
+        string text,
+        out Dictionary<string, object> result)
+    {
+        result = null;
+        var request = Regex.Replace((text ?? "").Trim(), @"\s+", " ")
+            .TrimEnd('.', '!', '?');
+        if (request.Length == 0)
+            return false;
+
+        var deleteWorkflow = Regex.Match(
+            request,
+            @"^(?:delete|forget)\s+(?:my\s+|the\s+)?(?:(?:workflow|routine)\s+(?<prefix>.+)|(?<suffix>.+?)\s+(?:workflow|routine))$",
+            RegexOptions.IgnoreCase);
+        if (deleteWorkflow.Success)
+        {
+            var reference = deleteWorkflow.Groups["prefix"].Success
+                ? deleteWorkflow.Groups["prefix"].Value
+                : deleteWorkflow.Groups["suffix"].Value;
+            result = DeleteWorkflow(ResolveWorkflowReference(reference));
+            return true;
+        }
+
+        var aliasEdit = Regex.Match(
+            request,
+            @"^(?<operation>add|remove|delete)\s+(?:the\s+)?alias\s+(?<target>.+?)\s+(?:to|from)\s+(?<workflow>.+)$",
+            RegexOptions.IgnoreCase);
+        if (aliasEdit.Success)
+        {
+            result = ApplyWorkflowEdit(
+                ResolveWorkflowReference(aliasEdit.Groups["workflow"].Value),
+                aliasEdit.Groups["operation"].Value.Equals("add", StringComparison.OrdinalIgnoreCase)
+                    ? "add_alias"
+                    : "remove_alias",
+                aliasEdit.Groups["target"].Value,
+                "");
+            return true;
+        }
+
+        var rename = Regex.Match(
+            request,
+            @"^rename\s+(?<workflow>.+?)\s+to\s+(?<target>.+)$",
+            RegexOptions.IgnoreCase);
+        if (rename.Success)
+        {
+            result = ApplyWorkflowEdit(
+                ResolveWorkflowReference(rename.Groups["workflow"].Value),
+                "rename",
+                rename.Groups["target"].Value,
+                "");
+            return true;
+        }
+
+        var replace = Regex.Match(
+            request,
+            @"^(?:replace|change)\s+(?<target>.+?)\s+(?:with|to)\s+(?<replacement>.+?)(?:\s+(?:in|from)\s+(?<workflow>.+))?$",
+            RegexOptions.IgnoreCase);
+        if (replace.Success)
+        {
+            var rawWorkflow = replace.Groups["workflow"].Value;
+            var workflow = ResolveWorkflowReference(rawWorkflow);
+            if (!string.IsNullOrWhiteSpace(workflow))
+            {
+                if (FindSavedWorkflow(workflow) == null
+                    && !IsExplicitWorkflowReferenceLanguage(rawWorkflow))
+                    return false;
+                result = ApplyWorkflowEdit(
+                    workflow,
+                    "replace_action",
+                    replace.Groups["target"].Value,
+                    replace.Groups["replacement"].Value);
+                return true;
+            }
+        }
+
+        var actionEdit = Regex.Match(
+            request,
+            @"^(?<operation>add|remove|delete)\s+(?<target>.+?)(?:\s+(?:to|from)\s+(?<workflow>.+))?$",
+            RegexOptions.IgnoreCase);
+        if (!actionEdit.Success)
+            return false;
+        var rawWorkflowReference = actionEdit.Groups["workflow"].Value;
+        var workflowReference = ResolveWorkflowReference(rawWorkflowReference);
+        if (string.IsNullOrWhiteSpace(workflowReference))
+            return false;
+        if (FindSavedWorkflow(workflowReference) == null
+            && !IsExplicitWorkflowReferenceLanguage(rawWorkflowReference))
+            return false;
+        result = ApplyWorkflowEdit(
+            workflowReference,
+            actionEdit.Groups["operation"].Value.Equals("add", StringComparison.OrdinalIgnoreCase)
+                ? "add_action"
+                : "remove_action",
+            actionEdit.Groups["target"].Value,
+            "");
+        return true;
+    }
+
+    private static bool IsExplicitWorkflowReferenceLanguage(string value) =>
+        Regex.IsMatch(
+            (value ?? "").Trim(),
+            @"\b(?:workflow|routine|setup)\b",
+            RegexOptions.IgnoreCase);
+
+    private Dictionary<string, object> ApplyWorkflowEdit(
+        string workflowReference,
+        string operation,
+        string target,
+        string replacement)
+    {
+        var workflow = FindSavedWorkflow(workflowReference);
+        if (workflow == null)
+            return Result(false, $"Workflow {workflowReference} was not found.", supported: false);
+
+        var previousIdentities = (workflow.Aliases ?? [])
+            .Prepend(workflow.Name)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var newName = workflow.Name;
+        var aliases = (workflow.Aliases ?? [])
+            .Prepend(workflow.Name)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var actions = OrderedWorkflowActions(workflow)
+            .Select(action => new JarvisWorkflowActionSettings
+            {
+                Kind = action.Kind,
+                Target = action.Target,
+            })
+            .ToList();
+        var normalizedOperation = NormalizeWords(
+            (operation ?? "").Replace('_', ' ').Replace('-', ' '));
+        var cleanTarget = (target ?? "").Trim().Trim(' ', '\'', '"', '.', '!', '?');
+
+        switch (normalizedOperation)
+        {
+            case "add action":
+            case "add":
+            {
+                var action = ResolveExplicitOpenAction(cleanTarget);
+                if (string.IsNullOrWhiteSpace(action.Target))
+                    return Result(false, "What should I add to the workflow?", needsClarification: true);
+                if (!actions.Any(existing => SameWorkflowAction(existing, action)))
+                    actions.Add(action);
+                break;
+            }
+            case "remove action":
+            case "remove":
+            case "delete action":
+            {
+                if (!TryFindWorkflowAction(actions, cleanTarget, out var index, out var reason))
+                    return Result(false, reason, needsClarification: true);
+                actions.RemoveAt(index);
+                if (actions.Count == 0)
+                    return Result(false, "A workflow must keep at least one action. Delete the workflow instead.", needsClarification: true);
+                break;
+            }
+            case "replace action":
+            case "replace":
+            case "change":
+            {
+                if (!TryFindWorkflowAction(actions, cleanTarget, out var index, out var reason))
+                    return Result(false, reason, needsClarification: true);
+                var action = ResolveExplicitOpenAction(replacement);
+                if (string.IsNullOrWhiteSpace(action.Target))
+                    return Result(false, "What should replace that workflow action?", needsClarification: true);
+                actions[index] = action;
+                break;
+            }
+            case "rename":
+                newName = CleanRoutineTrigger(cleanTarget);
+                if (string.IsNullOrWhiteSpace(newName))
+                    return Result(false, "What should the workflow be called?", needsClarification: true);
+                aliases.RemoveAll(alias => string.Equals(
+                    NormalizePhraseText(alias),
+                    NormalizePhraseText(workflow.Name),
+                    StringComparison.Ordinal));
+                aliases.Insert(0, newName);
+                break;
+            case "add alias":
+            {
+                var alias = CleanRoutineTrigger(cleanTarget);
+                if (string.IsNullOrWhiteSpace(alias))
+                    return Result(false, "What alias should I add?", needsClarification: true);
+                if (!aliases.Any(existing => string.Equals(
+                    NormalizePhraseText(existing),
+                    NormalizePhraseText(alias),
+                    StringComparison.Ordinal)))
+                    aliases.Add(alias);
+                break;
+            }
+            case "remove alias":
+            case "delete alias":
+            {
+                var normalized = NormalizePhraseText(cleanTarget);
+                if (string.Equals(normalized, NormalizePhraseText(workflow.Name), StringComparison.Ordinal))
+                    return Result(false, "Rename the workflow instead of removing its canonical trigger.", needsClarification: true);
+                var removed = aliases.RemoveAll(alias => string.Equals(
+                    NormalizePhraseText(alias),
+                    normalized,
+                    StringComparison.Ordinal));
+                if (removed == 0)
+                    return Result(false, $"Alias {cleanTarget} was not found.", needsClarification: true);
+                break;
+            }
+            default:
+                return Result(false, "Supported workflow edits are add, remove, replace, rename, and alias changes.", supported: false);
+        }
+
+        var unchanged = string.Equals(
+                NormalizePhraseText(newName), NormalizePhraseText(workflow.Name), StringComparison.Ordinal)
+            && aliases.Select(NormalizePhraseText).ToHashSet(StringComparer.Ordinal)
+                .SetEquals((workflow.Aliases ?? []).Prepend(workflow.Name).Select(NormalizePhraseText))
+            && actions.Count == OrderedWorkflowActions(workflow).Count
+            && actions.Zip(OrderedWorkflowActions(workflow)).All(pair => SameWorkflowAction(pair.First, pair.Second));
+        if (unchanged)
+        {
+            var existing = _settings.ReadPersistedWorkflow(workflow.Name);
+            if (!WorkflowRecordsMatch(workflow, existing))
+                return Result(false, "The workflow could not be read back, so I cannot confirm its saved state.");
+            return Result(true, $"Workflow {workflow.Name} already has that configuration; nothing changed.", extras: new()
+            {
+                ["workflow"] = PublicWorkflow(existing),
+                ["persistence_verified"] = true,
+                ["changed"] = false,
+            });
+        }
+
+        JarvisWorkflowSettings updated;
+        try
+        {
+            updated = _settings.UpdateWorkflow(
+                workflow.Name,
+                newName,
+                aliases,
+                actions);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Result(false, ex.Message, needsClarification: true);
+        }
+
+        var persisted = _settings.ReadPersistedWorkflow(updated.Name);
+        if (!WorkflowRecordsMatch(updated, persisted))
+        {
+            return Logged(
+                "edit_workflow",
+                workflow.Name,
+                false,
+                "The updated workflow could not be read back, so I did not confirm the change.");
+        }
+
+        try
+        {
+            foreach (var identity in previousIdentities)
+                _mappings.ForgetWorkflowReferences(identity);
+            foreach (var alias in persisted.Aliases.Prepend(persisted.Name)
+                .Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                _mappings.Remember(
+                    LearnedMappingKind.Workflow,
+                    alias,
+                    persisted.Name,
+                    persisted.Name);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, "Workflow alias index refresh failed after verified authoritative edit");
+        }
+
+        RememberWorkflowContext(persisted.Name);
+        return Logged(
+            "edit_workflow",
+            persisted.Name,
+            true,
+            $"Updated workflow {persisted.Name}.",
+            extras: new()
+            {
+                ["workflow"] = PublicWorkflow(persisted),
+                ["persistence_verified"] = true,
+                ["changed"] = true,
+            });
+    }
+
+    private string ResolveWorkflowReference(string value)
+    {
+        var reference = Regex.Replace((value ?? "").Trim(), @"\s+", " ")
+            .Trim(' ', '\'', '"', '.', '!', '?');
+        reference = Regex.Replace(reference, @"^(?:my|the)\s+", "", RegexOptions.IgnoreCase);
+        reference = Regex.Replace(reference, @"\s+(?:workflow|routine)$", "", RegexOptions.IgnoreCase);
+        if (string.IsNullOrWhiteSpace(reference)
+            || NormalizeWords(reference) is "that" or "this" or "it" or "workflow" or "routine" or "that workflow" or "this workflow")
+            return RecentWorkflowName();
+        return FindSavedWorkflow(reference)?.Name ?? reference;
+    }
+
+    private static bool TryFindWorkflowAction(
+        IReadOnlyList<JarvisWorkflowActionSettings> actions,
+        string query,
+        out int index,
+        out string reason)
+    {
+        index = -1;
+        reason = "";
+        var ranked = actions
+            .Select((action, actionIndex) => new
+            {
+                Index = actionIndex,
+                Score = WorkflowActionMatchScore(action, query),
+            })
+            .Where(item => item.Score >= 0.62)
+            .OrderByDescending(item => item.Score)
+            .ToArray();
+        if (ranked.Length == 0)
+        {
+            reason = $"I could not find {query} in that workflow.";
+            return false;
+        }
+        if (ranked.Length > 1
+            && ranked[0].Score < 0.92
+            && ranked[0].Score - ranked[1].Score < 0.08)
+        {
+            reason = $"More than one workflow action resembles {query}. Please name it more precisely.";
+            return false;
+        }
+        index = ranked[0].Index;
+        return true;
+    }
+
+    private static double WorkflowActionMatchScore(
+        JarvisWorkflowActionSettings action,
+        string query)
+    {
+        var terms = new List<string> { action?.Target ?? "" };
+        var address = TryGetTypedWorkflowUrl(action?.Target, out var typedUrl)
+            ? typedUrl
+            : action?.Target;
+        if (Uri.TryCreate(address, UriKind.Absolute, out var uri)
+            && uri.Scheme is "http" or "https")
+        {
+            var host = uri.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                ? uri.Host[4..]
+                : uri.Host;
+            terms.Add(host);
+            terms.Add(host.Split('.')[0]);
+            terms.AddRange(KnownWebApps
+                .Where(pair => Uri.TryCreate(pair.Value, UriKind.Absolute, out var known)
+                    && string.Equals(known.Host, uri.Host, StringComparison.OrdinalIgnoreCase))
+                .Select(pair => pair.Key));
+        }
+        return terms.Max(term => FuzzyMatcher.Score(query, term));
+    }
+
+    private static bool SameWorkflowAction(
+        JarvisWorkflowActionSettings left,
+        JarvisWorkflowActionSettings right) =>
+        string.Equals(left?.Kind, right?.Kind, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left?.Target, right?.Target, StringComparison.OrdinalIgnoreCase);
+
+    internal bool TryRememberWorkflowFromTranscript(
+        string text,
+        bool completeTurn,
+        out Dictionary<string, object> result)
+    {
+        result = null;
+        if (!TryParseExplicitWorkflow(text, completeTurn, out var trigger, out var actions))
+            return false;
+        result = SaveVerifiedRoutine(trigger, actions);
+        return true;
+    }
+
+    private Dictionary<string, object> SaveVerifiedRoutine(
+        string trigger,
+        IReadOnlyList<JarvisWorkflowActionSettings> actions)
+    {
+        trigger = CleanRoutineTrigger(trigger);
+        if (string.IsNullOrWhiteSpace(trigger))
+            return Result(false, "What phrase should trigger the routine?", needsClarification: true);
+
+        JarvisWorkflowSettings workflow;
+        try
+        {
+            workflow = _settings.SaveWorkflow(
+                trigger,
+                [trigger],
+                actions);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Result(false, ex.Message, needsClarification: true);
+        }
+
+        // The complete settings record is authoritative. The learned mapping
+        // remains a backward-compatible lookup index, not a second copy of the
+        // routine. A failure to refresh that index cannot discard a verified
+        // durable workflow object.
+        LearnedMappingEntry mapping = null;
+        try
+        {
+            mapping = _mappings.Remember(
+                LearnedMappingKind.Workflow,
+                trigger,
+                workflow.Name,
+                workflow.Name);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warning(ex, "Workflow alias index refresh failed; authoritative workflow remains saved");
+        }
+
+        var persisted = _settings.ReadPersistedWorkflow(trigger);
+        if (!WorkflowRecordsMatch(workflow, persisted))
+        {
+            return Logged(
+                "remember_routine",
+                trigger,
+                false,
+                "The complete workflow could not be read back from local storage, so I did not mark it as remembered.");
+        }
+        RememberWorkflowContext(persisted.Name);
+        return Logged(
+            "remember_routine",
+            trigger,
+            true,
+            $"Saved the routine. Say {trigger} to run it.",
+            extras: new()
+            {
+                ["workflow"] = PublicWorkflow(persisted),
+                ["mapping"] = mapping == null ? null : PublicMapping(mapping),
+                ["persistence_verified"] = true,
+            });
+    }
+
+    private bool TryParseExplicitWorkflow(
+        string text,
+        bool completeTurn,
+        out string trigger,
+        out IReadOnlyList<JarvisWorkflowActionSettings> actions)
+    {
+        trigger = "";
+        actions = Array.Empty<JarvisWorkflowActionSettings>();
+        var request = Regex.Replace((text ?? "").Trim(), @"\s+", " ");
+        if (request.Length == 0)
+            return false;
+
+        // Live input transcription arrives incrementally. Do not persist an
+        // incomplete list during a speaking pause; a terminal remember/save
+        // phrase proves the spoken mapping is complete. Local text submissions
+        // are already complete turns and can be parsed immediately.
+        if (!completeTurn && !Regex.IsMatch(
+                request,
+                @"\b(?:remember|save)\s+(?:this|that)(?:\s+(?:workflow|routine))?\s*[.!?]*$",
+                RegexOptions.IgnoreCase))
+            return false;
+
+        var match = Regex.Match(
+            request,
+            @"(?:^|\b)(?:whenever|when)\s+i\s+say\s+(?<trigger>.+?)[,;:]\s*(?<actions>.+)$",
+            RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            match = Regex.Match(
+                request,
+                @"(?:^|\b)make\s+(?<trigger>.+?)\s+mean\s+(?<actions>.+)$",
+                RegexOptions.IgnoreCase);
+        }
+        if (!match.Success)
+            return false;
+
+        trigger = CleanRoutineTrigger(match.Groups["trigger"].Value.Trim(' ', '\'', '"'));
+        var actionText = Regex.Replace(
+            match.Groups["actions"].Value,
+            @"(?:[.!?]\s*)?(?:remember|save)\s+(?:this|that)(?:\s+(?:workflow|routine))?\s*[.!?]*$",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+        if (string.IsNullOrWhiteSpace(trigger)
+            || !Regex.IsMatch(actionText, @"^(?:please\s+)?(?:open|launch|start|visit|go\s+to)\b", RegexOptions.IgnoreCase))
+            return false;
+
+        var targets = SplitExplicitOpenTargets(actionText);
+        if (targets.Count == 0 || targets.Any(SettingsService.IsUnresolvedWorkflowTarget))
+            return false;
+        actions = targets.Select(ResolveExplicitOpenAction).ToArray();
+        return actions.All(action => !string.IsNullOrWhiteSpace(action.Target));
+    }
+
+    private static IReadOnlyList<string> SplitExplicitOpenTargets(string actionText)
+    {
+        var list = Regex.Replace(
+            actionText,
+            @"^(?:please\s+)?(?:open|launch|start|visit|go\s+to)\s+",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+        list = Regex.Replace(list, @"\s+(?:and\s+then|then)\s+", ",", RegexOptions.IgnoreCase);
+        // Conjunctions are list separators even when an earlier comma is
+        // present ("open A, B and C"). Splitting only comma-free lists could
+        // persist the last two targets as one nonexistent app.
+        var parts = Regex.Split(list, @"\s+and\s+|[,;]", RegexOptions.IgnoreCase);
+        return parts
+            .Select(part => Regex.Replace(part, @"^and\s+", "", RegexOptions.IgnoreCase))
+            .Select(part => Regex.Replace(
+                part,
+                @"^(?:open|launch|start|visit|go\s+to)\s+",
+                "",
+                RegexOptions.IgnoreCase))
+            .Select(part => part.Trim().TrimEnd('.', '!', '?'))
+            .Where(part => !string.IsNullOrWhiteSpace(part))
+            .Take(24)
+            .ToArray();
+    }
+
+    private JarvisWorkflowActionSettings ResolveExplicitOpenAction(string rawTarget)
+    {
+        if (TryResolveExplicitWebNavigation(rawTarget, out var explicitWebUrl))
+            return new JarvisWorkflowActionSettings { Kind = "url", Target = explicitWebUrl };
+        var explicitNative = Regex.IsMatch(rawTarget, @"\s+(?:native\s+)?(?:app|application)$", RegexOptions.IgnoreCase);
+        var explicitWeb = Regex.IsMatch(rawTarget, @"\s+(?:website|site|web\s+page)$", RegexOptions.IgnoreCase);
+        var target = Regex.Replace(
+            rawTarget,
+            @"\s+(?:(?:native\s+)?(?:app|application)|website|site|web\s+page)$",
+            "",
+            RegexOptions.IgnoreCase).Trim();
+        if (target.StartsWith("url:", StringComparison.OrdinalIgnoreCase))
+            return TryGetTypedWorkflowUrl(target, out var typedUrl)
+                ? new JarvisWorkflowActionSettings { Kind = "url", Target = typedUrl }
+                : new JarvisWorkflowActionSettings { Kind = "url", Target = "" };
+        if (explicitNative)
+            return new JarvisWorkflowActionSettings { Kind = "app", Target = target };
+        if (Uri.TryCreate(target, UriKind.Absolute, out var uri)
+            && (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return new JarvisWorkflowActionSettings { Kind = "url", Target = uri.AbsoluteUri };
+        }
+
+        // Keep a saved Link as an alias-owned action. OpenAppAsync resolves it
+        // at execution time, so a later explicit preference correction also
+        // applies to workflows instead of freezing an older destination.
+        if (_mappings.FindExact(LearnedMappingKind.Link, target) != null)
+            return new JarvisWorkflowActionSettings { Kind = "auto", Target = target };
+
+        var normalized = NormalizeWords(target);
+        if (KnownWebApps.TryGetValue(normalized, out var knownUrl))
+            return new JarvisWorkflowActionSettings { Kind = "url", Target = knownUrl };
+        if (explicitWeb || Regex.IsMatch(target, @"^[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+(?:/.*)?$"))
+            return new JarvisWorkflowActionSettings { Kind = "url", Target = NormalizeUrl(target) };
+        if (AppResolverService.IsKnownNativeAppName(target))
+            return new JarvisWorkflowActionSettings { Kind = "app", Target = target };
+
+        var app = _apps.Resolve(target);
+        return new JarvisWorkflowActionSettings
+        {
+            Kind = app.Status == AppResolutionStatus.Found ? "app" : "auto",
+            Target = target,
+        };
+    }
+
+    internal static bool TryGetTypedWorkflowUrl(string target, out string url)
+    {
+        url = "";
+        if (string.IsNullOrWhiteSpace(target)
+            || !target.StartsWith("url:", StringComparison.OrdinalIgnoreCase)
+            || !Uri.TryCreate(target["url:".Length..].Trim(), UriKind.Absolute, out var uri)
+            || uri.Scheme is not ("http" or "https"))
+            return false;
+        url = uri.AbsoluteUri;
+        return true;
+    }
+
+    internal static bool TryResolveExplicitWebNavigation(string text, out string url)
+    {
+        url = "";
+        if (text is null || text.Length is 0 or > 3000) return false;
+        var navigation = MatchPlainNamedOpen(text);
+        var target = navigation.Success ? navigation.Groups["items"].Value : text;
+        var match = Regex.Match(target.Trim().TrimEnd('.', '!', '?'),
+            @"^(?<name>.+?)(?:'s)?\s+(?:web\s+version|website|web\s+site|site|web\s+page|(?:in|on)\s+(?:the\s+)?(?:browser|web))(?:\s+please)?$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return match.Success && TryResolvePreferenceUrl(match.Groups["name"].Value, out url);
+    }
+
+    private Dictionary<string, object> ListWorkflows() =>
+        Result(true, "Workflows loaded.", extras: new()
+        {
+            ["workflows"] = (_settings.Current.JarvisWorkflows ?? new()).Select(w => new
+            {
+                w.Name,
+                w.Version,
+                w.Aliases,
+                w.Actions,
+                w.Apps,
+                w.Urls,
+                w.Folder,
+            }).ToArray(),
+            ["built_in_examples"] = new[] { "coding mode", "study mode", "hackathon mode" },
+        });
+
+    private async Task<Dictionary<string, object>> RunWorkflowAsync(string name, CancellationToken token)
+    {
+        var workflow = FindWorkflow(name);
+        if (workflow == null)
+            return Result(false, $"Workflow {name} was not found. Create it first or use a built-in example.", supported: false);
+        // Old profiles can contain unresolved deictic placeholders from before
+        // save-time validation. They are not installed apps or fresh-selection
+        // authority. Retain storage for repair; never execute a partial routine.
+        if (OrderedWorkflowActions(workflow).Any(action => SettingsService.IsUnresolvedWorkflowTarget(action.Target)))
+            return Result(false, "This saved workflow contains an unresolved selection placeholder. Edit or resave it with an explicit destination; no action was executed.", supported: false);
+        RememberWorkflowContext(workflow.Name);
+
+        var failures = new List<string>();
+        var receipts = new List<object>();
+        var targets = new List<object>();
+        foreach (var action in OrderedWorkflowActions(workflow))
+        {
+            token.ThrowIfCancellationRequested();
+            Dictionary<string, object> result;
+            // Earlier saved workflows may encode an explicit web target as
+            // auto + "url:<address>". The target already carries its owner;
+            // do not send that string to native app search or rewrite storage.
+            var effectiveKind = action.Kind;
+            var effectiveTarget = action.Target;
+            if (effectiveKind == "auto" && TryGetTypedWorkflowUrl(effectiveTarget, out var typedUrl))
+            {
+                effectiveKind = "url";
+                effectiveTarget = typedUrl;
+            }
+            else if (effectiveKind is "auto" or "app"
+                && TryResolveExplicitWebNavigation(effectiveTarget, out var webUrl))
+            {
+                // Honor explicit web wording in legacy semantic actions without
+                // migrating or rewriting the user's saved workflow.
+                effectiveKind = "url";
+                effectiveTarget = webUrl;
+            }
+            switch (effectiveKind)
+            {
+                case "app":
+                    result = await OpenAppAsync(effectiveTarget, "native", token);
+                    break;
+                case "auto":
+                    result = await OpenAppAsync(effectiveTarget, "", token);
+                    break;
+                case "url":
+                    result = await OpenUrlAsync(NormalizeUrl(effectiveTarget), null, token);
+                    break;
+                case "folder":
+                    result = await OpenFolderAsync(effectiveTarget, "", token);
+                    break;
+                default:
+                    result = Result(false, $"Unsupported saved action type {action.Kind}.", supported: false);
+                    break;
+            }
+            var ok = Succeeded(result);
+            AttachReferentialTarget(effectiveKind switch
+            {
+                "url" => "open_url", "folder" => "open_folder", "app" or "auto" => "open_app", _ => "",
+            }, JsonSerializer.SerializeToElement(new { url = effectiveTarget, folder = effectiveTarget, app_name = effectiveTarget }), result);
+            if (result.TryGetValue("referential_target", out var target))
+                targets.Add(target);
+            var message = result.TryGetValue("message", out var detail)
+                ? detail?.ToString() ?? ""
+                : "";
+            receipts.Add(new { action.Kind, action.Target, ok, message, result });
+            if (!Succeeded(result))
+                failures.Add(string.IsNullOrWhiteSpace(message) ? $"Could not run {action.Target}." : message);
+            await Task.Delay(180, token);
+        }
+
+        return Logged(
+            "run_workflow",
+            workflow.Name,
+            failures.Count == 0,
+            failures.Count == 0
+                ? $"Started {workflow.Name}."
+                : $"Started {workflow.Name} with {failures.Count} action failure(s).",
+            extras: new()
+            {
+                ["failures"] = failures.ToArray(),
+                ["action_results"] = receipts.ToArray(),
+                ["referential_targets"] = targets.ToArray(),
+                ["workflow_version"] = workflow.Version,
+            });
+    }
+
+    private Dictionary<string, object> DeleteWorkflow(string name)
+    {
+        var learned = _mappings.FindExact(LearnedMappingKind.Workflow, name);
+        var saved = FindSavedWorkflow(learned?.Target ?? name);
+        var canonicalName = saved?.Name ?? learned?.Target ?? name;
+        var removed = _settings.DeleteWorkflow(canonicalName);
+        if (!string.Equals(
+                FuzzyMatcher.Normalize(canonicalName),
+                FuzzyMatcher.Normalize(name),
+                StringComparison.Ordinal))
+        {
+            _settings.DeleteWorkflow(name);
+        }
+        _mappings.ForgetWorkflowReferences(canonicalName);
+        _mappings.ForgetWorkflowReferences(name);
+        foreach (var alias in saved?.Aliases ?? [])
+            _mappings.ForgetWorkflowReferences(alias);
+        lock (_conversationStateLock)
+        {
+            if (string.Equals(
+                    NormalizePhraseText(_latestWorkflowName),
+                    NormalizePhraseText(canonicalName),
+                    StringComparison.Ordinal))
+            {
+                _latestWorkflowName = "";
+                _latestWorkflowAt = default;
+            }
+        }
+        return Logged("delete_workflow", name, removed, removed ? "Workflow deleted." : "Workflow not found.");
+    }
+
+    internal bool TryResolveSavedWorkflowTrigger(string utterance, out string canonicalName)
+    {
+        canonicalName = "";
+        var normalized = NormalizePhraseText(utterance);
+        if (string.IsNullOrWhiteSpace(normalized) || _settings.IsWorkflowDeleted(normalized))
+            return false;
+        var workflow = FindExactSavedWorkflow(utterance);
+        if (workflow == null || OrderedWorkflowActions(workflow).Count == 0)
+            return false;
+        canonicalName = workflow.Name;
+        RememberWorkflowContext(workflow.Name);
+        return true;
+    }
+
+    internal bool IsDeletedWorkflowTrigger(string utterance) =>
+        _settings.IsWorkflowDeleted(NormalizePhraseText(utterance));
+
+    internal static bool IsExplicitWorkflowPersistenceRequest(string text)
+    {
+        var normalized = NormalizePhraseText(text);
+        return Regex.IsMatch(normalized, @"\b(?:whenever|when) i say\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(normalized, @"\b(?:remember|save) (?:this|that)(?: as)?(?: workflow| routine)?\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(normalized, @"\bsave (?:this )?(?:workflow|routine)\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(normalized, @"\b(?:create|make|set up)\s+(?:(?:a|an|new|my)\s+)?(?:reusable\s+)?(?:workflow|routine)\b", RegexOptions.IgnoreCase)
+            || Regex.IsMatch(normalized, @"\bmake .+ mean .+", RegexOptions.IgnoreCase);
+    }
+
+    internal static string BuildSavedWorkflowPromptDigest(IEnumerable<JarvisWorkflowSettings> workflows)
+    {
+        var triggers = (workflows ?? [])
+            .Where(workflow => OrderedWorkflowActions(workflow).Count > 0)
+            .SelectMany(workflow => (workflow.Aliases ?? []).Prepend(workflow.Name))
+            .Select(NormalizePhraseText)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal)
+            .Take(24)
+            .ToArray();
+        return triggers.Length == 0
+            ? "None."
+            : string.Join(" | ", triggers.Select(trigger => $"[{Limit(trigger, 48)}]"));
+    }
+
+    private async Task<Dictionary<string, object>> RequestSensitiveActionAsync(string action, string target, CancellationToken token)
+    {
+        var normalized = NormalizeWords(action);
+        var allowed = new[]
+        {
+            "close active app", "close app", "shutdown", "restart", "sleep", "lock screen", "disable wifi",
+        };
+        if (!allowed.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+            return Result(false, "That sensitive action is not supported.", supported: false);
+        if (normalized == "close app" && string.IsNullOrWhiteSpace(target))
+            return Result(false, "Which app should I close?", needsClarification: true);
+
+        if (_settings.Current.JarvisPermissionMode == JarvisPermissionMode.AutoExecute
+            && normalized is "close active app" or "close app")
+        {
+            var result = await WindowActionAsync("close", normalized == "close app" ? target : "", token);
+            result["auto_executed"] = true;
+            return result;
+        }
+
+        var description = normalized switch
+        {
+            "close active app" => "Close the currently active app",
+            "close app" => $"Close {target}",
+            "shutdown" => "Shut down this computer",
+            "restart" => "Restart this computer",
+            "sleep" => "Put this computer to sleep",
+            "lock screen" => "Lock this computer",
+            "disable wifi" => "Disable Wi-Fi and disconnect Jarvis",
+            _ => normalized,
+        };
+
+        lock (_pendingLock)
+        {
+            _pending = new PendingJarvisAction
+            {
+                IsSensitive = true,
+                Action = normalized,
+                Target = target ?? "",
+                Description = description,
+            };
+        }
+        Models.KeyboardWtfState.SetUi(Models.VoiceUiPhase.Thinking, "Confirmation required", description);
+        _history.Add("confirmation_requested", description, true, true);
+        return Result(true, $"{description}. Ask the user to say confirm or cancel.", confirmationRequired: true,
+            extras: new() { ["description"] = description });
+    }
+
+    private static bool SameCalendarConfirmationArguments(JsonElement expected, JsonElement proposed)
+    {
+        try
+        {
+            var original = JsonNode.Parse(GetString(expected, "arguments_json"),
+                documentOptions: new JsonDocumentOptions { MaxDepth = 8 });
+            var repeated = JsonNode.Parse(GetString(proposed, "arguments_json"),
+                documentOptions: new JsonDocumentOptions { MaxDepth = 8 });
+            return original is JsonObject && repeated is JsonObject && JsonNode.DeepEquals(original, repeated);
+        }
+        catch (Exception error) when (error is JsonException or ArgumentException) { return false; }
+    }
+
+    private async Task<Dictionary<string, object>> ConfirmPendingActionAsync(CancellationToken token, string expectedPendingId = null)
+    {
+        PendingJarvisAction pending;
+        lock (_pendingLock)
+            pending = _pending;
+        if (pending == null)
+            return Result(false, "There is no pending action.", supported: false);
+        if (expectedPendingId is not null && pending.Id != expectedPendingId)
+            return Result(false, "The pending action changed. Review the current action before confirming it.", confirmationRequired: true);
+        if (pending.ConfirmedAt == null
+            || pending.ConfirmedAt < pending.RequestedAt
+            || DateTimeOffset.UtcNow - pending.ConfirmedAt > TimeSpan.FromSeconds(30))
+        {
+            return Result(false, "The user has not confirmed this action yet. Ask them to say confirm or cancel.",
+                confirmationRequired: true);
+        }
+
+        lock (_pendingLock)
+        {
+            if (!ReferenceEquals(_pending, pending))
+                return Result(false, "The pending action changed. Review the current action before confirming it.", confirmationRequired: true);
+            _pending = null;
+        }
+        if (pending.IsSensitive)
+        {
+            if (pending.Action is "close app" or "close active app")
+                return await WindowActionAsync("close", pending.Action == "close app" ? pending.Target : "", token);
+            return ExecuteSensitiveAction(pending);
+        }
+
+        _executingApprovedAction = true;
+        try
+        {
+            return await ExecuteCoreAsync(pending.ToolName, pending.Args, token);
+        }
+        finally
+        {
+            _executingApprovedAction = false;
+        }
+    }
+
+    private Dictionary<string, object> CancelPendingAction()
+    {
+        lock (_pendingLock)
+            _pending = null;
+        return Result(true, "Pending action cancelled.");
+    }
+
+    private Dictionary<string, object> ExecuteSensitiveAction(PendingJarvisAction pending)
+    {
+        switch (pending.Action)
+        {
+            case "close active app":
+            case "close app":
+                throw new InvalidOperationException("Close requests must use the verified native-window path.");
+            case "lock screen":
+                LockWorkStation();
+                return Logged("lock_screen", "", true, "Computer locked.");
+            case "shutdown":
+                Process.Start(new ProcessStartInfo { FileName = "shutdown.exe", Arguments = "/s /t 0", UseShellExecute = false });
+                return Logged("shutdown", "", true, "Shutting down.");
+            case "restart":
+                Process.Start(new ProcessStartInfo { FileName = "shutdown.exe", Arguments = "/r /t 0", UseShellExecute = false });
+                return Logged("restart", "", true, "Restarting.");
+            case "sleep":
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "rundll32.exe",
+                    Arguments = "powrprof.dll,SetSuspendState 0,1,0",
+                    UseShellExecute = false,
+                });
+                return Logged("sleep", "", true, "Going to sleep.");
+            case "disable wifi":
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netsh.exe",
+                    Arguments = "interface set interface name=\"Wi-Fi\" admin=disabled",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                return Logged("disable_wifi", "", true, "Wi-Fi disable requested.");
+            default:
+                return Result(false, "Sensitive action is no longer supported.", supported: false);
+        }
+    }
+
+    private async Task<Dictionary<string, object>> OpenUrlAsync(string url, string browser, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        // Use the same complete saved identity as the request resolver/guard.
+        // A model's harmless my/the or trigger-prefix variation must not turn
+        // an authorized Link back into a non-executable URL string.
+        var learned = FindExactSavedLink(url);
+        // Keep Link resolution observable without writing the alias or URL to
+        // a production log. This distinguishes an authoritative saved lookup from
+        // a model-supplied destination on a failing compound turn.
+        AppLog.Info(
+            $"Direct URL resolution: requestedHash={ShortOpenTargetHash(url)} " +
+            $"linkId={learned?.Id ?? "none"} " +
+            $"destinationHash={ShortOpenTargetHash(learned?.Target ?? url)}");
+        url = learned?.Target ?? url;
+        if (_browserHelper == null || !_browsers.UsesChrome(browser)
+            || !BrowserLauncherService.TryNormalizeUrl(url, out var destination)
+            || !_browserHelper.Status.Connected || !_browserHelper.Status.CommandAuthoritySupported
+            || _browserHelper.Status.WindowId is not > 0)
+            // A service worker/native host can remain connected with no Chrome
+            // window. Start the chosen/default browser before any Helper effect;
+            // an existing background Chrome window still uses the normal path.
+            return OpenUrl(url, browser);
+
+        Dictionary<string, BrowserActionReceipt> context;
+        lock (_conversationStateLock) context = _openedBrowserTabs;
+        var targetId = Guid.NewGuid().ToString("N");
+        BrowserActionReceipt receipt;
+        try
+        {
+            receipt = await _browserHelper.ExecuteAsync(new BrowserActionRequest
+            {
+                TaskId = "direct-" + targetId, Type = "open_direct_tab", Url = destination.AbsoluteUri,
+            }, token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+        catch (Exception)
+        {
+            // After dispatch the tab may exist; a shell retry could duplicate
+            // it. Report uncertainty rather than creating a hidden fallback.
+            return Result(false, "Chrome did not confirm the requested tab. It may have opened; check Chrome before retrying.", supported: false);
+        }
+        token.ThrowIfCancellationRequested();
+        if (!receipt.Ok || receipt.TabId is not > 0 || receipt.WindowId is not > 0 || string.IsNullOrWhiteSpace(receipt.SessionId))
+            return Result(false, string.IsNullOrWhiteSpace(receipt.Error) ? "Chrome returned no verified tab handle." : receipt.Error, supported: false);
+        lock (_conversationStateLock)
+        {
+            if (!ReferenceEquals(context, _openedBrowserTabs))
+                throw new OperationCanceledException("The originating conversation ended.");
+            if (context.Count >= 32) context.Remove(context.Keys.First());
+            context[targetId] = receipt;
+        }
+        var message = receipt.ForegroundConfirmed == false
+            ? $"Opened {destination.Host} in a new Chrome tab, but Chrome did not confirm that its window came to the front."
+            : $"Opened {destination.Host} in a new Chrome tab.";
+        return Logged("open_url", destination.AbsoluteUri, true, message, extras: new()
+        {
+            ["url"] = destination.AbsoluteUri,
+            ["browser"] = "chrome",
+            ["page_load_verified"] = false,
+            ["foreground_confirmed"] = receipt.ForegroundConfirmed,
+            ["referential_target"] = new Dictionary<string, object>
+            {
+                ["kind"] = "browser_tab", ["target"] = destination.AbsoluteUri, ["target_id"] = targetId,
+                ["instruction"] = "To close this tab, use browser_action action close tabs with this target_id in target_ids. Never substitute a foreground shortcut or window close.",
+            },
+        });
+    }
+
+    private static string ShortOpenTargetHash(string value) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(value ?? "")).AsSpan(0, 6));
+
+    private async Task<Dictionary<string, object>> CloseOpenedBrowserTabsAsync(JsonElement args, CancellationToken token)
+    {
+        if (NormalizeWords(GetString(args, "action")) is not ("close" or "close tab" or "close tabs")
+            || args.TryGetProperty("last_tab_count", out _)
+            || args.TryGetProperty("tab_index", out _) || args.TryGetProperty("tab_from_end", out _)
+            || args.TryGetProperty("tab_reference", out _)
+            || !args.TryGetProperty("target_ids", out var values) || values.ValueKind != JsonValueKind.Array
+            || values.GetArrayLength() is < 1 or > 32 || values.EnumerateArray().Any(value => value.ValueKind != JsonValueKind.String))
+            return Result(false, "Use close tabs with the exact target_ids from successful tab-open receipts.", supported: false);
+        var ids = values.EnumerateArray().Select(value => value.GetString()).Distinct(StringComparer.Ordinal).ToArray();
+        KeyValuePair<string, BrowserActionReceipt>[] targets;
+        Dictionary<string, BrowserActionReceipt> context;
+        lock (_conversationStateLock)
+        {
+            context = _openedBrowserTabs;
+            if (ids.Any(id => !context.ContainsKey(id)))
+                return Result(false, "One or more tab references are unknown or expired. No tab was closed.", needsClarification: true);
+            targets = ids.Select(id => KeyValuePair.Create(id, context[id])).ToArray();
+        }
+        if (_browserHelper == null) return Result(false, "The Chrome Helper is unavailable. No tab was closed.", supported: false);
+        var results = new List<object>();
+        var closed = 0;
+        var alreadyClosed = 0;
+        foreach (var (id, target) in targets)
+        {
+            token.ThrowIfCancellationRequested();
+            lock (_conversationStateLock)
+                if (!ReferenceEquals(context, _openedBrowserTabs)) throw new OperationCanceledException("The originating conversation ended.");
+            BrowserActionReceipt receipt;
+            try
+            {
+                receipt = await _browserHelper.ExecuteAsync(new BrowserActionRequest
+                {
+                    TaskId = "direct-close-" + Guid.NewGuid().ToString("N"), Type = "close_direct_tab",
+                    TabId = target.TabId, WindowId = target.WindowId, ExpectedSessionId = target.SessionId,
+                }, token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+            catch (Exception) { receipt = new() { Error = "Chrome did not verify this tab's closure." }; }
+            token.ThrowIfCancellationRequested();
+            if (receipt.Ok && (receipt.TabId != target.TabId || receipt.WindowId != target.WindowId
+                || !string.Equals(receipt.SessionId, target.SessionId, StringComparison.Ordinal)))
+                receipt = new() { Error = "Chrome's response did not match the requested tab. Closure was not verified." };
+            if (receipt.Ok)
+            {
+                if (receipt.AlreadyClosed) alreadyClosed++; else closed++;
+                lock (_conversationStateLock) context.Remove(id);
+            }
+            results.Add(new { target_id = id, ok = receipt.Ok, already_closed = receipt.AlreadyClosed, error = receipt.Error });
+        }
+        return Logged("browser_action", "close exact tab set", closed + alreadyClosed == targets.Length,
+            $"Closed {closed} requested tab(s); {alreadyClosed} were already closed; {targets.Length - closed - alreadyClosed} could not be verified.",
+            extras: new() { ["closed_count"] = closed, ["already_closed_count"] = alreadyClosed, ["target_count"] = targets.Length, ["action_results"] = results.ToArray() });
+    }
+
+    private Dictionary<string, object> OpenUrl(string url, string browser = null)
+    {
+        if (url?.StartsWith("ms-settings:", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            if (!string.IsNullOrWhiteSpace(browser))
+                return Logged("open_url", url, false, "Windows settings pages cannot be targeted to a web browser.", supported: false);
+            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+            return Logged("open_settings_page", url, true, "Opened Windows settings.");
+        }
+        var learned = FindExactSavedLink(url);
+        if (learned != null)
+            url = learned.Target;
+        var (opened, message, browserUsed) = _simpleUrlLauncher(url, browser);
+        if (!opened)
+        {
+            return Logged(
+                "open_url",
+                $"{url} browser={browser}",
+                false,
+                message,
+                supported: false,
+                extras: new()
+                {
+                    ["requested_browser"] = BrowserLauncherService.NormalizeBrowser(browser),
+                    ["fallback_used"] = false,
+                });
+        }
+        return Logged(
+            "open_url",
+            $"{url} browser={browserUsed}",
+            true,
+            message,
+            extras: new() { ["browser"] = browserUsed, ["url"] = url });
+    }
+
+    private JarvisWorkflowSettings FindWorkflow(string name)
+    {
+        var saved = FindSavedWorkflow(name);
+        if (saved != null)
+            return saved;
+        if (_settings.IsWorkflowDeleted(name))
+            return null;
+
+        var learned = _mappings.FindExact(LearnedMappingKind.Workflow, name);
+        learned ??= _mappings.Search(name, LearnedMappingKind.Workflow, 2)
+            .Select(entry => new
+            {
+                Entry = entry,
+                Score = Math.Max(
+                    FuzzyMatcher.Score(name, entry.Alias),
+                    FuzzyMatcher.Score(name, entry.DisplayName)),
+            })
+            .Where(item => item.Score >= 0.78)
+            .OrderByDescending(item => item.Score)
+            .Select(item => item.Entry)
+            .FirstOrDefault();
+        if (learned != null)
+        {
+            if (_settings.IsWorkflowDeleted(learned.Alias)
+                || _settings.IsWorkflowDeleted(learned.Target))
+                return null;
+            name = learned.Target;
+            saved = FindSavedWorkflow(name);
+            if (saved != null)
+                return saved;
+        }
+        var normalized = NormalizeWords(name);
+        if (_settings.IsWorkflowDeleted(normalized))
+            return null;
+        return BuiltInWorkflow(normalized);
+    }
+
+    // Compare complete saved references, never substrings/edit distance.
+    // Optional "my"/"the" and command courtesy do not change the object;
+    // qualifiers such as link/project/app and every name character remain.
+    // Literal aliases win; colliding destinations of the same applicable
+    // kind remain unresolved, including at the action guard.
+    internal static string NormalizeSavedCommandIdentity(string text)
+    {
+        var match = Regex.Match(text ?? "",
+            @"^\s*(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?<verb>open|visit|use|go\s+to|run|execute)\s+(?<name>.+?)[.!?]*\s*$",
+            RegexOptions.IgnoreCase);
+        var identity = NormalizePhraseText(match.Success ? match.Groups["name"].Value : text);
+        if (match.Success && match.Groups["verb"].Value.ToLowerInvariant() is "run" or "execute")
+            identity = Regex.Replace(identity, @"\s+(?:workflow|routine)$", "");
+        identity = Regex.Replace(identity, @"^(?:my|the) ", "");
+        return identity.Replace(" ", "");
+    }
+
+    private static bool HasExplicitSavedWorkflowIntent(string name) => Regex.IsMatch(name ?? "",
+        @"^\s*(?:(?:okay|ok|alright)[,\s]+)?(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:run|execute)\s+",
+        RegexOptions.IgnoreCase);
+
+    private static bool HasExplicitSavedLinkIntent(string name) =>
+        !HasExplicitSavedWorkflowIntent(name)
+        && NormalizePhraseText(name).EndsWith(" link", StringComparison.Ordinal);
+
+    private LearnedMappingEntry FindExactSavedLink(string name)
+    {
+        if (HasExplicitSavedWorkflowIntent(name)) return null;
+        var exact = _mappings.FindExact(LearnedMappingKind.Link, name)
+            ?? _mappings.FindExact(LearnedMappingKind.Link, "open " + name);
+        if (exact != null) return exact;
+        var identity = NormalizeSavedCommandIdentity(name);
+        var matches = _mappings.Snapshot(LearnedMappingKind.Link)
+            .Where(link => NormalizeSavedCommandIdentity(link.Alias) == identity).ToArray();
+        // Existing conflicting aliases must ask rather than silently picking
+        // one. A literal saved alias above retains its explicit precedence.
+        if (matches.Length == 0 || matches.Select(link => link.Target).Distinct(StringComparer.Ordinal).Count() != 1)
+            return null;
+        // A normalized reference cannot choose between a Link and a distinct
+        // valid workflow. Literal Link precedence above still protects exact
+        // saved preferences from stale workflow collisions.
+        return !HasExplicitSavedLinkIntent(name) && MatchingSavedWorkflows(identity).Any(workflow =>
+            OrderedWorkflowActions(workflow).Count > 0
+            && !OrderedWorkflowActions(workflow).Any(action => SettingsService.IsUnresolvedWorkflowTarget(action.Target))
+            && !WorkflowOpensOnlySavedUrl(workflow, matches[0].Target)) ? null : matches[0];
+    }
+
+    private JarvisWorkflowSettings FindExactSavedWorkflow(string name)
+    {
+        // A named Link request keeps its current valid Link even when an older
+        // workflow has an exact courtesy/spelling variant of the same object.
+        // Without a Link, legacy one-URL workflows remain usable by that name.
+        if (HasExplicitSavedLinkIntent(name) && FindExactSavedLink(name) != null) return null;
+        var workflows = _settings.Current.JarvisWorkflows ?? [];
+        var exact = workflows.FirstOrDefault(workflow => (workflow.Aliases ?? []).Prepend(workflow.Name)
+            .Any(alias => NormalizePhraseText(alias) == NormalizePhraseText(name)));
+        exact ??= workflows.FirstOrDefault(workflow => (workflow.Aliases ?? []).Prepend(workflow.Name)
+            .Any(alias => NormalizePhraseText(alias) == NormalizePhraseText("open " + name)));
+        if (exact != null) return exact;
+        var identity = NormalizeSavedCommandIdentity(name);
+        var matches = MatchingSavedWorkflows(identity).Take(2).ToArray();
+        return matches.Length == 1 && (HasExplicitSavedWorkflowIntent(name) || !_mappings.Snapshot(LearnedMappingKind.Link).Any(link =>
+            NormalizeSavedCommandIdentity(link.Alias) == identity
+            && !WorkflowOpensOnlySavedUrl(matches[0], link.Target))) ? matches[0] : null;
+    }
+
+    private IEnumerable<JarvisWorkflowSettings> MatchingSavedWorkflows(string identity)
+    {
+        var targets = _mappings.Snapshot(LearnedMappingKind.Workflow)
+            .Where(mapping => NormalizeSavedCommandIdentity(mapping.Alias) == identity)
+            .Select(mapping => NormalizePhraseText(mapping.Target)).ToHashSet(StringComparer.Ordinal);
+        return (_settings.Current.JarvisWorkflows ?? []).Where(workflow =>
+            (workflow.Aliases ?? []).Prepend(workflow.Name).Any(alias => NormalizeSavedCommandIdentity(alias) == identity)
+            || targets.Contains(NormalizePhraseText(workflow.Name)));
+    }
+
+    private static bool WorkflowOpensOnlySavedUrl(JarvisWorkflowSettings workflow, string target)
+    {
+        var actions = OrderedWorkflowActions(workflow);
+        if (actions.Count != 1) return false;
+        var action = actions[0];
+        var url = action.Kind == "url" ? action.Target
+            : action.Kind == "auto" && TryGetTypedWorkflowUrl(action.Target, out var typed) ? typed : null;
+        return url != null && BrowserLauncherService.TryNormalizeUrl(url, out var saved)
+            && BrowserLauncherService.TryNormalizeUrl(target, out var requested) && saved == requested;
+    }
+
+    private JarvisWorkflowSettings FindSavedWorkflow(string name)
+    {
+        var exact = FindExactSavedWorkflow(name);
+        if (exact != null) return exact;
+        var normalized = NormalizeWords(name);
+        var saved = _settings.Current.JarvisWorkflows?.FirstOrDefault(w =>
+            (w.Aliases ?? []).Prepend(w.Name).Any(alias =>
+                string.Equals(NormalizeWords(alias), normalized, StringComparison.OrdinalIgnoreCase)));
+        if (saved != null)
+            return saved;
+        var ranked = _settings.Current.JarvisWorkflows?
+            .Select(workflow => (Workflow: workflow, Score: (workflow.Aliases ?? [])
+                .Prepend(workflow.Name)
+                .Max(alias => FuzzyMatcher.Score(normalized, alias))))
+            .Where(item => item.Score >= 0.72)
+            .OrderByDescending(item => item.Score)
+            .Take(2)
+            .ToArray() ?? Array.Empty<(JarvisWorkflowSettings Workflow, double Score)>();
+        if (ranked.Length > 0)
+        {
+            var top = ranked[0];
+            var secondScore = ranked.Length > 1 ? ranked[1].Score : 0;
+            if (top.Score >= 0.9 || top.Score - secondScore >= 0.08)
+                return top.Workflow;
+        }
+        return null;
+    }
+
+    private static JarvisWorkflowSettings BuiltInWorkflow(string normalized) =>
+        normalized switch
+        {
+            "coding mode" => new JarvisWorkflowSettings
+            {
+                Name = "Coding mode",
+                Apps = "Visual Studio Code, Windows Terminal",
+                Urls = "https://github.com/, https://chatgpt.com/",
+            },
+            "study mode" => new JarvisWorkflowSettings
+            {
+                Name = "Study mode",
+                Apps = "Notepad",
+                Urls = "https://www.youtube.com/results?search_query=focus+music",
+            },
+            "hackathon mode" => new JarvisWorkflowSettings
+            {
+                Name = "Hackathon mode",
+                Apps = "Visual Studio Code, Windows Terminal",
+                Urls = "https://devpost.com/, https://github.com/, https://vercel.com/, https://chatgpt.com/",
+            },
+            _ => null,
+        };
+
+    private static IReadOnlyList<JarvisWorkflowActionSettings> OrderedWorkflowActions(
+        JarvisWorkflowSettings workflow)
+    {
+        if (workflow?.Actions is { Count: > 0 })
+            return workflow.Actions;
+        if (workflow == null)
+            return Array.Empty<JarvisWorkflowActionSettings>();
+        return SplitList(workflow.Apps)
+            .Select(target => new JarvisWorkflowActionSettings { Kind = "auto", Target = target })
+            .Concat(SplitList(workflow.Urls)
+                .Select(target => new JarvisWorkflowActionSettings { Kind = "url", Target = target }))
+            .Concat(string.IsNullOrWhiteSpace(workflow.Folder)
+                ? Array.Empty<JarvisWorkflowActionSettings>()
+                : [new JarvisWorkflowActionSettings { Kind = "folder", Target = workflow.Folder }])
+            .ToArray();
+    }
+
+    private static List<JarvisWorkflowActionSettings> ParseWorkflowActions(JsonElement args)
+    {
+        var actions = new List<JarvisWorkflowActionSettings>();
+        if (args.ValueKind == JsonValueKind.Object
+            && args.TryGetProperty("actions", out var actionArray)
+            && actionArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in actionArray.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+                actions.Add(new JarvisWorkflowActionSettings
+                {
+                    Kind = GetString(item, "kind") ?? GetString(item, "type"),
+                    Target = GetString(item, "target") ?? GetString(item, "value"),
+                });
+            }
+        }
+        if (actions.Count > 0)
+            return actions;
+        actions.AddRange(SplitList(GetString(args, "apps"))
+            .Select(target => new JarvisWorkflowActionSettings { Kind = "app", Target = target }));
+        actions.AddRange(SplitList(GetString(args, "urls"))
+            .Select(target => new JarvisWorkflowActionSettings { Kind = "url", Target = target }));
+        var folder = GetString(args, "folder");
+        if (!string.IsNullOrWhiteSpace(folder))
+            actions.Add(new JarvisWorkflowActionSettings { Kind = "folder", Target = folder });
+        return actions;
+    }
+
+    private static bool WorkflowRecordsMatch(
+        JarvisWorkflowSettings expected,
+        JarvisWorkflowSettings persisted)
+    {
+        if (expected == null || persisted == null
+            || persisted.Version != JarvisWorkflowSettings.CurrentVersion
+            || !string.Equals(
+                NormalizePhraseText(expected.Name),
+                NormalizePhraseText(persisted.Name),
+                StringComparison.Ordinal))
+            return false;
+        var expectedAliases = (expected.Aliases ?? [])
+            .Prepend(expected.Name)
+            .Select(NormalizePhraseText)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToHashSet(StringComparer.Ordinal);
+        var persistedAliases = (persisted.Aliases ?? [])
+            .Prepend(persisted.Name)
+            .Select(NormalizePhraseText)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToHashSet(StringComparer.Ordinal);
+        if (!expectedAliases.SetEquals(persistedAliases))
+            return false;
+        var expectedActions = OrderedWorkflowActions(expected);
+        var persistedActions = OrderedWorkflowActions(persisted);
+        return expectedActions.Count > 0
+            && expectedActions.Count == persistedActions.Count
+            && expectedActions.Zip(persistedActions).All(pair =>
+                string.Equals(pair.First.Kind, pair.Second.Kind, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(pair.First.Target, pair.Second.Target, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool MappingRecordsMatch(
+        LearnedMappingEntry expected,
+        LearnedMappingEntry persisted) =>
+        expected != null
+        && persisted != null
+        && expected.Kind == persisted.Kind
+        && string.Equals(
+            FuzzyMatcher.Normalize(expected.Alias),
+            FuzzyMatcher.Normalize(persisted.Alias),
+            StringComparison.Ordinal)
+        && string.Equals(expected.Target, persisted.Target, StringComparison.OrdinalIgnoreCase);
+
+    private static object PublicWorkflow(JarvisWorkflowSettings workflow) => new
+    {
+        workflow.Name,
+        workflow.Version,
+        aliases = workflow.Aliases?.ToArray() ?? Array.Empty<string>(),
+        actions = OrderedWorkflowActions(workflow)
+            .Select(action => new { action.Kind, action.Target })
+            .ToArray(),
+    };
+
+    private Dictionary<string, object> Logged(
+        string action,
+        string detail,
+        bool success,
+        string message,
+        bool supported = true,
+        Dictionary<string, object> extras = null)
+    {
+        _history.Add(action, detail, success);
+        return Result(success, message, supported: supported, extras: extras);
+    }
+
+    private static Dictionary<string, object> Result(
+        bool ok,
+        string message,
+        bool supported = true,
+        bool needsClarification = false,
+        bool confirmationRequired = false,
+        Dictionary<string, object> extras = null)
+    {
+        var result = extras ?? new Dictionary<string, object>();
+        result["ok"] = ok;
+        result["supported"] = supported;
+        result["needs_clarification"] = needsClarification;
+        result["confirmation_required"] = confirmationRequired;
+        result["message"] = message ?? "";
+        return result;
+    }
+
+    private static string GetString(JsonElement args, string name)
+    {
+        if (args.ValueKind != JsonValueKind.Object || !args.TryGetProperty(name, out var value))
+            return null;
+        return value.ValueKind == JsonValueKind.String ? value.GetString()?.Trim() : value.ToString();
+    }
+
+    private static int GetInt(JsonElement args, string name)
+    {
+        if (args.ValueKind != JsonValueKind.Object || !args.TryGetProperty(name, out var value))
+            return 0;
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+            return number;
+        return int.TryParse(value.ToString(), out number) ? number : 0;
+    }
+
+    private static string NormalizeWords(string text) =>
+        string.Join(" ", (text ?? "").Trim().ToLowerInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+    private static string CleanRoutineTrigger(string value)
+    {
+        var trigger = NormalizePhraseText(value);
+        foreach (var prefix in new[]
+        {
+            "whenever i say ", "when i say ", "remember that whenever i say ",
+            "remember whenever i say ", "remember this as ",
+        })
+        {
+            if (trigger.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                trigger = trigger[prefix.Length..].Trim();
+                break;
+            }
+        }
+        return Limit(trigger, 48);
+    }
+
+    private static string NormalizePhraseText(string text)
+    {
+        var wordsOnly = new string((text ?? "").ToLowerInvariant()
+            .Select(character => char.IsLetterOrDigit(character) || character == '\''
+                ? character
+                : ' ')
+            .ToArray());
+        return NormalizeWords(wordsOnly);
+    }
+
+    private static bool ContainsPhrase(string value, params string[] phrases)
+    {
+        var padded = $" {value} ";
+        return phrases.Any(phrase =>
+            padded.Contains($" {NormalizePhraseText(phrase)} ", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool Succeeded(Dictionary<string, object> result) =>
+        result.TryGetValue("ok", out var ok) && ok is bool success && success;
+
+    private static object PublicMapping(LearnedMappingEntry entry) => new
+    {
+        entry.Id,
+        kind = entry.Kind.ToString(),
+        entry.Alias,
+        entry.DisplayName,
+        target = entry.Kind == LearnedMappingKind.App ? entry.DisplayName : entry.Target,
+        entry.UpdatedAt,
+    };
+
+    private static bool TryStart(string fileName)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName = fileName, UseShellExecute = true });
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private static string ExpandPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return "";
+        return Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+    }
+
+    private static List<WindowInfo> EnumerateWindows()
+    {
+        var windows = new List<WindowInfo>();
+        EnumWindows((handle, _) =>
+        {
+            if (!IsWindowVisible(handle))
+                return true;
+            var title = GetWindowTitle(handle);
+            if (string.IsNullOrWhiteSpace(title))
+                return true;
+            windows.Add(new WindowInfo(handle, title, GetProcessName(handle)));
+            return true;
+        }, IntPtr.Zero);
+        return windows;
+    }
+
+    private static IntPtr FindWindowByName(string name)
+    {
+        var normalized = NormalizeWords(name);
+        return EnumerateWindows()
+            .FirstOrDefault(w => w.Title.Contains(normalized, StringComparison.OrdinalIgnoreCase)
+                || w.ProcessName.Contains(normalized, StringComparison.OrdinalIgnoreCase))
+            ?.Handle ?? IntPtr.Zero;
+    }
+
+    private static string GetWindowTitle(IntPtr handle)
+    {
+        var length = GetWindowTextLength(handle);
+        if (length <= 0)
+            return "";
+        var builder = new StringBuilder(length + 1);
+        GetWindowText(handle, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    private static string GetProcessName(IntPtr handle)
+    {
+        GetWindowThreadProcessId(handle, out var processId);
+        try { return Process.GetProcessById((int)processId).ProcessName; }
+        catch { return ""; }
+    }
+
+    private static bool IsBrowserProcess(string processName) =>
+        processName is not null
+        && new[] { "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc" }
+            .Contains(processName, StringComparer.OrdinalIgnoreCase);
+
+    private static void SendKeysOnUiThread(string keys, CancellationToken token, IntPtr expectedWindow = default)
+    {
+        var target = expectedWindow == IntPtr.Zero ? GetForegroundWindow() : expectedWindow;
+        BrowserTrustedInput.PressChordInWindow(target, token, NativeShortcutKeys(keys));
+    }
+
+    internal static ushort[] NativeShortcutKeys(string shortcut) => shortcut switch
+    {
+        "^t" => [0x11, 0x54], "^w" => [0x11, 0x57], "^+t" => [0x11, 0x10, 0x54],
+        "^r" => [0x11, 0x52], "^l" => [0x11, 0x4C], "^f" => [0x11, 0x46],
+        "^j" => [0x11, 0x4A], "^h" => [0x11, 0x48], "^c" => [0x11, 0x43], "^v" => [0x11, 0x56],
+        "%{LEFT}" => [0x12, 0x25], "%{RIGHT}" => [0x12, 0x27],
+        "{TAB}" => [0x09], "{ESC}" => [0x1B], "{UP}" => [0x26], "{DOWN}" => [0x28],
+        "{LEFT}" => [0x25], "{RIGHT}" => [0x27], "{PGUP}" => [0x21], "{PGDN}" => [0x22],
+        "{HOME}" => [0x24], "{END}" => [0x23],
+        _ => throw new InvalidOperationException("This keyboard shortcut is not supported."),
+    };
+
+    private static void PressMediaKey(byte key, int count, CancellationToken token)
+    {
+        var target = GetForegroundWindow();
+        for (var i = 0; i < count; i++)
+        {
+            BrowserTrustedInput.PressChordInWindow(target, token, key);
+        }
+    }
+
+    private static void SendChord(byte[] keys, CancellationToken token)
+    {
+        BrowserTrustedInput.PressChordInWindow(GetForegroundWindow(), token, keys.Select(key => (ushort)key).ToArray());
+    }
+
+    private List<JarvisTodo> LoadTodos()
+    {
+        try
+        {
+            if (!File.Exists(_todosPath))
+                return new List<JarvisTodo>();
+            return JsonSerializer.Deserialize<List<JarvisTodo>>(File.ReadAllText(_todosPath)) ?? new();
+        }
+        catch { return new List<JarvisTodo>(); }
+    }
+
+    private void SaveTodos(List<JarvisTodo> todos)
+    {
+        Directory.CreateDirectory(SettingsService.AppDataDir);
+        File.WriteAllText(_todosPath, JsonSerializer.Serialize(todos, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static IEnumerable<string> SplitList(string value) =>
+        (value ?? "").Split(new[] { ',', ';', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static string NormalizeUrl(string value)
+    {
+        var url = value?.Trim() ?? "";
+        if (!url.Contains("://", StringComparison.Ordinal))
+            url = "https://" + url;
+        return url;
+    }
+
+    private static string Limit(string value, int maxLength)
+    {
+        var text = value ?? "";
+        return text.Length <= maxLength ? text : text[..maxLength];
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+        _disposed = true;
+        if (_ownsTimerService)
+            _timerService.Dispose();
+        _screenGuidance.Dispose();
+    }
+
+    private sealed class PendingJarvisAction
+    {
+        public string Id { get; init; } = Guid.NewGuid().ToString("N");
+        public string ToolName { get; init; } = "";
+        public JsonElement Args { get; init; }
+        public bool IsSensitive { get; init; }
+        public string Action { get; init; } = "";
+        public string Target { get; init; } = "";
+        public string Description { get; init; } = "";
+        public DateTimeOffset RequestedAt { get; init; } = DateTimeOffset.UtcNow;
+        public DateTimeOffset? ConfirmedAt { get; set; }
+    }
+
+    private sealed class JarvisTodo
+    {
+        public string Id { get; set; } = Guid.NewGuid().ToString("N");
+        public string Text { get; set; } = "";
+        public bool Completed { get; set; }
+        public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.Now;
+    }
+
+    private sealed record WindowInfo(IntPtr Handle, string Title, string ProcessName);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attachThread, uint attachToThread, bool attach);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int command);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] private static extern bool LockWorkStation();
+}
+
+internal sealed record SelectionContext(IntPtr Handle, string ProcessName, string WindowTitle);
+internal sealed record SelectionSnapshot(
+    string Text,
+    DateTimeOffset CapturedAt,
+    IntPtr Handle,
+    string ProcessName,
+    string WindowTitle,
+    bool Truncated = false);

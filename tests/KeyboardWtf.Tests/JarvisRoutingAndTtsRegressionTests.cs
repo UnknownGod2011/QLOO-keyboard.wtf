@@ -1,0 +1,620 @@
+namespace KeyboardWtf.Tests;
+
+using System.Text.Json;
+using KeyboardWtf.Services;
+using KeyboardWtf.Services.BrowserAutomationV2;
+using Xunit;
+
+public sealed class JarvisRoutingAndTtsRegressionTests
+{
+    [Theory]
+    [InlineData("https://example.com/portal", true)]
+    [InlineData("http://localhost:8080/test", true)]
+    [InlineData("example.com", true)]
+    [InlineData("keyboardwtf.com", true)]
+    [InlineData("www.keyboardwtf.com", true)]
+    [InlineData("keyboardwtf.com/path?q=1#end", true)]
+    [InlineData("sub.example.com/path", true)]
+    [InlineData("user@example.com", false)]
+    [InlineData("C:\\Users\\Admin\\example.com", false)]
+    [InlineData("open my website please", false)]
+    [InlineData("javascript:alert(1)", false)]
+    [InlineData("not a URL", false)]
+    public void Explicit_selected_link_alias_accepts_safe_web_destinations(
+        string selected,
+        bool expected)
+    {
+        var result = new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["text"] = selected,
+        };
+
+        Assert.Equal(expected, CommandRegistry.TryGetSelectedHttpUrl(result).Length > 0);
+    }
+
+    [Fact]
+    public void Selected_hostname_is_canonicalized_before_link_persistence()
+    {
+        var result = new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["text"] = "example.com",
+        };
+
+        Assert.Equal("https://example.com/", CommandRegistry.TryGetSelectedHttpUrl(result));
+    }
+
+    [Fact]
+    public void Selected_context_copy_rejects_an_instruction_paraphrase_instead_of_mutating_the_clipboard()
+    {
+        const string request =
+            "I've selected some text. I need you to polish the English and copy the revised version to my clipboard, keeping the original meaning intact.";
+        const string selection =
+            "Yesterday the engineering team review the incident and they decides that the cache policy need clearer ownership. The change reduce duplicate work while keeping every customer-visible behavior the same.";
+        const string proposedCopy =
+            "I've selected some text. I need you to polish the English and copy the revised version to my clipboard, keeping the original meaning intact.";
+
+        Assert.True(CommandRegistry.IsSelectedContextInstructionEcho(
+            proposedCopy,
+            request,
+            selection));
+    }
+
+    [Theory]
+    [InlineData(
+        "Yesterday, the engineering team reviewed the incident and decided that the cache policy needs clearer ownership. The change reduces duplicate work while keeping every customer-visible behavior the same.",
+        "Polish the selected text and copy the result.")]
+    [InlineData(
+        "The passage argues that clearer cache ownership reduces duplicate engineering work without changing customer-visible behavior.",
+        "Analyze my selected text and copy your conclusion.")]
+    [InlineData(
+        "Bonjour, tout le monde.",
+        "Translate the selected sentence to French and copy only the translation.")]
+    public void Selected_context_copy_allows_actual_results(
+        string proposedCopy,
+        string request)
+    {
+        const string selection =
+            "Yesterday the engineering team review the incident and they decides that the cache policy need clearer ownership. The change reduce duplicate work while keeping every customer-visible behavior the same.";
+
+        Assert.False(CommandRegistry.IsSelectedContextInstructionEcho(
+            proposedCopy,
+            request,
+            selection));
+    }
+
+    [Theory]
+    [InlineData("copy_text", "Polish my selected paragraph and copy the result.", false, true)]
+    [InlineData("replace_selected_text", "Rewrite the highlighted sentence in professional English.", false, true)]
+    [InlineData("copy_text", "Polish my selected paragraph and copy the result.", true, false)]
+    [InlineData("copy_text", "Copy this final answer to my clipboard.", false, false)]
+    [InlineData("type_text", "Polish my selected paragraph and type the result.", false, false)]
+    public void Selected_context_output_mutation_requires_a_same_turn_capture(
+        string toolName,
+        string request,
+        bool hasCurrentSelectedContext,
+        bool expected)
+    {
+        Assert.Equal(
+            expected,
+            CommandRegistry.RequiresFreshSelectedContextBeforeMutation(
+                toolName,
+                request,
+                hasCurrentSelectedContext));
+    }
+
+    [Theory]
+    [InlineData("Copy the translation of my selected text you just gave me.", true, false)]
+    [InlineData("Copy the translation of my selected text you just gave me.", false, true)]
+    [InlineData("Okay now can you please copy whatever you said about my selected text to the clipboard?", true, false)]
+    [InlineData("Okay now can you please copy whatever you said about my selected text to the clipboard?", false, true)]
+    [InlineData("Translate my selected text and copy it.", true, true)]
+    [InlineData("Translate my selected text and copy it.", false, true)]
+    [InlineData("What you just said was wrong. Translate the selected text and copy the result.", true, true)]
+    [InlineData("Copy the translation of my selected text you just gave me, then rewrite it.", true, true)]
+    public void Copying_a_recent_assistant_result_does_not_recapture_an_old_selection(
+        string request,
+        bool hasRecentAssistantOutput,
+        bool expectedFreshCapture)
+    {
+        Assert.Equal(expectedFreshCapture,
+            CommandRegistry.RequiresFreshSelectedContextBeforeMutation(
+                "copy_text", request, false, hasRecentAssistantOutput));
+        Assert.True(CommandRegistry.RequiresFreshSelectedContextBeforeMutation(
+            "replace_selected_text", request, false, hasRecentAssistantOutput));
+    }
+
+    [Fact]
+    public void Prior_selection_copy_requires_output_after_that_capture_and_within_the_session_window()
+    {
+        var now = DateTime.UtcNow;
+        var captured = now.AddMinutes(-4);
+        Assert.True(GeminiLiveConversationService.IsRecentAssistantOutputAfter(
+            captured, now.AddMinutes(-3), now, TimeSpan.FromMinutes(5)));
+        Assert.False(GeminiLiveConversationService.IsRecentAssistantOutputAfter(
+            captured, captured.AddSeconds(-1), now, TimeSpan.FromMinutes(5)));
+        Assert.False(GeminiLiveConversationService.IsRecentAssistantOutputAfter(
+            now.AddMinutes(-8), now.AddMinutes(-6), now, TimeSpan.FromMinutes(5)));
+        Assert.False(GeminiLiveConversationService.IsRecentAssistantOutputAfter(
+            default, now, now, TimeSpan.FromMinutes(5)));
+    }
+
+    [Fact]
+    public void Virtual_desktop_tool_documents_only_the_directionless_switch_default()
+    {
+        var buildTools = typeof(GeminiLiveConversationService).GetMethod(
+            "BuildTools", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var tools = JsonSerializer.SerializeToElement(buildTools.Invoke(null, null));
+        var declaration = tools[0].GetProperty("functionDeclarations").EnumerateArray()
+            .Single(item => item.GetProperty("name").GetString() == "virtual_desktop_action");
+        var description = declaration.GetProperty("description").GetString();
+        Assert.Contains("explicitly asks to switch desktops without a direction", description);
+        Assert.Contains("use next", description);
+        Assert.Contains("Closing requires confirmation", description);
+        Assert.Contains("current desktop is not independently verified", description);
+    }
+
+    [Fact]
+    public void Link_alias_tool_allows_the_existing_selection_fallback()
+    {
+        var buildTools = typeof(GeminiLiveConversationService).GetMethod(
+            "BuildTools",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(buildTools);
+
+        var tools = JsonSerializer.SerializeToElement(buildTools.Invoke(null, null));
+        var declaration = tools[0]
+            .GetProperty("functionDeclarations")
+            .EnumerateArray()
+            .Single(item => item.GetProperty("name").GetString() == "remember_link_alias");
+        var parameters = declaration.GetProperty("parameters");
+        var required = parameters.GetProperty("required")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+
+        Assert.Contains("alias", required);
+        Assert.DoesNotContain("url", required);
+        Assert.True(parameters.GetProperty("properties").TryGetProperty("url", out _));
+    }
+
+    [Fact]
+    public void Live_tool_declarations_use_the_default_blocking_contract()
+    {
+        var buildTools = typeof(GeminiLiveConversationService).GetMethod(
+            "BuildTools",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(buildTools);
+
+        var declarations = JsonSerializer.SerializeToElement(buildTools.Invoke(null, null))[0]
+            .GetProperty("functionDeclarations")
+            .EnumerateArray();
+
+        Assert.All(declarations, declaration =>
+            Assert.False(declaration.TryGetProperty("behavior", out _)));
+    }
+
+    [Fact]
+    public void Deterministic_tool_failure_is_not_executed_twice_in_one_turn()
+    {
+        var guard = new ToolAttemptGuard();
+        var args = JsonSerializer.SerializeToElement(new { app_name = "missing app" });
+        guard.Record("open_app", args, new Dictionary<string, object>
+        {
+            ["ok"] = false,
+            ["supported"] = false,
+            ["message"] = "I could not find that app.",
+        });
+
+        Assert.True(guard.TryGetSuppressed("open_app", args, out var result));
+        Assert.True((bool)result["duplicate_suppressed"]);
+    }
+
+    [Fact]
+    public void Transient_tool_failure_allows_only_one_silent_retry()
+    {
+        var guard = new ToolAttemptGuard();
+        var args = JsonSerializer.SerializeToElement(new { url = "https://example.com" });
+        var transient = new Dictionary<string, object>
+        {
+            ["ok"] = false,
+            ["supported"] = true,
+            ["message"] = "The connection was interrupted.",
+        };
+        guard.Record("open_url", args, transient);
+        Assert.False(guard.TryGetSuppressed("open_url", args, out _));
+
+        guard.Record("open_url", args, transient);
+        Assert.True(guard.TryGetSuppressed("open_url", args, out _));
+    }
+
+    [Theory]
+    [InlineData("result")]
+    [InlineData("status")]
+    public void Connector_read_only_observations_refresh_within_the_same_turn(string action)
+    {
+        var guard = new ToolAttemptGuard();
+        var args = JsonSerializer.SerializeToElement(new
+        {
+            task_id = "0123456789abcdef0123456789abcdef",
+            operation_id = "abcdef0123456789abcdef0123456789",
+            action,
+        });
+
+        // A successful observation is not a completed effect. The next poll
+        // must reach the controller again to observe the worker's new state.
+        guard.Record("connector_control", args, new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["state"] = "executing",
+        });
+        Assert.False(guard.TryGetSuppressed("connector_control", args, out _));
+
+        guard.Record("connector_control", args, new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["state"] = "completed",
+            ["verified"] = true,
+        });
+        Assert.False(guard.TryGetSuppressed("connector_control", args, out _));
+
+        // State lookup must also remain fresh after an earlier failed read.
+        var failed = new Dictionary<string, object>
+        {
+            ["ok"] = false,
+            ["supported"] = false,
+            ["state"] = "failed",
+        };
+        guard.Record("connector_control", args, failed);
+        guard.Record("connector_control", args, failed);
+        Assert.False(guard.TryGetSuppressed("connector_control", args, out _));
+    }
+
+    [Theory]
+    [InlineData("connector_execute", "result")]
+    [InlineData("connector_resolve", "status")]
+    [InlineData("connector_control", "cancel")]
+    [InlineData("connector_control", "complete")]
+    [InlineData("connector_control", "change_account")]
+    [InlineData("connector_control", "RESULT")]
+    [InlineData("connector_control", "unknown")]
+    public void Connector_effects_and_unrecognized_controls_keep_exact_attempt_deduplication(string tool, string action)
+    {
+        var guard = new ToolAttemptGuard();
+        var args = JsonSerializer.SerializeToElement(new
+        {
+            task_id = "0123456789abcdef0123456789abcdef",
+            action,
+        });
+        guard.Record(tool, args, new Dictionary<string, object>
+        {
+            ["ok"] = true,
+            ["state"] = "completed",
+            ["verified"] = true,
+        });
+
+        Assert.True(guard.TryGetSuppressed(tool, args, out var repeated));
+        Assert.True((bool)repeated["duplicate_suppressed"]);
+        Assert.True((bool)repeated["verified"]);
+    }
+
+    [Fact]
+    public void Verified_first_tab_switch_receipt_is_reused_not_blocked()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "Switch to the first Chrome tab.",
+            ToolName = "browser_action",
+            Ok = true,
+            Message = "Switched to the first tab in the existing Chrome window.",
+        };
+        var now = receipt.CreatedUtc.AddSeconds(1);
+
+        Assert.True(receipt.AppliesTo("browser_action", now));
+        Assert.False(receipt.BlocksCompetingTool("browser_action", now));
+        Assert.True(receipt.BlocksCompetingTool("type_text", now));
+        Assert.True(receipt.Ok);
+        Assert.Contains("Switched", receipt.Message);
+    }
+
+    [Fact]
+    public void Verified_second_tab_switch_echo_does_not_execute_twice()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "Switch to Chrome's second tab!",
+            ToolName = "browser_action",
+            Ok = true,
+            Message = "Switched to the second tab in the existing Chrome window.",
+        };
+
+        Assert.True(receipt.IsEchoOf(
+            "switch to chrome's second tab",
+            receipt.CreatedUtc.AddSeconds(1)));
+        Assert.False(receipt.IsEchoOf(
+            "switch to chrome's third tab",
+            receipt.CreatedUtc.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void Flight_task_start_receipt_is_acknowledged_as_started()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "Find cheap Switzerland flights.",
+            ToolName = "browser_automation",
+            Ok = true,
+            Started = true,
+            TaskId = "flight-task",
+            Message = "Browser automation started in the existing Chrome session.",
+        };
+
+        Assert.True(receipt.AppliesTo(
+            "browser_automation",
+            receipt.CreatedUtc.AddSeconds(1)));
+        Assert.True(receipt.Started);
+        Assert.Equal("flight-task", receipt.TaskId);
+        Assert.Contains("started", receipt.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("browser_action")]
+    [InlineData("browser_automation")]
+    [InlineData("browser_automation_control")]
+    public async Task Every_pre_route_receipt_representation_has_one_completion_owner(string tool)
+    {
+        var commands = new CommandRegistry(null, null, null, null, null);
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "test request", ToolName = tool, Ok = true,
+            Started = tool == "browser_automation", TaskId = "task", Message = "The verified result.",
+        };
+        typeof(CommandRegistry).GetField("_browserPreRouteReceipt", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(commands, receipt);
+        var first = await commands.ExecuteJarvisToolAsync(tool, JsonSerializer.SerializeToElement(new { }), CancellationToken.None);
+        var repeated = await commands.ExecuteJarvisToolAsync(tool, JsonSerializer.SerializeToElement(new { }), CancellationToken.None);
+        Assert.Equal("The verified result.", first["message"]);
+        Assert.Equal("The verified result.", repeated["message"]);
+        Assert.Equal(true, repeated["duplicate_suppressed"]);
+        if (tool == "browser_automation")
+        {
+            Assert.Equal("task", repeated["task_id"]);
+            Assert.Equal(true, repeated["started"]);
+            Assert.Contains("not current task progress", repeated["lifecycle_note"].ToString());
+            Assert.False(repeated.ContainsKey("state"));
+        }
+    }
+
+    [Fact]
+    public void Durable_workflow_receipt_blocks_reinterpretation_but_accepts_its_one_tool_result()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "potato patato",
+            ToolName = "run_workflow",
+            Ok = true,
+            Message = "Started potato patato.",
+            Result = new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["message"] = "Started potato patato.",
+            },
+        };
+        var now = receipt.CreatedUtc.AddSeconds(20);
+
+        Assert.True(receipt.AppliesTo("run_workflow", now));
+        Assert.False(receipt.BlocksCompetingTool("run_workflow", now));
+        Assert.True(receipt.BlocksCompetingTool("browser_automation", now));
+        Assert.True(receipt.BlocksCompetingTool("open_url", now));
+    }
+
+    [Fact]
+    public void Authoritative_pre_route_receipt_has_one_completion_owner_for_the_whole_turn()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "Open my website",
+            ToolName = "open_app",
+            Ok = true,
+            Message = "Opened the saved website.",
+            Result = new Dictionary<string, object>
+            {
+                ["ok"] = true,
+                ["message"] = "Opened the saved website.",
+            },
+            Authoritative = true,
+        };
+
+        Assert.True(receipt.TryAcknowledgeOnce());
+        Assert.False(receipt.TryAcknowledgeOnce());
+        Assert.True(receipt.BlocksCompetingTool(
+            "open_url",
+            receipt.CreatedUtc.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void Stale_receipt_cannot_contaminate_the_next_turn()
+    {
+        var receipt = new BrowserPreRouteReceipt
+        {
+            UserTurn = "Fill this form.",
+            ToolName = "browser_automation",
+            Ok = true,
+            Started = true,
+        };
+
+        var later = receipt.CreatedUtc.AddSeconds(13);
+        Assert.False(receipt.AppliesTo("browser_automation", later));
+        Assert.False(receipt.BlocksCompetingTool("type_text", later));
+    }
+
+    [Fact]
+    public void Completed_and_cancelled_lifecycle_events_are_terminal_not_background_work()
+    {
+        foreach (var state in new[] { "Completed", "Cancelled", "Failed" })
+        {
+            var text = GeminiLiveConversationService.BuildLifecycleEventText(
+                new JarvisLifecycleAnnouncement
+                {
+                    Source = "browser_automation",
+                    State = state,
+                    Detail = "Verified terminal result.",
+                });
+
+            Assert.Contains("no longer running", text);
+            Assert.Contains($"\"state\":\"{state}\"", text);
+        }
+    }
+
+    [Theory]
+    [InlineData(BrowserTaskState.Queued, true, "starting")]
+    [InlineData(BrowserTaskState.Planning, true, "running")]
+    [InlineData(BrowserTaskState.Paused, true, "paused")]
+    [InlineData(BrowserTaskState.Completed, false, "completed")]
+    [InlineData(BrowserTaskState.Failed, false, "failed")]
+    [InlineData(BrowserTaskState.Cancelled, false, "cancelled")]
+    public void Browser_status_has_one_authoritative_lifecycle(
+        BrowserTaskState detailState,
+        bool active,
+        string expected)
+    {
+        var snapshot = new BrowserAutomationSnapshot
+        {
+            TaskId = "task-1",
+            State = detailState,
+            CanCancel = active,
+        };
+
+        Assert.Equal(expected, CommandRegistry.NormalizeBrowserTaskState(snapshot));
+    }
+
+    [Fact]
+    public void Missing_task_is_idle_even_if_the_default_detail_state_is_queued()
+    {
+        Assert.Equal(
+            "idle",
+            CommandRegistry.NormalizeBrowserTaskState(new BrowserAutomationSnapshot()));
+    }
+
+    [Fact]
+    public void Cancelled_speech_cannot_clear_the_next_response()
+    {
+        var leases = new TtsPlaybackLease();
+        var first = leases.Begin();
+
+        Assert.Equal(first, leases.CancelCurrent());
+        var second = leases.Begin();
+
+        Assert.False(leases.Complete(first));
+        Assert.True(leases.IsCurrent(second));
+        Assert.True(leases.Complete(second));
+        Assert.False(leases.IsCurrent(second));
+    }
+
+    [Fact]
+    public void Live_speech_buffer_keeps_complete_normal_responses()
+    {
+        var buffer = GeminiLiveConversationService.CreatePlaybackBuffer();
+        var fiveSeconds = new byte[24000 * 2 * 5];
+
+        Assert.Equal(TimeSpan.FromSeconds(120), buffer.BufferDuration);
+        Assert.False(buffer.DiscardOnBufferOverflow);
+        Assert.True(GeminiLiveConversationService.TryQueuePlaybackAudio(
+            buffer,
+            fiveSeconds));
+        Assert.Equal(fiveSeconds.Length, buffer.BufferedBytes);
+    }
+
+    [Fact]
+    public void Live_speech_preserves_a_long_recap_generated_faster_than_device_playback()
+    {
+        var buffer = GeminiLiveConversationService.CreatePlaybackBuffer();
+        using var expected = new MemoryStream();
+        using var rendered = new MemoryStream();
+        // Real six-turn replay: roughly75seconds generated in less than20s.
+        // Feed three seconds for each second the device consumes.
+        for (var second = 0; second < 25; second++)
+        {
+            var chunk = Enumerable.Repeat((byte)(second + 1), 24000 * 2 * 3).ToArray();
+            expected.Write(chunk);
+            Assert.True(GeminiLiveConversationService.TryQueuePlaybackAudio(buffer, chunk));
+            var consumed = new byte[24000 * 2];
+            rendered.Write(consumed, 0, buffer.Read(consumed, 0, consumed.Length));
+        }
+        var tail = new byte[buffer.BufferedBytes];
+        rendered.Write(tail, 0, buffer.Read(tail, 0, tail.Length));
+        Assert.Equal(expected.ToArray(), rendered.ToArray());
+        Assert.Equal(0, buffer.BufferedBytes);
+    }
+
+    [Fact]
+    public void Excessive_live_speech_fails_explicitly_instead_of_dropping_its_tail()
+    {
+        var buffer = GeminiLiveConversationService.CreatePlaybackBuffer();
+        var tooLarge = new byte[buffer.BufferLength + 1];
+
+        Assert.False(GeminiLiveConversationService.TryQueuePlaybackAudio(
+            buffer,
+            tooLarge));
+        Assert.Equal(0, buffer.BufferedBytes);
+    }
+
+    [Fact]
+    public void Needs_user_action_lifecycle_keeps_the_exact_intervention_and_same_task_contract()
+    {
+        var text = GeminiLiveConversationService.BuildLifecycleEventText(
+            new JarvisLifecycleAnnouncement
+            {
+                Source = "browser_automation",
+                State = "NeedsUserAction",
+                Detail = "Please sign in to Gmail in the controlled tab.",
+            });
+
+        Assert.Contains("Please sign in to Gmail", text);
+        Assert.Contains("same browser task remains paused", text);
+        Assert.Contains("say continue", text);
+    }
+
+    [Fact]
+    public void Zero_control_form_completion_uses_one_bounded_visual_recovery()
+    {
+        var decision = new BrowserPlannerDecision
+        {
+            Done = true,
+            Action = new BrowserPlannerAction { Type = "done" },
+        };
+
+        Assert.True(BrowserAutomationCoordinator.ShouldForceVisualRecovery(
+            "Fill this quiz, but do not submit it.",
+            new BrowserPageSnapshot { Controls = Array.Empty<BrowserControl>() },
+            decision,
+            visionRecoveryAlreadyUsed: false));
+        Assert.False(BrowserAutomationCoordinator.ShouldForceVisualRecovery(
+            "Fill this quiz, but do not submit it.",
+            new BrowserPageSnapshot { Controls = Array.Empty<BrowserControl>() },
+            decision,
+            visionRecoveryAlreadyUsed: true));
+    }
+
+    [Fact]
+    public void Read_only_completion_and_sensitive_blockers_do_not_force_visual_click_recovery()
+    {
+        var emptyPage = new BrowserPageSnapshot { Controls = Array.Empty<BrowserControl>() };
+
+        Assert.False(BrowserAutomationCoordinator.ShouldForceVisualRecovery(
+            "Summarize this page.",
+            emptyPage,
+            new BrowserPlannerDecision { Done = true },
+            visionRecoveryAlreadyUsed: false));
+        Assert.False(BrowserAutomationCoordinator.ShouldForceVisualRecovery(
+            "Fill this form.",
+            emptyPage,
+            new BrowserPlannerDecision
+            {
+                NeedsUserAction = true,
+                UserAction = "Please complete the CAPTCHA manually.",
+            },
+            visionRecoveryAlreadyUsed: false));
+    }
+}
